@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1]
+
+### Changed
+
+- Recorded ATRAPS LLC as copyright holder and added a `NOTICE` file. The Apache-2.0
+  appendix was never filled in — it still carried the literal
+  `[yyyy] [name of copyright owner]` placeholder, so nothing in this repo stated
+  who owned it. No functional change.
+- Dropped the deprecated `authors` field and repointed `repository` at the organisation.
+- Refreshed transitive dependencies (`cargo update`).
+- CI lints `--all-targets --all-features`, so lint failures outside the library are
+  gated rather than invisible.
+- Publishing now uses crates.io trusted publishing instead of a stored registry token.
+
 ## [0.3.0] — 2026-06-09
 
 ### Added
@@ -315,7 +329,9 @@ Affects `vbobject.rs`, `pcodemethod.rs`, `methodlink.rs`,
 
 Initial public release.
 
-[Unreleased]: https://github.com/BinFlip/visualbasic-rs/compare/v0.2.1...HEAD
-[0.2.1]: https://github.com/BinFlip/visualbasic-rs/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/BinFlip/visualbasic-rs/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/BinFlip/visualbasic-rs/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/ATRAPSLLC/visualbasic-rs/releases/tag/v0.1.0
