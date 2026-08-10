@@ -2,11 +2,10 @@
 name = "visualbasic"
 version = "0.3.0"
 edition = "2024"
-authors = ["Johann Kempter <admin@binflip.rs>"]
 rust-version = "1.88"
 description = "Parse and inspect Visual Basic 6 compiled binaries"
 license = "Apache-2.0"
-repository = "https://github.com/BinFlip/visualbasic-rs"
+repository = "https://github.com/ATRAPSLLC/visualbasic-rs"
 readme = "README.md"
 keywords = ["vb6", "pcode", "parser", "reverse-engineering", "binary-analysis"]
 categories = ["parser-implementations"]
