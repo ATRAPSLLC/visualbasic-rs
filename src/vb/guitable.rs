@@ -151,17 +151,17 @@ impl fmt::Display for GuiTypeFlags {
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 4 | `dwEntrySize` — offset to next entry (self-relative) |
-/// | 0x04 | 16 | `uuidObject` — primary object GUID |
-/// | 0x14 | 16 | `uuidSecondary` — secondary GUID (zeros for standard Forms) |
-/// | 0x24 | 4 | `dwField24` — stored to runtime wrapper (zero for Forms) |
-/// | 0x28 | 4 | `dwObjectType` — type + flag bits (see below) |
-/// | 0x2C | 4 | `dwTypeDataDword` — non-zero for MDI (size/offset), 0 for others |
-/// | 0x30 | 16 | `guidTypeDataIID` — interface IID for MDI/UserControl, zeros for Form |
-/// | 0x40 | 4 | `dwFormDataSize` — compiled form binary size |
+/// | 0x00 | 4 | `dwEntrySize` - offset to next entry (self-relative) |
+/// | 0x04 | 16 | `uuidObject` - primary object GUID |
+/// | 0x14 | 16 | `uuidSecondary` - secondary GUID (zeros for standard Forms) |
+/// | 0x24 | 4 | `dwField24` - stored to runtime wrapper (zero for Forms) |
+/// | 0x28 | 4 | `dwObjectType` - type + flag bits (see below) |
+/// | 0x2C | 4 | `dwTypeDataDword` - non-zero for MDI (size/offset), 0 for others |
+/// | 0x30 | 16 | `guidTypeDataIID` - interface IID for MDI/UserControl, zeros for Form |
+/// | 0x40 | 4 | `dwFormDataSize` - compiled form binary size |
 /// | 0x44 | 4 | Reserved (zero) |
-/// | 0x48 | 4 | `lpFormData` — VA of form design/binary data |
-/// | 0x4C | 4 | `dwFormDataSize2` — secondary size field |
+/// | 0x48 | 4 | `lpFormData` - VA of form design/binary data |
+/// | 0x4C | 4 | `dwFormDataSize2` - secondary size field |
 ///
 /// # dwObjectType Bits
 ///

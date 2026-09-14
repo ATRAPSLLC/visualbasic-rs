@@ -5,10 +5,10 @@
 //! or `"Timer1"` with vtable offset.
 //!
 //! Two resolver types are provided:
-//! - [`ImportResolver`]: Lightweight — needs only an [`AddressMap`] and the
+//! - [`ImportResolver`]: Lightweight - needs only an [`AddressMap`] and the
 //!   external table VA/count. Resolves `%x` imports without a full
 //!   [`VbProject`].
-//! - [`CallResolver`]: Full — wraps [`ImportResolver`] and adds `%v`/`%c`
+//! - [`CallResolver`]: Full - wraps [`ImportResolver`] and adds `%v`/`%c`
 //!   resolution that requires project context.
 
 use crate::{
@@ -46,7 +46,7 @@ pub enum CallTarget {
 /// Lightweight import resolver for `%x` (ExternalCall) operands.
 ///
 /// Resolves import indices to `CallTarget::Api` entries using only the
-/// address map and external table location — no [`VbProject`] required.
+/// address map and external table location - no [`VbProject`] required.
 ///
 /// Construct from [`AddressMap`] + external table VA + count (available
 /// from [`ProjectData`](crate::vb::projectdata::ProjectData)), or from

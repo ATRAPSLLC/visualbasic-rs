@@ -40,7 +40,7 @@ pub struct VbControl<'a> {
     /// Authoritative control type from form binary data (`cType` byte).
     ///
     /// When available, this is more reliable than GUID-based identification
-    /// (GUID fuzzy matching fails for malware samples — 8/12 controls
+    /// (GUID fuzzy matching fails for malware samples - 8/12 controls
     /// misidentified in the vb_inject sample).
     form_control_type: Option<FormControlType>,
 }

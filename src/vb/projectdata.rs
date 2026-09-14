@@ -20,11 +20,11 @@ use crate::{
 /// | 0x00 | 4 | `dwVersion` (always 0x1F4 = VB 5.00) |
 /// | 0x04 | 4 | `lpObjectTable` (.text VA) |
 /// | 0x08 | 4 | Reserved (always 0) |
-/// | 0x0C | 4 | `lpCodeStart` (.text VA — start of native/P-Code region) |
-/// | 0x10 | 4 | `lpCodeEnd` (.text VA — end of code region) |
+/// | 0x0C | 4 | `lpCodeStart` (.text VA - start of native/P-Code region) |
+/// | 0x10 | 4 | `lpCodeEnd` (.text VA - end of code region) |
 /// | 0x14 | 4 | `dwDataSize` (size of VB object structures in bytes) |
-/// | 0x18 | 4 | `lpThreadSpace` (.data VA — per-object data area base) |
-/// | 0x1C | 4 | `lpVbaSeh` (.text VA — `__vbaExceptHandler` import thunk) |
+/// | 0x18 | 4 | `lpThreadSpace` (.data VA - per-object data area base) |
+/// | 0x1C | 4 | `lpVbaSeh` (.text VA - `__vbaExceptHandler` import thunk) |
 /// | 0x20 | 4 | `lpNativeCode` (.data VA; **0 = P-Code!**) |
 /// | 0x24 | 528 | `szPathInfo` (null-terminated VBP path; often zeroed in malware) |
 /// | 0x234 | 4 | `lpExternalTable` (.text VA) |

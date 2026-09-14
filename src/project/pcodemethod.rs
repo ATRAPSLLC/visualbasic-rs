@@ -103,7 +103,7 @@ impl<'a> PCodeMethod<'a> {
             method_va
         };
 
-        // Parse ProcDscInfo — read MIN_SIZE first to get total_size, then re-read full
+        // Parse ProcDscInfo - read MIN_SIZE first to get total_size, then re-read full
         let pdi_header = map.slice_from_va(proc_dsc_va, ProcDscInfo::MIN_SIZE)?;
         let pdi_tmp = ProcDscInfo::parse(pdi_header)?;
         let full_size = (pdi_tmp.total_size()? as usize).max(ProcDscInfo::MIN_SIZE);
@@ -194,7 +194,7 @@ impl<'a> PCodeMethod<'a> {
 
     /// VA of the call stub or direct ProcDscInfo pointer.
     ///
-    /// This is the raw VA from the method dispatch table entry — the
+    /// This is the raw VA from the method dispatch table entry - the
     /// native stub code (`mov edx, <RTMI>; call ProcCallEngine`) that
     /// launches the P-Code interpreter for this method.
     #[inline]
@@ -250,7 +250,7 @@ impl<'a> PCodeMethod<'a> {
     ///
     /// The cleanup table describes resource-release thunks (BSTR free,
     /// VARIANT free, object Release) that the runtime invokes on procedure
-    /// exit and on the error path. The table is **P-Code only** —
+    /// exit and on the error path. The table is **P-Code only** -
     /// native-compiled methods emit cleanup calls inline in their x86 code.
     ///
     /// This is a forwarder for [`ProcDscInfo::cleanup_entries`] kept on

@@ -6,7 +6,7 @@
 //!
 //! Internally the helpers use [`slice::get`] and
 //! [`<[u8; N]>::try_from`](TryFrom) to convert validated slices into
-//! fixed-size arrays for [`u16::from_le_bytes`] / [`u32::from_le_bytes`] —
+//! fixed-size arrays for [`u16::from_le_bytes`] / [`u32::from_le_bytes`] -
 //! no panicking indexing or unchecked arithmetic.
 
 use crate::error::Error;

@@ -6,12 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.3.1]
+## [0.3.2] - 2026-09-13
+
+### Added
+
+- `ObjectInfo::has_method_table()` - `true` only when `methods_va` is non-zero,
+  differs from `constants_va`, and the object's own `method_count` is non-zero.
+- `VbProject::diagnostics()` reports an `Info` `Quirk` at site `method_table`
+  when `methods_va` is set but the object's method count is zero (the pointer
+  is uninitialized, not a dispatch table).
+
+### Fixed
+
+- `VbObject::has_method_table()` now delegates to
+  `ObjectInfo::has_method_table()`. An object with a zero method count no longer
+  has a descriptor-supplied count iterated over its uninitialized table pointer.
+- `VbObject::code_entries()` and `VbProject::code_entrypoints()` are fail-soft
+  per slot: an unreadable method slot, `proc_size`, or object is dropped (with a
+  `tracing` warn event under the `tracing` feature) instead of aborting the
+  whole walk.
+
+### Changed
+
+- Replaced em-dashes with plain hyphens across docs, comments, and
+  `ParseDiagnostic` message strings. Consumers matching on exact diagnostic
+  message text will see the new punctuation; match on `site` / `kind` instead.
+- Refreshed transitive dependencies (`cargo update`). Direct dependencies were
+  already current.
+- UTF-16LE decoding in `BStr::to_string_lossy()` and `FuncTypDesc` string
+  defaults uses `as_chunks::<2>()` instead of `chunks_exact(2)`, satisfying the
+  `chunks_exact_to_as_chunks` lint added in clippy 1.98. No behaviour change.
+
+## [0.3.1] - 2026-08-09
 
 ### Changed
 
 - Recorded ATRAPS LLC as copyright holder and added a `NOTICE` file. The Apache-2.0
-  appendix was never filled in — it still carried the literal
+  appendix was never filled in - it still carried the literal
   `[yyyy] [name of copyright owner]` placeholder, so nothing in this repo stated
   who owned it. No functional change.
 - Dropped the deprecated `authors` field and repointed `repository` at the organisation.
@@ -20,11 +51,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gated rather than invisible.
 - Publishing now uses crates.io trusted publishing instead of a stored registry token.
 
-## [0.3.0] — 2026-06-09
+## [0.3.0] - 2026-06-09
 
 ### Added
 
-- `CallApiStub::ordinal()`, `flags()`, and `is_by_ordinal()` — the
+- `CallApiStub::ordinal()`, `flags()`, and `is_by_ordinal()` - the
   `DllFunctionCall` descriptor is 16 bytes (not 8), carrying an import ordinal
   and a by-ordinal flag (bit 1) after the name pointers. Verified against
   MSVBVM60.DLL `sub_660315de`. By-ordinal imports omit the API name from the
@@ -33,18 +64,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CallApiStub`, exposing ordinal / by-ordinal state for declared imports
   (e.g. `Declare ... Alias "#123"`).
 - `controlprop::CleanupAction` plus `ControlPropertyType::cleanup_action()`
-  and `is_reference()` — the runtime resource-release classification
+  and `is_reference()` - the runtime resource-release classification
   (`FreeString` / `FreeVariant` / `ReleaseObject` / `DestroyArray` /
   `UnlockArray` / `DestructRecord`) for each class/form instance member,
   recovered from `CleanupSingleEntry` (0x66016AAA).
-- `decoder::ErrorFlow` plus `Instruction::error_flow()` — classifies a
+- `decoder::ErrorFlow` plus `Instruction::error_flow()` - classifies a
   `Resume` / `OnErrorGoto` instruction's signed operand into its source-level
   construct (`Resume`, `Resume Next`, `Resume <label>`, `On Error GoTo <label>`,
   `On Error Resume Next`, `On Error GoTo 0`). Verified against `op_Lead2_Resume`
   and `op_OnErrorGoto`.
 - `Instruction::is_bos()` / `bos_distance()`, `OpcodeInfo::is_bos()`,
   `OpcodeSemantics::Bos`, and `PCodeMethod::statement_markers()` returning
-  `StatementMarker { offset, distance }` — `LargeBos` is now modelled as a
+  `StatementMarker { offset, distance }` - `LargeBos` is now modelled as a
   beginning-of-statement marker whose `u8` operand is the byte distance to the
   next statement boundary (`0` = last). This partitions a procedure's P-Code
   into source statements.
@@ -88,7 +119,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to a 4-byte boundary). A lone trailing `0x00` previously looked like a
   truncated `LargeBos`; the iterator now ends cleanly at an all-zero tail.
 
-## [0.2.1] — 2026-05-04
+## [0.2.1] - 2026-05-04
 
 Patch release focused on parser integration ergonomics and stable
 persistence surfaces.
@@ -118,7 +149,7 @@ persistence surfaces.
 - Documented the `PCodeMethod::instructions()` upper bound from the on-disk
   `u16` procedure-size field.
 
-## [0.2.0] — 2026-04-26
+## [0.2.0] - 2026-04-26
 
 A breaking-change release focused on adversarial-input safety, richer
 typed walkers, and a tagged stream of code entry points. Verified
@@ -143,58 +174,58 @@ and `VB6.EXE` (v6.00.8176).
 
 #### Predicates and forward-compat aliases
 
-- `OpcodeInfo::is_terminator()` and `OpcodeInfo::is_call()` —
+- `OpcodeInfo::is_terminator()` and `OpcodeInfo::is_call()` -
   convenience predicates for CFG-style basic-block splitting.
 - `CompilationMode { Pcode, Native, Mixed }` enum and
-  `VbProject::compilation_mode()` — combines the project-level
+  `VbProject::compilation_mode()` - combines the project-level
   `lpNativeCode` flag with a per-object `has_pcode()` scan, so
   mixed-mode binaries surface explicitly.
-- `PCodeMethod::cleanup_entries()` — re-export of the cleanup-table
+- `PCodeMethod::cleanup_entries()` - re-export of the cleanup-table
   iterator on `ProcDscInfo` for ergonomic consumer access.
-- `ConstantPool::entries_with_hints()` — reserved signature aliasing
+- `ConstantPool::entries_with_hints()` - reserved signature aliasing
   `entries()` for forward compatibility with future hint-enriched entries.
-- `VbObject::form_designer_data()` — reserved signature aliasing
+- `VbObject::form_designer_data()` - reserved signature aliasing
   `form_data_from_gui_entry()`.
 
 #### Joined walkers and aggregators
 
 - `VbObject::events()` and `VbObject::events_all_slots()` returning
-  `Vec<EventBinding>` — joined walker over controls × event sink slots ×
+  `Vec<EventBinding>` - joined walker over controls × event sink slots ×
   per-control-type event-name templates.
 - `EventBinding { control_index, control_name, control_type, event_slot,
   event_name, handler_va }` with `is_connected()` and `label()` helpers.
 - `VbProject::gui_entries_with_form_data()` returning
   `GuiEntriesWithFormData` iterator yielding `GuiEntryWithFormData
-  { entry, form_data }` pairs — pre-pairs each form metadata entry with
+  { entry, form_data }` pairs - pre-pairs each form metadata entry with
   its parsed form binary.
-- `VbProject::code_entrypoints()` — single-call aggregator returning
+- `VbProject::code_entrypoints()` - single-call aggregator returning
   `Vec<CodeEntrypoint>` over per-object dispatch + thunks + events +
   `Sub Main`. Each carries an `EntrypointKind` tag.
 - `EntrypointKind { PCodeStub, NativeProc, NativeThunk, EventHandler,
   SubMain }` (`#[non_exhaustive]`).
 - `InterfaceMetadata::typelib_path_va()` and
-  `InterfaceMetadata::data_slot_va()` — raw VA accessors for the +0x10
+  `InterfaceMetadata::data_slot_va()` - raw VA accessors for the +0x10
   and +0x18 fields, with explicit "purpose undocumented" doc on +0x18.
 
 #### Operand and constant pool typed accessors
 
-- `Instruction::data_type()` — exposes the parent opcode's
+- `Instruction::data_type()` - exposes the parent opcode's
   `PCodeDataType` for the instruction's stack result.
-- `Instruction::operand_type(idx)` — per-slot inferred type, validated
+- `Instruction::operand_type(idx)` - per-slot inferred type, validated
   against operand presence.
-- `ConstantPool::string_at(index)` — indexed BSTR accessor returning
+- `ConstantPool::string_at(index)` - indexed BSTR accessor returning
   `Result<Option<BStr>, Error>`.
-- `ConstantPool::api_stub_at(index)` — indexed `CallApiStub` resolution
+- `ConstantPool::api_stub_at(index)` - indexed `CallApiStub` resolution
   returning `Result<Option<CallApiStub>, Error>`.
 
 #### Diagnostics and optional tracing
 
-- Optional `tracing` cargo feature (`--features tracing`) — emits
+- Optional `tracing` cargo feature (`--features tracing`) - emits
   `target = "visualbasic::dropped"` `warn` events at silent fail-soft
   sites (`code_entries`, `events_inner`, `ImportResolver`,
   `CallResolver`). Default builds carry zero `tracing` dependency
   weight; helpers compile to no-ops.
-- `VbProject::diagnostics()` returning `Vec<ParseDiagnostic>` — eager
+- `VbProject::diagnostics()` returning `Vec<ParseDiagnostic>` - eager
   parse-health probe flagging missing `Sub Main`, mixed compilation
   mode, suspicious-absent `OptionalObjectInfo`/`PrivateObjectDescriptor`,
   and method-table overlap.
@@ -203,15 +234,15 @@ and `VB6.EXE` (v6.00.8176).
 
 #### Recognition error discrimination
 
-- `Error::NotRecognized` — valid PE container but no VB6 marker.
-- `Error::TruncatedContainer { context }` — recognized as VB6 but a
+- `Error::NotRecognized` - valid PE container but no VB6 marker.
+- `Error::TruncatedContainer { context }` - recognized as VB6 but a
   structure read overran the buffer.
-- `Error::UnrecognizedFormat { reason }` — not a recognizable PE
+- `Error::UnrecognizedFormat { reason }` - not a recognizable PE
   container at all (or PE32+).
 - `RecognitionFailure { NotRecognized, TruncatedContainer,
   UnrecognizedFormat, CompressedAndOpaque }` (`#[non_exhaustive]`)
   with `Error::recognition_failure() -> Option<RecognitionFailure>`
-  classifier — lets consumers silently deny non-VB6 files and only
+  classifier - lets consumers silently deny non-VB6 files and only
   warn on truncation cases. `CompressedAndOpaque` is reserved for a
   future heuristic and not yet emitted.
 
@@ -243,7 +274,7 @@ let frame = method.frame_size()?;
 let v = obj.method_count()?;
 ```
 
-The fallible signatures match the malware-analysis posture — every
+The fallible signatures match the malware-analysis posture - every
 read can now surface `Error::Truncated` rather than panicking on a
 short slice.
 
@@ -254,7 +285,7 @@ For `VbObject`, `VbProject::project_name`, `VbControl::name`,
 `prog_id` / `class_name`, and `CallApiStub::library_name` /
 `function_name`:
 
-- The string accessor returns `Cow<'a, str>` (lossy UTF-8) — borrows
+- The string accessor returns `Cow<'a, str>` (lossy UTF-8) - borrows
   for valid UTF-8 (the common case for ASCII identifiers), allocates
   only on U+FFFD substitution.
 - The byte form is preserved as `*_bytes()`.
@@ -290,7 +321,7 @@ Affects `vbobject.rs`, `pcodemethod.rs`, `methodlink.rs`,
 
 ### Removed
 
-- `Error::VbHeaderNotFound` — superseded by the discriminated variants
+- `Error::VbHeaderNotFound` - superseded by the discriminated variants
   above. Match on `Error::recognition_failure()` to map old
   `VbHeaderNotFound` semantics to the new
   `RecognitionFailure::NotRecognized`.
@@ -306,7 +337,7 @@ Affects `vbobject.rs`, `pcodemethod.rs`, `methodlink.rs`,
 
 - The full crate parse path was audited under
   `clippy::{unwrap_used, expect_used, panic, arithmetic_side_effects,
-  indexing_slicing}` — **no input byte sequence can panic the parser.**
+  indexing_slicing}` - **no input byte sequence can panic the parser.**
   ~538 lint sites in the library and ~215 in `build.rs` were converted
   to checked alternatives. `build.rs` runs at compile time on
   CSV input from `data/` and is exempt from the per-byte lints.
@@ -316,7 +347,7 @@ Affects `vbobject.rs`, `pcodemethod.rs`, `methodlink.rs`,
 - Verified `ProcCallEngine_Body` (0x66108C00) and `op_Lead2_Resume`
   (0x6610F212) in MSVBVM60: only `+0x06`, `+0x0C`, `+0x10`, `+0x18`,
   `+0x1C` of `ProcDscInfo` are read by the runtime. There is **no**
-  `wLocalsNameTableOffset` field — per-procedure local-variable names
+  `wLocalsNameTableOffset` field - per-procedure local-variable names
   are not recoverable from compiled binaries (documented in `TODO.md`).
 - Verified `EbLoadRunTime` (0x6602F6CE): `PublicVarTable` entries
   carry only `frame_offset + type_code`. Variable names are
@@ -325,11 +356,12 @@ Affects `vbobject.rs`, `pcodemethod.rs`, `methodlink.rs`,
   static defaults don't exist in compiled binaries (documented in
   `TODO.md`).
 
-## [0.1.0] — 2026-03-31
+## [0.1.0] - 2026-03-31
 
 Initial public release.
 
-[Unreleased]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.2.0...v0.2.1

@@ -8,7 +8,7 @@
 //! VB6.EXE v6.00.8176) actually writes `0x78` bytes (120), but the runtime
 //! never reads past offset `0x54` (`lpComRegisterData`). The fields at
 //! `0x58`–`0x64` (bSZ string offsets) and `0x68`–`0x77` (reserved) are
-//! dead data from the runtime's perspective — used only by the IDE/compiler.
+//! dead data from the runtime's perspective - used only by the IDE/compiler.
 
 use crate::{
     error::Error,

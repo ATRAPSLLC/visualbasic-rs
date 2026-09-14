@@ -175,7 +175,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         // OptionalObjectInfo (0x40 bytes) sits between ObjectInfo and the
         // constants table when there is room. For standard modules, the
         // constants table starts immediately after ObjectInfo (gap == 0)
-        // and no OptionalObjectInfo exists — regardless of the flag bit.
+        // and no OptionalObjectInfo exists - regardless of the flag bit.
         let optional_info = if descriptor.has_optional_info() {
             let opt_va = descriptor
                 .object_info_va()?
@@ -242,7 +242,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     ///
     /// Contains function type descriptors, parameter name tables, and
     /// public function/variable counts. Not available for standard modules
-    /// (BAS files) — those have `private_object_va == 0xFFFFFFFF`.
+    /// (BAS files) - those have `private_object_va == 0xFFFFFFFF`.
     #[inline]
     pub fn private_object(&self) -> Option<&PrivateObjectDescriptor<'a>> {
         self.private_object.as_ref()
@@ -300,7 +300,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
 
     /// Reads the object name as raw bytes from the PE image.
     ///
-    /// Returns the slice exactly as stored — no decoding, no fallback.
+    /// Returns the slice exactly as stored - no decoding, no fallback.
     /// Prefer [`name`](Self::name) for display.
     ///
     /// # Errors
@@ -353,7 +353,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     /// Returns the number of methods in this object.
     ///
     /// Uses the larger of `ObjectInfo.method_count()` and
-    /// `PublicObjectDescriptor.method_count()` — they can differ in
+    /// `PublicObjectDescriptor.method_count()` - they can differ in
     /// native-compiled binaries where the ObjectInfo count may undercount.
     ///
     /// # Errors
@@ -435,7 +435,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     ///
     /// Like [`controls`](Self::controls), but each yielded control has its
     /// [`form_control_type`](crate::project::VbControl::form_control_type) populated from the
-    /// form binary data `cType` byte — the **authoritative** control type.
+    /// form binary data `cType` byte - the **authoritative** control type.
     ///
     /// Use this when form data is available (parsed from
     /// [`GuiTableEntry::form_data_va`](crate::vb::guitable::GuiTableEntry::form_data_va)).
@@ -489,23 +489,24 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
 
     /// Returns `true` if this object has a real method dispatch table.
     ///
-    /// When `methods_va == constants_va`, the "method table" is actually
-    /// the constants/variable pool and should not be iterated as methods.
+    /// Answered by [`ObjectInfo::has_method_table`]: the table is trusted only
+    /// when it is not the constants pool and the object's own method count is
+    /// non-zero. [`method_count`](Self::method_count) takes the larger of that
+    /// count and the descriptor's, so without the gate a descriptor count would
+    /// be iterated over a pointer the object never initialized.
     ///
     /// # Errors
     ///
-    /// Returns an error if the methods or constants VA cannot be read.
+    /// Returns an error if the method count or either VA cannot be read.
     pub fn has_method_table(&self) -> Result<bool, Error> {
-        let m = self.info.methods_va()?;
-        let c = self.info.constants_va()?;
-        Ok(m != 0 && m != c)
+        self.info.has_method_table()
     }
 
     /// Returns an iterator over all method table entries, classified by type.
     ///
     /// Each entry is classified as [`MethodEntry::Null`], [`MethodEntry::PCode`],
     /// [`MethodEntry::Native`], or [`MethodEntry::Runtime`]. This is the full
-    /// view of the dispatch table — use [`pcode_methods`](Self::pcode_methods)
+    /// view of the dispatch table - use [`pcode_methods`](Self::pcode_methods)
     /// if you only want P-Code methods.
     ///
     /// Returns an empty iterator if the object has no method table (e.g.,
@@ -598,18 +599,18 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     /// Returns all code entry points in this object.
     ///
     /// Combines three sources into a single `Vec`:
-    /// 1. **Method table** — P-Code and native methods from the dispatch table
-    /// 2. **Method link thunks** — native code bodies discovered via JMP thunks
-    /// 3. **Event handlers** — connected event sink handler VAs from controls
+    /// 1. **Method table** - P-Code and native methods from the dispatch table
+    /// 2. **Method link thunks** - native code bodies discovered via JMP thunks
+    /// 3. **Event handlers** - connected event sink handler VAs from controls
     ///
     /// Each entry includes a code VA and a human-readable label. Null entries
     /// and runtime VAs (pointing into MSVBVM60.DLL) are excluded.
     /// # Name Resolution
     ///
     /// Names are resolved using a three-tier fallback:
-    /// 1. Method name table (`method_name()`) — from PublicObjectDescriptor
-    /// 2. FuncTypDesc signature — from PrivateObjectDescriptor's type info
-    /// 3. Positional fallback — `method_NN` for methods, `Control_EventName` for events
+    /// 1. Method name table (`method_name()`) - from PublicObjectDescriptor
+    /// 2. FuncTypDesc signature - from PrivateObjectDescriptor's type info
+    /// 3. Positional fallback - `method_NN` for methods, `Control_EventName` for events
     ///
     /// When `form_data` is provided, event handler names use the exact
     /// `FormControlType` from the form binary (e.g., `Timer1_Timer` instead
@@ -631,10 +632,26 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         let ftd_map = self.build_func_type_desc_map()?;
 
         // 1. Method table entries
+        //    One unreadable slot is dropped on its own; it says nothing about the
+        //    slots beside it.
         if self.has_method_table()? {
             for (i, result) in self.methods()?.enumerate() {
-                match result? {
+                let entry = match result {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        crate::trace::warn_drop!("code_entries.methods", error = ?e);
+                        continue;
+                    }
+                };
+                match entry {
                     MethodEntry::PCode(pm) => {
+                        let pcode_size = match pm.proc_size() {
+                            Ok(size) => size,
+                            Err(e) => {
+                                crate::trace::warn_drop!("code_entries.proc_size", error = ?e);
+                                continue;
+                            }
+                        };
                         let name = self.resolve_method_name(i, &ftd_map);
                         entries.push(CodeEntry {
                             va: pm.pcode_va(),
@@ -643,7 +660,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                             name,
                             data_const_va: Some(pm.data_const_va()),
                             stub_va: Some(pm.stub_va()),
-                            pcode_size: Some(pm.proc_size()?),
+                            pcode_size: Some(pcode_size),
                         });
                     }
                     MethodEntry::Native { va } => {
@@ -767,7 +784,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         for &(fi, ref ftd) in ftd_map {
             if fi == index {
                 let name = format_signature(ftd, "", self.project.address_map());
-                // format_signature returns " ()" for empty name — strip prefix space
+                // format_signature returns " ()" for empty name - strip prefix space
                 let trimmed = name.trim();
                 if !trimmed.is_empty() && trimmed != "()" {
                     return Some(trimmed.to_string());
@@ -865,8 +882,8 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     /// Returns every event-handler slot on this object, including
     /// disconnected ones (`handler_va == 0`).
     ///
-    /// Like [`events`](Self::events) but does not filter out empty slots
-    /// — useful for completeness checks ("how many of this control's
+    /// Like [`events`](Self::events) but does not filter out empty slots -
+    /// useful for completeness checks ("how many of this control's
     /// 24 events are wired up?") or for surfacing the full slot
     /// template per control type.
     ///
@@ -1167,7 +1184,7 @@ pub enum CodeEntryKind {
 /// [`EventSinkVtable`](crate::vb::events::EventSinkVtable) header, and the
 /// [`eventname`](crate::vb::eventname) lookup tables.
 ///
-/// Only **connected** handlers are yielded — slots whose
+/// Only **connected** handlers are yielded - slots whose
 /// `event_handler_va == 0` (event not wired up by the user) are filtered
 /// out. Use [`VbObject::events_all_slots`] for the full per-slot view
 /// including disconnected events.
@@ -1184,7 +1201,7 @@ pub struct EventBinding<'a> {
     ///
     /// Resolution prefers form binary data (`cType` byte) over GUID
     /// fuzzy matching (which is unreliable for malware samples).
-    /// `None` when neither source resolves the type — in that case
+    /// `None` when neither source resolves the type - in that case
     /// [`event_name`](Self::event_name) falls back to the standard
     /// 24-event template.
     pub control_type: Option<FormControlType>,

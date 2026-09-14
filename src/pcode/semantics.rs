@@ -2,7 +2,7 @@
 //!
 //! Provides typed enums for classifying every P-Code opcode by its
 //! data type and semantic operation. All classification is performed
-//! at **build time** by `build.rs` — the generated opcode tables contain
+//! at **build time** by `build.rs` - the generated opcode tables contain
 //! fully typed enum values with zero runtime string parsing.
 
 /// Data type operated on by a P-Code instruction.

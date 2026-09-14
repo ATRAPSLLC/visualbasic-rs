@@ -32,7 +32,7 @@ use crate::{
 /// | 0x18 | 4 | `lpszObjectName` (null-terminated ANSI string VA) |
 /// | 0x1C | 4 | `dwMethodCount` |
 /// | 0x20 | 4 | `lpMethodNames` (VA; forms/classes only; 0 for modules) |
-/// | 0x24 | 4 | `oStaticVars` (always 0x0000FFFF — sentinel) |
+/// | 0x24 | 4 | `oStaticVars` (always 0x0000FFFF - sentinel) |
 /// | 0x28 | 4 | `fObjectType` (type flags, see below) |
 /// | 0x2C | 4 | Reserved (always 0) |
 ///
@@ -346,7 +346,7 @@ impl<'a> ObjectInfo<'a> {
     /// of a `mov edx, <rtmi_addr>; call ProcCallEngine` stub.
     ///
     /// Note: the P-Code engine does NOT use this field at runtime for
-    /// method dispatch — it goes through ProcDscInfo structures directly.
+    /// method dispatch - it goes through ProcDscInfo structures directly.
     /// This field is used during project loading to build dispatch tables.
     /// When `method_count() == 0`, this value may be uninitialized garbage.
     #[inline]
@@ -371,7 +371,7 @@ impl<'a> ObjectInfo<'a> {
     /// Use [`ConstantPool::new`](super::constantpool::ConstantPool::new) to create
     /// a reader for resolving string and API references from this base address.
     ///
-    /// This is the most heavily used ObjectInfo field at runtime — the
+    /// This is the most heavily used ObjectInfo field at runtime - the
     /// P-Code engine reads it at the start of every method execution to
     /// set up the constants pool base address. Also accessed via
     /// [`ProcDscInfo::object_info_va`](super::procedure::ProcDscInfo::object_info_va)
@@ -379,6 +379,22 @@ impl<'a> ObjectInfo<'a> {
     #[inline]
     pub fn constants_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x34)
+    }
+
+    /// Returns `true` if this object carries a real method dispatch table.
+    ///
+    /// Two layouts mean it does not. A table address equal to
+    /// [`constants_va`](Self::constants_va) is the constants/variable pool, not a
+    /// table. A zero [`method_count`](Self::method_count) leaves
+    /// [`methods_va`](Self::methods_va) uninitialized, so whatever it holds is not
+    /// an address worth reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the method count or either VA cannot be read.
+    pub fn has_method_table(&self) -> Result<bool, Error> {
+        let methods = self.methods_va()?;
+        Ok(methods != 0 && methods != self.constants_va()? && self.method_count()? > 0)
     }
 }
 
@@ -404,24 +420,24 @@ impl<'a> ObjectInfo<'a> {
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 4 | `gui_guids_count` — GUI GUID table entry count |
-/// | 0x04 | 4 | `object_clsid_va` — VA of 16-byte object CLSID |
-/// | 0x08 | 4 | `null_08` — always 0 (reserved) |
-/// | 0x0C | 4 | `gui_guid_table_va` — VA of GUID VA-pointer array |
-/// | 0x10 | 4 | `default_iid_count` — default IID table entry count |
-/// | 0x14 | 4 | `events_iid_table_va` — VA of event source IID table |
-/// | 0x18 | 4 | `events_iid_count` — event source IID count |
-/// | 0x1C | 4 | `default_iid_table_va` — VA of default IID VA-pointer array |
-/// | 0x20 | 4 | `control_count` — number of controls |
-/// | 0x24 | 4 | `controls_va` — VA of ControlInfo array |
-/// | 0x28 | 2 | `method_link_count` — method link entries |
-/// | 0x2A | 2 | `pcode_count` — P-Code method count (`0x1B7` is the linker-emitted native marker; see [`Self::PCODE_COUNT_NATIVE_SENTINEL`]) |
-/// | 0x2C | 2 | `initialize_event_offset` — dispatch vtable byte offset |
-/// | 0x2E | 2 | `terminate_event_offset` — dispatch vtable byte offset |
-/// | 0x30 | 4 | `method_link_table_va` — VA of method link table |
-/// | 0x34 | 4 | `basic_class_object_va` — VA of runtime dispatch vtable |
-/// | 0x38 | 4 | `null_38` — always 0 (reserved) |
-/// | 0x3C | 4 | `field_3c` — non-zero, linker-internal VA (not patchable) |
+/// | 0x00 | 4 | `gui_guids_count` - GUI GUID table entry count |
+/// | 0x04 | 4 | `object_clsid_va` - VA of 16-byte object CLSID |
+/// | 0x08 | 4 | `null_08` - always 0 (reserved) |
+/// | 0x0C | 4 | `gui_guid_table_va` - VA of GUID VA-pointer array |
+/// | 0x10 | 4 | `default_iid_count` - default IID table entry count |
+/// | 0x14 | 4 | `events_iid_table_va` - VA of event source IID table |
+/// | 0x18 | 4 | `events_iid_count` - event source IID count |
+/// | 0x1C | 4 | `default_iid_table_va` - VA of default IID VA-pointer array |
+/// | 0x20 | 4 | `control_count` - number of controls |
+/// | 0x24 | 4 | `controls_va` - VA of ControlInfo array |
+/// | 0x28 | 2 | `method_link_count` - method link entries |
+/// | 0x2A | 2 | `pcode_count` - P-Code method count (`0x1B7` is the linker-emitted native marker; see [`Self::PCODE_COUNT_NATIVE_SENTINEL`]) |
+/// | 0x2C | 2 | `initialize_event_offset` - dispatch vtable byte offset |
+/// | 0x2E | 2 | `terminate_event_offset` - dispatch vtable byte offset |
+/// | 0x30 | 4 | `method_link_table_va` - VA of method link table |
+/// | 0x34 | 4 | `basic_class_object_va` - VA of runtime dispatch vtable |
+/// | 0x38 | 4 | `null_38` - always 0 (reserved) |
+/// | 0x3C | 4 | `field_3c` - non-zero, linker-internal VA (not patchable) |
 ///
 /// # GUID Tables
 ///
@@ -568,7 +584,7 @@ impl<'a> OptionalObjectInfo<'a> {
     /// Empirically every natively-compiled VB6 object surveyed has this
     /// exact value at +0x2A; no runtime path in `MSVBVM60.DLL_6.00.9848`
     /// reads `wPCodeCount` and checks against `0x1B7`, so the runtime
-    /// itself does not enforce a sentinel — the value is a compiler /
+    /// itself does not enforce a sentinel - the value is a compiler /
     /// linker default written when there is no P-Code dispatch table to
     /// describe. The dispatch path iterates the actual method table at
     /// `methods_va` instead, which is the authoritative source.
@@ -579,7 +595,7 @@ impl<'a> OptionalObjectInfo<'a> {
     /// when reverse-engineering the layout itself.
     pub const PCODE_COUNT_NATIVE_SENTINEL: u16 = 0x1B7;
 
-    /// Raw P-Code method count at offset 0x2A — see
+    /// Raw P-Code method count at offset 0x2A - see
     /// [`PCODE_COUNT_NATIVE_SENTINEL`](Self::PCODE_COUNT_NATIVE_SENTINEL).
     ///
     /// Returns the on-disk u16 verbatim. Almost every caller wants
@@ -689,7 +705,7 @@ impl<'a> OptionalObjectInfo<'a> {
     /// Linker-internal field at offset 0x3C.
     ///
     /// Non-zero in all tested samples, but contains an address outside the
-    /// PE image range — appears to be an unpatched linker-internal VA from
+    /// PE image range - appears to be an unpatched linker-internal VA from
     /// the VBA6.DLL compilation environment. Not read by the runtime.
     #[inline]
     pub fn field_3c(&self) -> Result<u32, Error> {
@@ -857,7 +873,7 @@ impl<'a> GuidTableIter<'a> {
 }
 
 impl<'a> Iterator for GuidTableIter<'a> {
-    /// Yields `(guid_va, Guid)` pairs — the VA of the GUID data and
+    /// Yields `(guid_va, Guid)` pairs - the VA of the GUID data and
     /// the parsed 16-byte GUID.
     type Item = (u32, Guid);
 
@@ -953,6 +969,38 @@ mod tests {
     }
 
     #[test]
+    fn test_object_info_method_table_requires_a_count() {
+        let mut data = vec![0u8; ObjectInfo::SIZE];
+        data[0x24..0x28].copy_from_slice(&0x00404000u32.to_le_bytes()); // methods_va
+        data[0x34..0x38].copy_from_slice(&0x00405000u32.to_le_bytes()); // constants_va
+
+        // A zero count leaves the table pointer uninitialized.
+        assert!(
+            !ObjectInfo::parse(&data)
+                .unwrap()
+                .has_method_table()
+                .unwrap()
+        );
+
+        data[0x20..0x22].copy_from_slice(&3u16.to_le_bytes()); // method_count
+        assert!(
+            ObjectInfo::parse(&data)
+                .unwrap()
+                .has_method_table()
+                .unwrap()
+        );
+
+        // The "table" at the constants pool is the pool.
+        data[0x24..0x28].copy_from_slice(&0x00405000u32.to_le_bytes());
+        assert!(
+            !ObjectInfo::parse(&data)
+                .unwrap()
+                .has_method_table()
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn test_object_info_too_short() {
         let data = vec![0u8; ObjectInfo::SIZE - 1];
         assert!(matches!(
@@ -977,7 +1025,7 @@ mod tests {
     fn test_optional_object_info_native_sentinel() {
         let mut data = vec![0u8; OptionalObjectInfo::SIZE];
         // Linker writes 0x1B7 (439) at +0x2A on natively compiled objects
-        // — see `OptionalObjectInfo::PCODE_COUNT_NATIVE_SENTINEL`.
+        // - see `OptionalObjectInfo::PCODE_COUNT_NATIVE_SENTINEL`.
         data[0x2A..0x2C]
             .copy_from_slice(&OptionalObjectInfo::PCODE_COUNT_NATIVE_SENTINEL.to_le_bytes());
         let opt = OptionalObjectInfo::parse(&data).unwrap();

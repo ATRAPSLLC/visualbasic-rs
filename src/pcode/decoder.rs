@@ -51,7 +51,7 @@ pub struct Instruction {
 impl Instruction {
     /// Returns the type the opcode imprints on its evaluation-stack result, if any.
     ///
-    /// Mirrors the `data_type` field on the parent [`OpcodeInfo`] — for
+    /// Mirrors the `data_type` field on the parent [`OpcodeInfo`] - for
     /// example `LitI4` returns `Some(PCodeDataType::I4)`, `FStR8` returns
     /// `Some(PCodeDataType::R8)`, control-flow / Nop / Stack opcodes return
     /// `None`. Build-time-resolved from the opcode's mnemonic suffix; no
@@ -69,7 +69,7 @@ impl Instruction {
     /// Returns the inferred type of the operand at slot `index`, if any.
     ///
     /// Today this projects the parent opcode's
-    /// [`data_type`](Self::data_type) for every operand slot — VB6 P-Code
+    /// [`data_type`](Self::data_type) for every operand slot - VB6 P-Code
     /// opcodes are monomorphic in their operand kinds (a `LitI4` always
     /// produces `I4`, an `FStR8` always stores `R8`), so the per-operand
     /// type equals the per-instruction type when one is defined. The
@@ -153,17 +153,17 @@ impl Instruction {
 /// disassembler from printing a sentinel as `loc_FFFF`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorFlow {
-    /// `On Error GoTo <label>` — installs the handler at the given P-Code offset.
+    /// `On Error GoTo <label>` - installs the handler at the given P-Code offset.
     OnErrorGoto(u16),
-    /// `On Error Resume Next` — operand `-1` (`0xFFFF`).
+    /// `On Error Resume Next` - operand `-1` (`0xFFFF`).
     OnErrorResumeNext,
-    /// `On Error GoTo 0` — disables error handling; operand `-2` (`0xFFFE`).
+    /// `On Error GoTo 0` - disables error handling; operand `-2` (`0xFFFE`).
     OnErrorGotoZero,
-    /// `Resume <label>` — resumes at the given P-Code offset.
+    /// `Resume <label>` - resumes at the given P-Code offset.
     ResumeLabel(u16),
-    /// `Resume Next` — resumes after the faulting statement; operand `-1` (`0xFFFF`).
+    /// `Resume Next` - resumes after the faulting statement; operand `-1` (`0xFFFF`).
     ResumeNext,
-    /// bare `Resume` — re-executes the faulting statement; operand `-2` (`0xFFFE`).
+    /// bare `Resume` - re-executes the faulting statement; operand `-2` (`0xFFFE`).
     Resume,
 }
 
@@ -235,7 +235,7 @@ impl<'a> InstructionIterator<'a> {
     /// bytes, so `proc_size` can include 1–3 trailing pad bytes after the final
     /// terminator. A partial "instruction" made entirely of those pad bytes
     /// (e.g. a lone `0x00`, which would otherwise look like a truncated
-    /// `LargeBos`) is not a decode error — it is the end of the real stream.
+    /// `LargeBos`) is not a decode error - it is the end of the real stream.
     fn tail_is_zero_padding(&self, start: usize) -> bool {
         self.bytes
             .get(start..self.limit)
@@ -253,7 +253,7 @@ impl Iterator for InstructionIterator<'_> {
 
         // VB6 pads each procedure's P-Code to a 4-byte boundary with zero
         // bytes. Once everything remaining is `0x00`, the real instruction
-        // stream is over — stop cleanly rather than decoding the padding (a
+        // stream is over - stop cleanly rather than decoding the padding (a
         // lone trailing `0x00` otherwise looks like a truncated `LargeBos`,
         // and an even pad like `00 00` like a spurious BOS marker). Real code
         // never reaches an all-zero tail: procedures end on a terminator, not
@@ -372,7 +372,7 @@ impl Iterator for InstructionIterator<'_> {
 
             // Ensure pos advances to the declared instruction size even when
             // the operand format is empty or incomplete. Many opcodes have
-            // size > 1 but no documented operand format specifiers — we still
+            // size > 1 but no documented operand format specifiers - we still
             // need to skip over their operand bytes to stay aligned.
             let lead_extra = opcode_bytes_consumed.saturating_sub(1);
             let expected_end = start
@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_trailing_double_zero_padding_no_spurious_bos() {
-        // ExitProc (0x14) then two 0x00 pad bytes — a clean `00 00` would decode
+        // ExitProc (0x14) then two 0x00 pad bytes - a clean `00 00` would decode
         // as a LargeBos; as trailing padding it must be dropped, leaving one insn.
         let insns = decode_all(&[0x14, 0x00, 0x00]);
         assert_eq!(insns.len(), 1);
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn test_data_type_and_operand_type() {
-        // LitI4 — should report I4 as both instruction- and operand-type.
+        // LitI4 - should report I4 as both instruction- and operand-type.
         let insns = decode_all(&[0xF5, 0x78, 0x56, 0x34, 0x12]);
         let insn = &insns[0];
         assert_eq!(insn.data_type(), Some(PCodeDataType::I4));
@@ -650,7 +650,7 @@ mod tests {
         let insn = &insns[0];
         assert_eq!(insn.data_type(), Some(PCodeDataType::I2));
         assert_eq!(insn.operand_type(0), Some(PCodeDataType::I2));
-        // ExitProc — Return semantics, no data type.
+        // ExitProc - Return semantics, no data type.
         let insns = decode_all(&[0x14]);
         let insn = &insns[0];
         assert_eq!(insn.data_type(), None);

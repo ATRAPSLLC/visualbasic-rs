@@ -132,9 +132,10 @@ impl<'a> BStr<'a> {
         }
         let u16s: Vec<u16> = self
             .data
-            .chunks_exact(2)
-            .filter_map(|pair| <[u8; 2]>::try_from(pair).ok())
-            .map(u16::from_le_bytes)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
             .collect();
         String::from_utf16_lossy(&u16s)
     }

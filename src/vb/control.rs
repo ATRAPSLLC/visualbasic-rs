@@ -15,7 +15,7 @@ use crate::{
     util::{read_u16_le, read_u32_le},
 };
 
-/// A COM GUID (CLSID/IID) as stored in PE data — 16 bytes, little-endian.
+/// A COM GUID (CLSID/IID) as stored in PE data - 16 bytes, little-endian.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Guid {
     /// Raw 16-byte GUID in binary form.
@@ -33,7 +33,7 @@ impl Guid {
 
     /// Returns a human-readable name if this is a well-known VB6 intrinsic control.
     ///
-    /// Uses **exact CLSID matching** only — no fuzzy/IID variant guessing.
+    /// Uses **exact CLSID matching** only - no fuzzy/IID variant guessing.
     /// The lookup table is generated at build time from `data/vb6_control_guids.csv`.
     ///
     /// For reliable control type identification, prefer
@@ -134,7 +134,7 @@ pub(crate) mod generated {
 ///
 /// The VA at +0x1C points to per-control-type data in the linker's workspace
 /// address space (typically 0x0073xxxx). Controls with the same CLSID share
-/// the same +0x1C value. This pointer is NOT patched to a valid PE VA — it's
+/// the same +0x1C value. This pointer is NOT patched to a valid PE VA - it's
 /// a vestigial linker artifact. In memory dumps it may be overwritten.
 ///
 /// # Name Resolution
@@ -222,7 +222,7 @@ impl<'a> ControlInfo<'a> {
 
     /// COM dispatch member type at offset 0x0E (`DESCKIND`).
     ///
-    /// Always 3 (`DESCKIND_TYPECOMP`) for normal controls — controls are type
+    /// Always 3 (`DESCKIND_TYPECOMP`) for normal controls - controls are type
     /// components in the COM IDispatch namespace. 0xFFFF for the form's default
     /// control (the implicit control with `index == 0xFFFF`). Used as the high
     /// word of the packed [`control_id`](Self::control_id) at +0x24 for hash
