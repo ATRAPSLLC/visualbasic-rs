@@ -5,7 +5,7 @@
 //! list of per-object COM registration records with CLSIDs, ProgIDs,
 //! interface GUIDs, and registry metadata.
 //!
-//! All offsets within this structure are **self-relative** — add the
+//! All offsets within this structure are **self-relative** - add the
 //! offset value to the structure's base VA to resolve.
 //!
 //! # Layout verified against
@@ -294,7 +294,7 @@ impl<'a> ComRegData<'a> {
 /// | 0x2C | 4 | `bSourceIfaceGuids` (self-relative offset to event interface GUID array) |
 /// | 0x30 | 4 | `dwSourceIfaceCount` (number of event interface GUIDs) |
 /// | 0x34 | 4 | `dwMiscStatus` (OLE MiscStatus value for DVASPECT\_CONTENT) |
-/// | 0x38 | 2 | `wObjectFlags` (registration flags — see [`ComRegObject::object_flags`]) |
+/// | 0x38 | 2 | `wObjectFlags` (registration flags - see [`ComRegObject::object_flags`]) |
 /// | 0x3A | 2 | `wToolboxBitmap32` (resource ID for ToolboxBitmap32) |
 /// | 0x3C | 2 | `wDefaultIcon` (resource ID for DefaultIcon) |
 /// | 0x3E | 2 | `wExtendedFlags` (bit 0 = has designer data at +0x40) |
@@ -449,12 +449,12 @@ impl<'a> ComRegObject<'a> {
     /// | 0 | `0x0001` | Skip registration (return immediately) |
     /// | 1 | `0x0002` | Register `IPersistPropertyBag` CATID |
     /// | 2 | `0x0004` | Register safe-for-scripting CATID |
-    /// | 5 | `0x0020` | Control — `Control` subkey, `ToolboxBitmap32` |
-    /// | 7 | `0x0080` | DocObject — `DocObject`, `DefaultIcon`, `InprocHandler32`, `BrowserFlags`, `EditFlags` |
+    /// | 5 | `0x0020` | Control - `Control` subkey, `ToolboxBitmap32` |
+    /// | 7 | `0x0080` | DocObject - `DocObject`, `DefaultIcon`, `InprocHandler32`, `BrowserFlags`, `EditFlags` |
     ///
     /// Composite masks used by the runtime:
-    /// - `0x00B2` (bits 1,4,5,7): Automatable — `ProgID`, `TypeLib`, `VERSION`, interface registration
-    /// - `0x00A0` (bits 5,7): Control or DocObject — `MiscStatus`, `MiscStatus\1`
+    /// - `0x00B2` (bits 1,4,5,7): Automatable - `ProgID`, `TypeLib`, `VERSION`, interface registration
+    /// - `0x00A0` (bits 5,7): Control or DocObject - `MiscStatus`, `MiscStatus\1`
     #[inline]
     pub fn object_flags(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x38)

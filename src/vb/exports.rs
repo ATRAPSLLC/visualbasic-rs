@@ -21,64 +21,64 @@ pub enum CallingConv {
     /// `__cdecl`: all args on stack; caller cleans stack.
     Cdecl,
     /// Special: x87 FPU intrinsic, FDIV workaround, or custom register convention.
-    /// No standard parameter passing — skip during prototype application.
+    /// No standard parameter passing - skip during prototype application.
     Special,
 }
 
 /// Parameter or return type for an MSVBVM60 export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VbParamType {
-    /// `void` — no value.
+    /// `void` - no value.
     Void,
-    /// `int16_t` — 16-bit signed integer (VB6 `Integer`).
+    /// `int16_t` - 16-bit signed integer (VB6 `Integer`).
     Int16,
-    /// `uint16_t` — 16-bit unsigned integer.
+    /// `uint16_t` - 16-bit unsigned integer.
     UInt16,
-    /// `int32_t` — 32-bit signed integer (VB6 `Long`).
+    /// `int32_t` - 32-bit signed integer (VB6 `Long`).
     Int32,
-    /// `uint32_t` — 32-bit unsigned integer.
+    /// `uint32_t` - 32-bit unsigned integer.
     UInt32,
-    /// `int64_t` — 64-bit signed integer (VB6 `Currency` raw).
+    /// `int64_t` - 64-bit signed integer (VB6 `Currency` raw).
     Int64,
-    /// `uint8_t` — 8-bit unsigned (VB6 `Byte`).
+    /// `uint8_t` - 8-bit unsigned (VB6 `Byte`).
     UInt8,
-    /// `float` — 32-bit IEEE 754 (VB6 `Single`).
+    /// `float` - 32-bit IEEE 754 (VB6 `Single`).
     Float,
-    /// `double` — 64-bit IEEE 754 (VB6 `Double`).
+    /// `double` - 64-bit IEEE 754 (VB6 `Double`).
     Double,
-    /// `BOOL` — Win32 boolean (32-bit).
+    /// `BOOL` - Win32 boolean (32-bit).
     Bool,
-    /// `BSTR` — pointer to `SysAllocString`'d wide string.
+    /// `BSTR` - pointer to `SysAllocString`'d wide string.
     Bstr,
-    /// `BSTR*` — pointer to BSTR location.
+    /// `BSTR*` - pointer to BSTR location.
     BstrPtr,
-    /// `VARIANT*` — pointer to 16-byte COM VARIANT.
+    /// `VARIANT*` - pointer to 16-byte COM VARIANT.
     VariantPtr,
-    /// `SAFEARRAY*` — pointer to COM safe array.
+    /// `SAFEARRAY*` - pointer to COM safe array.
     SafeArrayPtr,
-    /// `SAFEARRAY**` — pointer to SAFEARRAY pointer.
+    /// `SAFEARRAY**` - pointer to SAFEARRAY pointer.
     SafeArrayPtrPtr,
-    /// `IUnknown*` — COM interface pointer.
+    /// `IUnknown*` - COM interface pointer.
     IUnknownPtr,
-    /// `IUnknown**` — pointer to COM interface pointer.
+    /// `IUnknown**` - pointer to COM interface pointer.
     IUnknownPtrPtr,
-    /// `IDispatch*` — COM dispatch interface pointer.
+    /// `IDispatch*` - COM dispatch interface pointer.
     IDispatchPtr,
-    /// `IDispatch**` — pointer to COM dispatch pointer.
+    /// `IDispatch**` - pointer to COM dispatch pointer.
     IDispatchPtrPtr,
-    /// `HRESULT` — 32-bit COM result code.
+    /// `HRESULT` - 32-bit COM result code.
     Hresult,
-    /// `GUID*` — pointer to 16-byte COM GUID.
+    /// `GUID*` - pointer to 16-byte COM GUID.
     GuidPtr,
-    /// `void*` — opaque pointer.
+    /// `void*` - opaque pointer.
     VoidPtr,
-    /// `int32_t*` — pointer to 32-bit integer.
+    /// `int32_t*` - pointer to 32-bit integer.
     Int32Ptr,
-    /// `int16_t*` — pointer to 16-bit integer.
+    /// `int16_t*` - pointer to 16-bit integer.
     Int16Ptr,
-    /// `uint8_t*` — pointer to byte.
+    /// `uint8_t*` - pointer to byte.
     UInt8Ptr,
-    /// `int64_t*` — pointer to 64-bit integer.
+    /// `int64_t*` - pointer to 64-bit integer.
     Int64Ptr,
 }
 

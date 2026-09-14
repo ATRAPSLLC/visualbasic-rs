@@ -39,7 +39,7 @@ use crate::{
 /// | 0x44 | 4 | `dwLcid` (primary locale ID) |
 /// | 0x48 | 4 | `dwLcid2` (secondary locale ID) |
 /// | 0x4C | 4 | IDE data 3 (0 in compiled) |
-/// | 0x50 | 4 | `dwIdentifier` (always 2 — format version) |
+/// | 0x50 | 4 | `dwIdentifier` (always 2 - format version) |
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectTable<'a> {
     bytes: &'a [u8],
@@ -87,7 +87,7 @@ impl<'a> ObjectTable<'a> {
     ///
     /// Points to compiler-allocated .data section space (zeroed on disk,
     /// populated at runtime by MSVBVM60). Always exactly 0x10 bytes after
-    /// [`project_object_va`](Self::project_object_va) — they are two
+    /// [`project_object_va`](Self::project_object_va) - they are two
     /// entry points into the same COM object.
     ///
     /// At runtime, the first DWORD at this address contains the VBHeader

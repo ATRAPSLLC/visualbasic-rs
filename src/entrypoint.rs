@@ -7,7 +7,7 @@
 //! call    ThunRTMain          ; 0xE8 <rel32>  (or indirect call)
 //! ```
 //!
-//! VB6 ActiveX DLLs/OCXs use a different pattern — the DllMain entry
+//! VB6 ActiveX DLLs/OCXs use a different pattern - the DllMain entry
 //! does NOT contain the VBHeader VA. Instead, the DLL exports
 //! (`DllGetClassObject`, `DllRegisterServer`, etc.) each push it:
 //!
@@ -54,7 +54,7 @@ const VB5_MAGIC: &[u8; 4] = b"VB5!";
 ///
 /// - [`Error::EntryPointNotPush`] if both methods fail.
 pub fn extract_vb_header_va(map: &AddressMap<'_>, entry_point_rva: u32) -> Result<u32, Error> {
-    // Method 1: EXE entry point — push imm32 (0x68 xx xx xx xx)
+    // Method 1: EXE entry point - push imm32 (0x68 xx xx xx xx)
     if let Ok(code) = map.slice_from_rva(entry_point_rva, MIN_ENTRY_BYTES)
         && let Some(&[PUSH_IMM32, b0, b1, b2, b3]) = code.first_chunk::<5>()
     {

@@ -31,9 +31,9 @@ const STD_DATA_FORMAT_MAGIC: u32 = 0x6B263850;
 /// `StdDataFormat` COM object from MSSTDFMT.DLL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataFormatType {
-    /// General format — no special formatting applied.
+    /// General format - no special formatting applied.
     General = 0,
-    /// Number format — uses the format string for numeric display.
+    /// Number format - uses the format string for numeric display.
     Number = 1,
     /// Currency format.
     Currency = 2,
@@ -41,7 +41,7 @@ pub enum DataFormatType {
     ShortDate = 3,
     /// Long date format.
     LongDate = 4,
-    /// Custom format — fully user-defined via the format string.
+    /// Custom format - fully user-defined via the format string.
     /// When this type is active, TrueValue/FalseValue/NullValue
     /// VARIANT entries are also serialized.
     Custom = 5,
@@ -115,7 +115,7 @@ impl fmt::Display for DataFormatType {
 ///
 /// # Version History
 ///
-/// - `0x60000`: Original format — header + format string + custom values only.
+/// - `0x60000`: Original format - header + format string + custom values only.
 /// - `0x60001`: Adds FirstDayOfWeek trailer field.
 /// - `0x60002`: Adds FirstWeekOfYear trailer field (current/most common).
 #[derive(Debug, Clone)]
@@ -218,7 +218,7 @@ impl PropType {
 
 /// Returns the property name and type for a form binary property opcode.
 ///
-/// Property opcodes are **context-dependent** — the same index means different
+/// Property opcodes are **context-dependent** - the same index means different
 /// properties for different control types.
 ///
 /// Returns `None` for unknown opcodes.
@@ -642,7 +642,7 @@ fn parse_utf16_str(data: &[u8]) -> Option<(String, usize)> {
 /// A decoded property value from a form binary property stream.
 #[derive(Debug, Clone)]
 pub enum PropertyValue {
-    /// Flag-only — opcode emitted with no value data.
+    /// Flag-only - opcode emitted with no value data.
     Flag,
     /// Boolean/enum byte (1 byte).
     Byte(u8),
@@ -889,7 +889,7 @@ impl<'a> PropertyIter<'a> {
                 Some(PropertyValue::DataFormat(df))
             }
 
-            // Unknown ser_type — treat as flag
+            // Unknown ser_type - treat as flag
             _ => Some(PropertyValue::Flag),
         }
     }
@@ -906,7 +906,7 @@ impl<'a> Iterator for PropertyIter<'a> {
 
         let opcode_offset = self.pos;
 
-        // Known property — decode via ser_type dispatch
+        // Known property - decode via ser_type dispatch
         if let Some(desc) = property_descriptor(self.ctype, opcode) {
             self.pos = self.pos.checked_add(1)?; // consume opcode byte
             let value_offset = self.pos;
@@ -927,7 +927,7 @@ impl<'a> Iterator for PropertyIter<'a> {
             });
         }
 
-        // Unknown opcode — try lookahead to skip flag-like unknowns
+        // Unknown opcode - try lookahead to skip flag-like unknowns
         self.pos = self.pos.checked_add(1)?;
         if let Some(&next) = self.data.get(self.pos)
             && (next == 0xFF || property_info(self.ctype, next).is_some())
@@ -993,7 +993,7 @@ pub fn decode_form_type(
             FormControlType::UserControl
         }
         // Form and MDIForm gui types. UserDocument also uses Form gui type
-        // in practice — the Form table handles it correctly since the property
+        // in practice - the Form table handles it correctly since the property
         // streams overlap at common indices. The UserDocument table has additional
         // document-specific properties at indices 76+ (ScrollBars, Viewport, etc.)
         // that are only emitted for real UserDocument streams.

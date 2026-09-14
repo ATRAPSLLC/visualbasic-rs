@@ -98,7 +98,7 @@ impl<'a> MethodEntry<'a> {
         let maybe_proc_table = read_u32_le(stub_data, 0)?;
         let maybe_proc_size = read_u16_le(stub_data, 8)?;
         if map.is_va_in_image(maybe_proc_table) && maybe_proc_size > 0 && maybe_proc_size < 0x8000 {
-            // Looks like a valid ProcDscInfo — try to parse as P-Code
+            // Looks like a valid ProcDscInfo - try to parse as P-Code
             if let Ok(pcode) = PCodeMethod::parse(map, methods_va, index) {
                 return Ok(MethodEntry::PCode(pcode));
             }

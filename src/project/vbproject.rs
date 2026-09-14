@@ -77,7 +77,7 @@ pub struct CodeEntrypoint<'a> {
     /// What kind of entry this is.
     pub kind: EntrypointKind,
     /// Human-readable label (method name, `"ControlName_EventName"`, or
-    /// `"Sub Main"`). Empty when no name could be resolved — the kind
+    /// `"Sub Main"`). Empty when no name could be resolved - the kind
     /// and `object_index` / `method_index` are still authoritative.
     pub name_hint: Cow<'a, str>,
     /// Index of the owning object (form/class/module) in the object
@@ -109,16 +109,16 @@ pub struct CodeEntrypoint<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DiagnosticSeverity {
-    /// Routine/expected condition — surfaced for completeness, not a problem.
+    /// Routine/expected condition - surfaced for completeness, not a problem.
     /// Example: a standard `.bas` module legitimately has no
     /// `OptionalObjectInfo`; reporting that absence is informational.
     Info,
     /// Anomaly worth attention but recoverable. Example:
-    /// `methods_va == constants_va` — the method table overlaps the
+    /// `methods_va == constants_va` - the method table overlaps the
     /// constants pool, so method iteration will yield nothing useful, but
     /// the rest of the object can still be inspected.
     Warning,
-    /// Structural error — the affected substructure was unparseable and
+    /// Structural error - the affected substructure was unparseable and
     /// a downstream walker dropped it. Example: a control-table parse
     /// failure that stops the controls iterator early.
     Error,
@@ -172,7 +172,7 @@ pub enum CompilationMode {
     Pcode,
     /// Project flag indicates native AND no object holds P-Code methods.
     Native,
-    /// The project flag and per-object scan disagree — e.g. a P-Code
+    /// The project flag and per-object scan disagree - e.g. a P-Code
     /// project with native-compiled classes, or a native project where
     /// individual objects still carry P-Code dispatch entries. Treat
     /// each object's [`has_pcode`](crate::project::VbObject::has_pcode)
@@ -237,11 +237,11 @@ impl<'a> VbProject<'a> {
     /// Returns an [`Error`] whose [`recognition_failure`](Error::recognition_failure)
     /// classifies the failure mode:
     ///
-    /// - [`RecognitionFailure::UnrecognizedFormat`](crate::error::RecognitionFailure::UnrecognizedFormat) —
+    /// - [`RecognitionFailure::UnrecognizedFormat`](crate::error::RecognitionFailure::UnrecognizedFormat) -
     ///   not a valid PE32 container at all (or PE32+ which VB6 doesn't use).
-    /// - [`RecognitionFailure::NotRecognized`](crate::error::RecognitionFailure::NotRecognized) —
+    /// - [`RecognitionFailure::NotRecognized`](crate::error::RecognitionFailure::NotRecognized) -
     ///   PE walked OK but no VB6 marker (entry point or DLL-export pattern).
-    /// - [`RecognitionFailure::TruncatedContainer`](crate::error::RecognitionFailure::TruncatedContainer) —
+    /// - [`RecognitionFailure::TruncatedContainer`](crate::error::RecognitionFailure::TruncatedContainer) -
     ///   recognized as VB6 but a header/structure read overran the buffer.
     ///
     /// Consumers tagging files as "VB6 or not" should match on
@@ -420,7 +420,7 @@ impl<'a> VbProject<'a> {
     /// metadata structures are still accessible.
     ///
     /// Note: this reflects only the project-level `lpNativeCode` field. Some
-    /// VB6 binaries are **mixed** — the project-level flag says "native" but
+    /// VB6 binaries are **mixed** - the project-level flag says "native" but
     /// individual classes/forms still hold P-Code methods (or vice versa).
     /// Use [`compilation_mode`](Self::compilation_mode) for the
     /// per-object-aware classification.
@@ -436,16 +436,16 @@ impl<'a> VbProject<'a> {
     /// Classifies the binary's compilation mode by combining the project-level
     /// `lpNativeCode` flag with a per-object scan for P-Code methods.
     ///
-    /// - [`CompilationMode::Pcode`] — project flag says P-Code AND every
+    /// - [`CompilationMode::Pcode`] - project flag says P-Code AND every
     ///   object that has methods has P-Code methods (no native objects).
-    /// - [`CompilationMode::Native`] — project flag says native AND no
+    /// - [`CompilationMode::Native`] - project flag says native AND no
     ///   object holds P-Code methods.
-    /// - [`CompilationMode::Mixed`] — the two signals disagree, e.g. a
+    /// - [`CompilationMode::Mixed`] - the two signals disagree, e.g. a
     ///   P-Code project with some native-compiled classes, or a native
     ///   project where some objects still carry P-Code dispatch entries.
     ///
     /// This is the signal to use when deciding whether to expect P-Code in
-    /// a given object — `is_pcode()` alone misclassifies mixed-mode binaries.
+    /// a given object - `is_pcode()` alone misclassifies mixed-mode binaries.
     ///
     /// # Errors
     ///
@@ -579,7 +579,7 @@ impl<'a> VbProject<'a> {
     ///
     /// Walks the optional substructures and reports which were absent,
     /// which were present but anomalous, and which failed to parse.
-    /// Intended as a "parse health" probe for analyst UIs — a
+    /// Intended as a "parse health" probe for analyst UIs - a
     /// zero-element vec means everything the crate looked at is in
     /// expected shape.
     ///
@@ -590,7 +590,7 @@ impl<'a> VbProject<'a> {
     ///    `PrivateObjectDescriptor` (expected for modules), method-table
     ///    overlap (`methods_va == constants_va`).
     ///
-    /// This is a **best-effort** snapshot — it deliberately does not
+    /// This is a **best-effort** snapshot - it deliberately does not
     /// surface every possible quirk. New findings may be added in
     /// future versions; consumers should match on
     /// [`DiagnosticKind`] / [`DiagnosticSeverity`] using non-exhaustive
@@ -638,7 +638,7 @@ impl<'a> VbProject<'a> {
                 object_index: None,
                 site: "compilation_mode",
                 message: Cow::Borrowed(
-                    "project flag and per-object scan disagree — treat each object's has_pcode() as authoritative",
+                    "project flag and per-object scan disagree - treat each object's has_pcode() as authoritative",
                 ),
             });
         }
@@ -657,7 +657,7 @@ impl<'a> VbProject<'a> {
                     object_index,
                     site: "OptionalObjectInfo",
                     message: Cow::Borrowed(
-                        "OptionalObjectInfo missing for non-module object — controls/event sinks unavailable",
+                        "OptionalObjectInfo missing for non-module object - controls/event sinks unavailable",
                     ),
                 });
             }
@@ -670,7 +670,7 @@ impl<'a> VbProject<'a> {
                     object_index,
                     site: "PrivateObjectDescriptor",
                     message: Cow::Borrowed(
-                        "PrivateObjectDescriptor missing for class object — function type descriptors unavailable",
+                        "PrivateObjectDescriptor missing for class object - function type descriptors unavailable",
                     ),
                 });
             }
@@ -687,7 +687,17 @@ impl<'a> VbProject<'a> {
                         object_index,
                         site: "method_table",
                         message: Cow::Borrowed(
-                            "methods_va == constants_va — no method dispatch table for this object",
+                            "methods_va == constants_va - no method dispatch table for this object",
+                        ),
+                    });
+                } else if methods_va != 0 && info.method_count()? == 0 {
+                    out.push(ParseDiagnostic {
+                        kind: DiagnosticKind::Quirk,
+                        severity: DiagnosticSeverity::Info,
+                        object_index,
+                        site: "method_table",
+                        message: Cow::Borrowed(
+                            "method_count == 0 - methods_va is uninitialized, not a dispatch table",
                         ),
                     });
                 }
@@ -701,12 +711,12 @@ impl<'a> VbProject<'a> {
     ///
     /// Aggregates four sources into a single tagged stream:
     ///
-    /// 1. **Per-object method dispatch** — P-Code stubs and native methods
+    /// 1. **Per-object method dispatch** - P-Code stubs and native methods
     ///    from each object's [`code_entries`](crate::project::VbObject::code_entries).
-    /// 2. **Native method-link thunks** — JMP thunks that bridge COM vtable
+    /// 2. **Native method-link thunks** - JMP thunks that bridge COM vtable
     ///    dispatch to native code bodies (also via `code_entries`).
-    /// 3. **Event handlers** — connected control event handler VAs.
-    /// 4. **`Sub Main`** — the project-level entry procedure from
+    /// 3. **Event handlers** - connected control event handler VAs.
+    /// 4. **`Sub Main`** - the project-level entry procedure from
     ///    [`VbHeader::sub_main_va`], when non-zero.
     ///
     /// Each entry carries a tagged [`EntrypointKind`] so consumers can
@@ -733,10 +743,25 @@ impl<'a> VbProject<'a> {
         let mut out: Vec<CodeEntrypoint<'a>> = Vec::new();
 
         // 1-3. Per-object dispatch + thunks + events.
+        //    An object that does not read is dropped on its own: the entry points
+        //    of every other object are still real.
         for (obj_index, obj_result) in self.objects()?.enumerate() {
-            let obj = obj_result?;
+            let obj = match obj_result {
+                Ok(obj) => obj,
+                Err(e) => {
+                    crate::trace::warn_drop!("code_entrypoints.objects", error = ?e);
+                    continue;
+                }
+            };
             let object_index = u16::try_from(obj_index).ok();
-            for entry in obj.code_entries(None)? {
+            let entries = match obj.code_entries(None) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    crate::trace::warn_drop!("code_entrypoints.code_entries", error = ?e);
+                    continue;
+                }
+            };
+            for entry in entries {
                 out.push(CodeEntrypoint {
                     va: entry.va,
                     kind: EntrypointKind::from(entry.kind),
@@ -752,7 +777,7 @@ impl<'a> VbProject<'a> {
         }
 
         // 4. Sub Main. `lpSubMain` (VbHeader +0x2C) is the *callable* address
-        //    the runtime invokes — for a P-Code module that is the dispatch
+        //    the runtime invokes - for a P-Code module that is the dispatch
         //    stub VA, for a native module the procedure VA. Both were already
         //    collected as per-object entries above, so resolve the target by
         //    matching that address rather than re-implementing stub detection:
@@ -801,7 +826,7 @@ impl<'a> VbProject<'a> {
     /// The pair's [`form_data`](GuiEntryWithFormData::form_data) is `None`
     /// when the entry has no form data (`form_data_va == 0` or `size == 0`)
     /// and `Some(parser)` when the form binary parses successfully.
-    /// Parse errors silently degrade to `None` — use
+    /// Parse errors silently degrade to `None` - use
     /// [`form_data_from_gui_entry`](crate::project::VbObject::form_data_from_gui_entry)
     /// directly if you need the parse error.
     ///

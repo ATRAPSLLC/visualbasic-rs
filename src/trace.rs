@@ -3,8 +3,8 @@
 //! Several iterator and resolver paths in this crate **silently** drop
 //! malformed entries (`filter_map(|r| r.ok())`, `.ok()?` chains, etc.)
 //! rather than abort whole-structure parses. That fail-soft behavior is
-//! correct for adversarial malware analysis — one bad row should not
-//! poison the whole table — but it makes diagnosis difficult: you see
+//! correct for adversarial malware analysis - one bad row should not
+//! poison the whole table - but it makes diagnosis difficult: you see
 //! "23 entries parsed" without knowing whether 5 more were dropped.
 //!
 //! When the `tracing` feature is enabled, the macros in this module
@@ -31,7 +31,7 @@
 /// the dropped error / value formatted with `Debug`, recorded as a
 /// structured field when `tracing` is enabled.
 ///
-/// Expands to a no-op when the `tracing` feature is disabled — but still
+/// Expands to a no-op when the `tracing` feature is disabled - but still
 /// references the payload so `unused_variables` does not fire on the
 /// caller's `e` binding.
 #[macro_export]

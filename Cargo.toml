@@ -1,6 +1,6 @@
 [package]
 name = "visualbasic"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Parse and inspect Visual Basic 6 compiled binaries"
@@ -31,7 +31,7 @@ default = []
 # Emits structured `tracing` events at the per-iteration silent-skip sites
 # (decode errors, malformed entries, unparseable controls, etc.). Useful
 # for diagnosing why a parse silently dropped data without changing the
-# fail-soft semantics. No effect when disabled — the helpers compile to
+# fail-soft semantics. No effect when disabled - the helpers compile to
 # no-ops.
 tracing = ["dep:tracing"]
 

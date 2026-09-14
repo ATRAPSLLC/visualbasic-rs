@@ -34,7 +34,7 @@ use crate::{
 /// View over a CallAPI stub structure (the `DllFunctionCall` descriptor).
 ///
 /// This is the structure the compiler-emitted native stub pushes before
-/// `jmp DllFunctionCall` — both for `ImpAdCall*` constant-pool API calls and
+/// `jmp DllFunctionCall` - both for `ImpAdCall*` constant-pool API calls and
 /// for `Declare` imports (via [`ExternalDeclareInfo::native_stub_va`]). The
 /// VB6 runtime reads it in `DllFunctionCall` → `sub_660315de` to resolve the
 /// import lazily via `LoadLibraryA` + `GetProcAddress`.
@@ -51,7 +51,7 @@ use crate::{
 /// | 0x00 | 4 | `lpLibraryName` (VA to null-terminated DLL name) | `LoadLibraryA` |
 /// | 0x04 | 4 | `lpFunctionName` (VA to null-terminated API name) | `GetProcAddress` by name |
 /// | 0x08 | 2 | `wOrdinal` (import ordinal) | `GetProcAddress` by ordinal |
-/// | 0x0A | 2 | `wFlags` — **bit 1 (`0x02`) = resolve by ordinal** | path selector |
+/// | 0x0A | 2 | `wFlags` - **bit 1 (`0x02`) = resolve by ordinal** | path selector |
 /// | 0x0C | 4 | `lpResolveCache` (`+0x04` HMODULE, `+0x08` proc addr) | populated at first call |
 ///
 /// Only the first 8 bytes ([`SIZE`](Self::SIZE)) are required; the ordinal and
@@ -77,7 +77,7 @@ impl<'a> CallApiStub<'a> {
     /// Bit in [`flags`](Self::flags) indicating the import resolves by ordinal.
     ///
     /// When set, the runtime ignores [`function_name_va`](Self::function_name_va)
-    /// and calls `GetProcAddress` with [`ordinal`](Self::ordinal) instead — the
+    /// and calls `GetProcAddress` with [`ordinal`](Self::ordinal) instead - the
     /// API name is absent from the binary, a common API-hiding technique.
     pub const FLAG_BY_ORDINAL: u16 = 0x0002;
 
@@ -534,47 +534,47 @@ impl fmt::Display for VbBaseType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum VarType {
-    /// VT_EMPTY (0) — no value.
+    /// VT_EMPTY (0) - no value.
     Empty = 0,
-    /// VT_NULL (1) — SQL-style null.
+    /// VT_NULL (1) - SQL-style null.
     Null = 1,
-    /// VT_I2 (2) — 16-bit signed integer. Data: 2 bytes.
+    /// VT_I2 (2) - 16-bit signed integer. Data: 2 bytes.
     I2 = 2,
-    /// VT_I4 (3) — 32-bit signed integer. Data: 4 bytes.
+    /// VT_I4 (3) - 32-bit signed integer. Data: 4 bytes.
     I4 = 3,
-    /// VT_R4 (4) — 32-bit float. Data: 4 bytes.
+    /// VT_R4 (4) - 32-bit float. Data: 4 bytes.
     R4 = 4,
-    /// VT_R8 (5) — 64-bit float. Data: 8 bytes.
+    /// VT_R8 (5) - 64-bit float. Data: 8 bytes.
     R8 = 5,
-    /// VT_CY (6) — Currency (64-bit fixed-point). Data: 8 bytes.
+    /// VT_CY (6) - Currency (64-bit fixed-point). Data: 8 bytes.
     Cy = 6,
-    /// VT_DATE (7) — Date (as f64). Data: 8 bytes.
+    /// VT_DATE (7) - Date (as f64). Data: 8 bytes.
     Date = 7,
-    /// VT_BSTR (8) — Unicode string. Data: u16 length + UTF-16LE bytes.
+    /// VT_BSTR (8) - Unicode string. Data: u16 length + UTF-16LE bytes.
     Bstr = 8,
-    /// VT_DISPATCH (9) — IDispatch pointer. Data: 4 bytes.
+    /// VT_DISPATCH (9) - IDispatch pointer. Data: 4 bytes.
     Dispatch = 9,
-    /// VT_ERROR (10) — SCODE. Data: 4 bytes.
+    /// VT_ERROR (10) - SCODE. Data: 4 bytes.
     Error = 10,
-    /// VT_BOOL (11) — Boolean (VARIANT_BOOL). Data: 2 bytes.
+    /// VT_BOOL (11) - Boolean (VARIANT_BOOL). Data: 2 bytes.
     Bool = 11,
-    /// VT_VARIANT (12) — Variant (nested). Data: variable.
+    /// VT_VARIANT (12) - Variant (nested). Data: variable.
     Variant = 12,
-    /// VT_UNKNOWN (13) — IUnknown pointer. Data: 4 bytes.
+    /// VT_UNKNOWN (13) - IUnknown pointer. Data: 4 bytes.
     Unknown = 13,
-    /// VT_DECIMAL (14) — 96-bit decimal. Data: 16 bytes.
+    /// VT_DECIMAL (14) - 96-bit decimal. Data: 16 bytes.
     Decimal = 14,
-    /// VT_I1 (16) — 8-bit signed integer. Data: 2 bytes (word-aligned).
+    /// VT_I1 (16) - 8-bit signed integer. Data: 2 bytes (word-aligned).
     I1 = 16,
-    /// VT_UI1 (17) — 8-bit unsigned integer. Data: 2 bytes (word-aligned).
+    /// VT_UI1 (17) - 8-bit unsigned integer. Data: 2 bytes (word-aligned).
     Ui1 = 17,
-    /// VT_UI2 (18) — 16-bit unsigned integer. Data: 2 bytes.
+    /// VT_UI2 (18) - 16-bit unsigned integer. Data: 2 bytes.
     Ui2 = 18,
-    /// VT_RECORD (19) — UDT / record. Data: 4 bytes.
+    /// VT_RECORD (19) - UDT / record. Data: 4 bytes.
     Record = 19,
-    /// VT_INT (22) — Machine-sized signed integer. Data: 4 bytes.
+    /// VT_INT (22) - Machine-sized signed integer. Data: 4 bytes.
     Int = 22,
-    /// VT_UINT (23) — Machine-sized unsigned integer. Data: 4 bytes.
+    /// VT_UINT (23) - Machine-sized unsigned integer. Data: 4 bytes.
     Uint = 23,
 }
 
@@ -617,7 +617,7 @@ impl VarType {
             Self::I2 => 2,
             Self::I4 | Self::R4 => 4,
             Self::R8 | Self::Cy | Self::Date => 8,
-            Self::Bstr => 0, // Variable — handled separately
+            Self::Bstr => 0, // Variable - handled separately
             Self::Dispatch | Self::Error => 4,
             Self::Bool => 2,
             Self::Variant => 0,
@@ -729,7 +729,7 @@ impl fmt::Display for ExternalKind {
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 4 | `fExternalType` — see [`ExternalKind`] |
+/// | 0x00 | 4 | `fExternalType` - see [`ExternalKind`] |
 /// | 0x04 | 4 | `lpExternalObject` (VA to component descriptor) |
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalTableEntry<'a> {
@@ -815,7 +815,7 @@ impl<'a> ExternalTableEntry<'a> {
 /// |--------|------|-------|
 /// | 0x00 | 4 | `lpLibraryName` (VA to DLL name string) |
 /// | 0x04 | 4 | `lpFunctionName` (VA to API function name string) |
-/// | 0x08 | 4 | `dwFlags` (always 0x00040000 — calling convention) |
+/// | 0x08 | 4 | `dwFlags` (always 0x00040000 - calling convention) |
 /// | 0x0C | 4 | `lpNativeStub` (VA to 12-byte native call stub in .data) |
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalDeclareInfo<'a> {
@@ -863,7 +863,7 @@ impl<'a> ExternalDeclareInfo<'a> {
     /// Resolves the `DllFunctionCall` descriptor behind this declare's native stub.
     ///
     /// The stub at [`native_stub_va`](Self::native_stub_va) is a
-    /// `push <descriptor>; jmp DllFunctionCall` thunk — the same shape used by
+    /// `push <descriptor>; jmp DllFunctionCall` thunk - the same shape used by
     /// `ImpAdCall*` constant-pool entries. Resolving it exposes the
     /// [`CallApiStub::ordinal`] and [`CallApiStub::is_by_ordinal`] fields, so a
     /// `Declare ... Alias "#123"` ordinal import can be distinguished from a
@@ -957,24 +957,24 @@ impl<'a> ExternalTypelibInfo<'a> {
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 4 | `dwEntrySize` — total entry size (self-relative advance to next) |
-/// | 0x04 | 4 | `bComponentInfo` — self-rel offset to component info block |
-/// | 0x08 | 4 | `bField08` — self-rel offset (interface data 1) |
-/// | 0x0C | 4 | `bField0C` — self-rel offset (interface data 2) |
-/// | 0x10 | 4 | `bField10` — self-rel offset (interface data 3) |
-/// | 0x14 | 4 | `bField14` — self-rel offset (interface data 4) |
-/// | 0x18 | 4 | `bEventHandlers` — self-rel offset to event handler array |
-/// | 0x1C | 4 | `bField1C` — self-rel offset (interface data 5) |
-/// | 0x20 | 4 | `dwInfoBlockSize` — component info block size (direct value) |
-/// | 0x24 | 4 | `bField24` — self-rel offset (0 = not present) |
-/// | 0x28 | 4 | `bOcxFilename` — self-rel offset to OCX filename string |
-/// | 0x2C | 4 | `bProgId` — self-rel offset to ProgID string (e.g., "TabDlg.SSTab") |
-/// | 0x30 | 4 | `bClassName` — self-rel offset to class name (e.g., "SSTab") |
+/// | 0x00 | 4 | `dwEntrySize` - total entry size (self-relative advance to next) |
+/// | 0x04 | 4 | `bComponentInfo` - self-rel offset to component info block |
+/// | 0x08 | 4 | `bField08` - self-rel offset (interface data 1) |
+/// | 0x0C | 4 | `bField0C` - self-rel offset (interface data 2) |
+/// | 0x10 | 4 | `bField10` - self-rel offset (interface data 3) |
+/// | 0x14 | 4 | `bField14` - self-rel offset (interface data 4) |
+/// | 0x18 | 4 | `bEventHandlers` - self-rel offset to event handler array |
+/// | 0x1C | 4 | `bField1C` - self-rel offset (interface data 5) |
+/// | 0x20 | 4 | `dwInfoBlockSize` - component info block size (direct value) |
+/// | 0x24 | 4 | `bField24` - self-rel offset (0 = not present) |
+/// | 0x28 | 4 | `bOcxFilename` - self-rel offset to OCX filename string |
+/// | 0x2C | 4 | `bProgId` - self-rel offset to ProgID string (e.g., "TabDlg.SSTab") |
+/// | 0x30 | 4 | `bClassName` - self-rel offset to class name (e.g., "SSTab") |
 ///
 /// # Component Info Block (at `bComponentInfo`)
 ///
 /// Variable-length block with at least 0x93 bytes:
-/// - +0x86 (u8): flags — bit 7 = uses special load path in runtime
+/// - +0x86 (u8): flags - bit 7 = uses special load path in runtime
 /// - +0x92 (u16): event handler count
 ///
 /// # Event Handler Array (at `bEventHandlers`)

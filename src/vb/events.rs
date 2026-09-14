@@ -26,7 +26,7 @@ use crate::{addressmap::AddressMap, error::Error, util::read_u32_le};
 /// event dispatch ID before falling through to the P-Code engine. The method
 /// dispatch table points to +0x07, where `eax` is cleared (direct call, no
 /// event). The `66 3D` at +0x05 is a `cmp ax, imm16` that harmlessly overlaps
-/// with the `xor eax, eax` bytes — a VB6 compiler space optimization.
+/// with the `xor eax, eax` bytes - a VB6 compiler space optimization.
 #[derive(Clone, Copy, Debug)]
 pub struct EventHandlerThunk {
     /// Event dispatch ID passed in eax (from `mov eax, imm32` at +0x00).
@@ -208,9 +208,9 @@ impl fmt::Display for IUnknownThunk {
 /// | 0x00 | Reserved (always 0) |
 /// | 0x04 | Back-pointer to this control's [`ControlInfo`](crate::vb::control::ControlInfo) entry |
 /// | 0x08 | Back-pointer to parent [`ObjectInfo`](crate::vb::object::ObjectInfo) |
-/// | 0x0C | `EVENT_SINK_QueryInterface` thunk VA — `jmp [IAT]` to MSVBVM60 |
-/// | 0x10 | `EVENT_SINK_AddRef` thunk VA — `jmp [IAT]` to MSVBVM60 |
-/// | 0x14 | `EVENT_SINK_Release` thunk VA — `jmp [IAT]` to MSVBVM60 |
+/// | 0x0C | `EVENT_SINK_QueryInterface` thunk VA - `jmp [IAT]` to MSVBVM60 |
+/// | 0x10 | `EVENT_SINK_AddRef` thunk VA - `jmp [IAT]` to MSVBVM60 |
+/// | 0x14 | `EVENT_SINK_Release` thunk VA - `jmp [IAT]` to MSVBVM60 |
 /// | 0x18+ | Event handler VAs (0 = not connected) |
 ///
 /// The IUnknown thunks at +0x0C-0x14 are 6-byte `FF 25 imm32` indirect jumps

@@ -16,7 +16,7 @@
 //!   fixed-length string (nibble 4) it calls `SysAllocStringLen` with the char
 //!   count at entry+0x08; for an array (nibble 5) it builds the SafeArray.
 //! - `CleanupSingleEntry` (0x66016AAA) is the **destruct** side and is the
-//!   authoritative source of each member's resource type — it dispatches on the
+//!   authoritative source of each member's resource type - it dispatches on the
 //!   low nibble of the type byte to `SysFreeString` / `__vbaFreeVar` /
 //!   `IUnknown::Release` / `SafeArray*` / `__vbaRecDestructAnsi`.
 //! - `CalcPropertyDataSize` (0x660169D3) computes the entry stride; the MLIL of
@@ -31,9 +31,9 @@
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x00 | 2 | `wFrameOffset` — target byte offset within instance data |
-//! | 0x02 | 1 | `bType` — bits \[3:0\] = [`ControlPropertyType`] nibble, bits \[7:4\] = modifiers |
-//! | 0x03 | 1 | `bFlags` — modifier flags (bit 2 = 6-byte floor, bit 5 = widen to 8) |
+//! | 0x00 | 2 | `wFrameOffset` - target byte offset within instance data |
+//! | 0x02 | 1 | `bType` - bits \[3:0\] = [`ControlPropertyType`] nibble, bits \[7:4\] = modifiers |
+//! | 0x03 | 1 | `bFlags` - modifier flags (bit 2 = 6-byte floor, bit 5 = widen to 8) |
 //! | 0x04 | var | Type-dependent data (e.g. +0x08 = string char count / array element info) |
 
 use std::fmt;
@@ -44,12 +44,12 @@ use crate::{error::Error, util::read_u16_le};
 ///
 /// Recovered from `CleanupSingleEntry` (0x66016AAA): the runtime walks the same
 /// entry array on object teardown and dispatches on the type nibble. This is
-/// the forensically meaningful classification — it states exactly which members
+/// the forensically meaningful classification - it states exactly which members
 /// hold heap resources (BSTRs, objects, arrays, records) versus plain inline
 /// values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupAction {
-    /// Inline value member — no heap resource, nothing to release.
+    /// Inline value member - no heap resource, nothing to release.
     None,
     /// BSTR freed via `SysFreeString` (nibbles 1 and 4).
     FreeString,
@@ -91,20 +91,20 @@ impl fmt::Display for CleanupAction {
 /// raw nibble preserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlPropertyType {
-    /// Nibble 1 — dynamic `String` (BSTR). Zero-initialized, freed on destruct.
+    /// Nibble 1 - dynamic `String` (BSTR). Zero-initialized, freed on destruct.
     String,
-    /// Nibble 2 — `Variant`. Cleared via `__vbaFreeVar` on destruct.
+    /// Nibble 2 - `Variant`. Cleared via `__vbaFreeVar` on destruct.
     Variant,
-    /// Nibble 3 — object reference (`Object` / typed class). Released on destruct.
+    /// Nibble 3 - object reference (`Object` / typed class). Released on destruct.
     Object,
-    /// Nibble 4 — fixed-length `String`. Allocated to a fixed char count
+    /// Nibble 4 - fixed-length `String`. Allocated to a fixed char count
     /// (`SysAllocStringLen`, length at entry+0x08) at init, freed on destruct.
     FixedString,
-    /// Nibble 5 — dynamic array (`SafeArray`). Built at init, destroyed on destruct.
+    /// Nibble 5 - dynamic array (`SafeArray`). Built at init, destroyed on destruct.
     Array,
-    /// Nibble 6 — fixed/locked array. Released via `SafeArrayUnlock` on destruct.
+    /// Nibble 6 - fixed/locked array. Released via `SafeArrayUnlock` on destruct.
     FixedArray,
-    /// Nibble 9 — user-defined type (record). Destructed recursively on teardown.
+    /// Nibble 9 - user-defined type (record). Destructed recursively on teardown.
     Udt,
     /// Inline value member with no heap resource (nibbles 0, 7, 8, 0xA, 0xB, 0xC).
     ///
@@ -297,7 +297,7 @@ impl<'a> ControlPropertyEntry<'a> {
                 context: "calc_safearray_total_size desc_offset+3",
             })?;
         if self.bytes.len() < needed {
-            // Not enough data — use a safe minimum.
+            // Not enough data - use a safe minimum.
             return Ok(0x28);
         }
         let dim_count = read_u16_le(self.bytes, desc_offset)? as usize;

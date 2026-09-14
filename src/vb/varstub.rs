@@ -5,7 +5,7 @@
 //! descriptor that tells the compiler which VBA runtime helper functions
 //! implement the property Get/Let/Set accessors for a public variable.
 //!
-//! **Not read by MSVBVM60.DLL at runtime** — this is compiler/IDE metadata
+//! **Not read by MSVBVM60.DLL at runtime** - this is compiler/IDE metadata
 //! only. However, the data is present in compiled binaries and useful for
 //! understanding which runtime functions a variable depends on.
 //!
@@ -13,11 +13,11 @@
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x00 | 2 | `wHeaderSize` — header bytes before name data (0x0C + params*4) |
-//! | 0x02 | 2 | `wDataSize` — size of name/data section after header |
+//! | 0x00 | 2 | `wHeaderSize` - header bytes before name data (0x0C + params*4) |
+//! | 0x02 | 2 | `wDataSize` - size of name/data section after header |
 //! | 0x04 | 2 | Reserved (zero) |
-//! | 0x06 | 2 | `wParamCount` — indexed property parameter count |
-//! | 0x08 | 2 | `wDataSize2` — copy of wDataSize |
+//! | 0x06 | 2 | `wParamCount` - indexed property parameter count |
+//! | 0x08 | 2 | `wDataSize2` - copy of wDataSize |
 //! | 0x0A | 1 | `bFlags1` |
 //! | 0x0B | 1 | `bFlags2` |
 //! | 0x0C | N×4 | Parameter descriptors: `[{u16 offset, u16 type}]` × wParamCount |

@@ -8,8 +8,8 @@
 )]
 //!
 //! Reads CSVs at build time and produces:
-//! - `opcode_generated.rs` — 6 static `[OpcodeInfo; 256]` opcode arrays
-//! - `vb6_data_generated.rs` — control GUIDs, event templates, VB6 constants
+//! - `opcode_generated.rs` - 6 static `[OpcodeInfo; 256]` opcode arrays
+//! - `vb6_data_generated.rs` - control GUIDs, event templates, VB6 constants
 
 use std::collections::HashMap;
 use std::env;

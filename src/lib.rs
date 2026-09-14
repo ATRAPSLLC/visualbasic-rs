@@ -46,7 +46,7 @@
 //! VB6 binaries from the wild include malware samples that may be truncated,
 //! have inconsistent structure-size fields, or carry intentionally adversarial
 //! VAs. Every public API in this crate falls into one of three behavioural
-//! categories — pick the one that matches your call site:
+//! categories - pick the one that matches your call site:
 //!
 //! ## 1. Fail-loud at the byte boundary (primitive accessors)
 //!
@@ -66,12 +66,12 @@
 //! [`InstructionIterator`](crate::pcode::decoder::InstructionIterator),
 //! [`PCodeMethodIterator`](crate::project::PCodeMethodIterator), and
 //! [`ConstPoolIter`](crate::vb::constantpool::ConstPoolIter) yield
-//! `Item = Result<T, Error>` per entry — they emit one `Err` per malformed
+//! `Item = Result<T, Error>` per entry - they emit one `Err` per malformed
 //! row and *keep going*, so a single bad entry does not poison the whole
 //! sweep. Match on each `Item` to pull successes, log failures, or stop
 //! early on first error per your policy. Iteration ends only when the
 //! underlying byte stream is exhausted (or a structural-truncation
-//! `Err` is yielded — most iterators continue past per-entry errors).
+//! `Err` is yielded - most iterators continue past per-entry errors).
 //!
 //! ## 3. Silent fail-soft (high-level joins)
 //!
@@ -91,9 +91,9 @@
 //! Parse failures during the recognition phase are classified by
 //! [`Error::recognition_failure`] into one of:
 //!
-//! - [`RecognitionFailure::NotRecognized`] — valid PE but no VB6 marker.
-//! - [`RecognitionFailure::TruncatedContainer`] — looks VB6 but truncated.
-//! - [`RecognitionFailure::UnrecognizedFormat`] — not a PE container at all.
+//! - [`RecognitionFailure::NotRecognized`] - valid PE but no VB6 marker.
+//! - [`RecognitionFailure::TruncatedContainer`] - looks VB6 but truncated.
+//! - [`RecognitionFailure::UnrecognizedFormat`] - not a PE container at all.
 //!
 //! Consumers tagging files as "VB6 or not" should match on this
 //! classification to silently skip non-VB6 files and only log the
@@ -103,7 +103,7 @@
 //!
 //! The crate is built under the lint set
 //! `clippy::{unwrap_used, expect_used, panic, arithmetic_side_effects,
-//! indexing_slicing}` — every byte read goes through a checked helper, every
+//! indexing_slicing}` - every byte read goes through a checked helper, every
 //! offset computation uses `checked_add` / `wrapping_add` / `saturating_add`
 //! depending on semantics, and every slice access uses `.get(...)` rather
 //! than `[]`. **No input byte sequence can panic this parser.** Tests are
@@ -160,7 +160,7 @@ pub use project::{
 // Thread-safety guarantee: VbProject and PCodeMethod borrow from a `&[u8]`
 // file buffer, hold no interior mutability, and contain no raw pointers or
 // `Cell`/`RefCell`. They are therefore both `Send` and `Sync` whenever the
-// borrowed buffer is — i.e., always, for any `&'a [u8]` input. This static
+// borrowed buffer is - i.e., always, for any `&'a [u8]` input. This static
 // assertion makes that guarantee a compile-time invariant: a future change
 // that adds a non-Send/non-Sync field will break the build here, not silently
 // at a downstream `.await` point.

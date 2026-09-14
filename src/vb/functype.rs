@@ -9,16 +9,16 @@
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x00 | 1 | `bArgSize` — encodes arg count (bits 3-7) and property kind (bits 0-2) |
-//! | 0x01 | 1 | `bFlags` — bit 0: function has a return type |
-//! | 0x02 | 2 | `wVTableOffset` — COM vtable offset; bit 0 is runtime flag (mask off) |
-//! | 0x04 | 2 | `iObjectIndex` — signed; -1 (0xFFFF) = no COM object type reference |
+//! | 0x00 | 1 | `bArgSize` - encodes arg count (bits 3-7) and property kind (bits 0-2) |
+//! | 0x01 | 1 | `bFlags` - bit 0: function has a return type |
+//! | 0x02 | 2 | `wVTableOffset` - COM vtable offset; bit 0 is runtime flag (mask off) |
+//! | 0x04 | 2 | `iObjectIndex` - signed; -1 (0xFFFF) = no COM object type reference |
 //! | 0x06 | 2 | Reserved (always 0) |
-//! | 0x08 | 4 | `lpOptionalDefaults` — VA to optional param default values header (see below) |
-//! | 0x0C | 2 | `wNameIndex` — method DISPID for IDispatch::GetIDsOfNames resolution |
-//! | 0x0E | 1 | `bReturnType` — [`VbType`] byte for the return value |
-//! | 0x0F | 1 | `bFuncFlags` — 0x60 for regular Sub/Function, 0x68 for Property |
-//! | 0x10 | 4 | `lpParamNames` — VA to parameter name string pointer array |
+//! | 0x08 | 4 | `lpOptionalDefaults` - VA to optional param default values header (see below) |
+//! | 0x0C | 2 | `wNameIndex` - method DISPID for IDispatch::GetIDsOfNames resolution |
+//! | 0x0E | 1 | `bReturnType` - [`VbType`] byte for the return value |
+//! | 0x0F | 1 | `bFuncFlags` - 0x60 for regular Sub/Function, 0x68 for Property |
+//! | 0x10 | 4 | `lpParamNames` - VA to parameter name string pointer array |
 //! | 0x14 | 12 | Padding (always 0) |
 //!
 //! # Property Kind Encoding
@@ -158,7 +158,7 @@ impl<'a> FuncTypDesc<'a> {
     /// | Bit | Mask | Meaning |
     /// |-----|------|---------|
     /// | 0 | 0x01 | Has return type |
-    /// | 1 | 0x02 | Has ParamArray (variable argument list) — confirmed in `MarshalDispParamsToNative` |
+    /// | 1 | 0x02 | Has ParamArray (variable argument list) - confirmed in `MarshalDispParamsToNative` |
     /// | 2-7 | 0xFC | Bits 2-7 encode the named argument count (0x3F = none) |
     #[inline]
     pub fn flags(&self) -> u8 {
@@ -187,7 +187,7 @@ impl<'a> FuncTypDesc<'a> {
     /// VTable offset at offset 0x02 (2 bytes, little-endian).
     ///
     /// This is the byte offset into the COM vtable for this method.
-    /// Bit 0 is masked off — it indicates "has return type" redundantly
+    /// Bit 0 is masked off - it indicates "has return type" redundantly
     /// (same as `bFlags` bit 0). Confirmed in `ResolveDispatchToFuncTypDesc`
     /// which reads `*(ftd+2) & 1` to check this flag. The first user method
     /// typically starts at offset 0x1C (after IUnknown + IDispatch = 7 methods).
@@ -218,14 +218,14 @@ impl<'a> FuncTypDesc<'a> {
     /// Points to an 8-byte header structure used by the runtime's
     /// `OptionalDefaultsNext` (0x660F5FCA) for looking up default values
     /// of optional parameters. **Not** the arg type data (those are inline
-    /// at +0x20 — see [`arg_types`](Self::arg_types)).
+    /// at +0x20 - see [`arg_types`](Self::arg_types)).
     ///
     /// # Header Layout (at this VA)
     ///
     /// | Offset | Size | Field |
     /// |--------|------|-------|
-    /// | 0x00 | 4 | `dwTotalSize` — bytes in the defaults data area |
-    /// | 0x04 | 4 | `lpDefaults` — VA of first default value entry |
+    /// | 0x00 | 4 | `dwTotalSize` - bytes in the defaults data area |
+    /// | 0x04 | 4 | `lpDefaults` - VA of first default value entry |
     ///
     /// Each default value entry is:
     /// - `u16` VarType code (2=Integer, 3=Long, 8=BSTR, etc.)
@@ -340,9 +340,9 @@ impl<'a> FuncTypDesc<'a> {
 
     /// Returns the procedure kind keyword for display.
     ///
-    /// - `"Sub"` — no return type, not a property
-    /// - `"Function"` — has return type, not a property
-    /// - `"Property Get"` / `"Property Let"` / `"Property Set"` — property procedures
+    /// - `"Sub"` - no return type, not a property
+    /// - `"Function"` - has return type, not a property
+    /// - `"Property Get"` / `"Property Let"` / `"Property Set"` - property procedures
     pub fn kind_keyword(&self) -> &'static str {
         if self.is_property() {
             match self.property_kind() {
@@ -383,7 +383,7 @@ impl<'a> FuncTypDesc<'a> {
     /// ```
     ///
     /// To use this method, the `data` slice passed to [`parse`](Self::parse)
-    /// must extend beyond the 0x14-byte minimum — at least `0x20 + arg_count`
+    /// must extend beyond the 0x14-byte minimum - at least `0x20 + arg_count`
     /// bytes are needed. Use [`parse_extended`](Self::parse_extended) to
     /// ensure the slice is large enough.
     ///
@@ -518,9 +518,10 @@ impl<'a> FuncTypDesc<'a> {
                 };
                 let text = String::from_utf16_lossy(
                     &str_bytes
-                        .chunks_exact(2)
-                        .filter_map(|c| <[u8; 2]>::try_from(c).ok())
-                        .map(u16::from_le_bytes)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&c| u16::from_le_bytes(c))
                         .collect::<Vec<_>>(),
                 );
                 defaults.push(OptionalDefault {

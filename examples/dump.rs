@@ -1,4 +1,4 @@
-//! Full VB6 project dump — ildasm-style text output.
+//! Full VB6 project dump - ildasm-style text output.
 //!
 //! Usage:
 //!   cargo run --example dump -- <path-to-vb6-exe>
@@ -406,7 +406,7 @@ fn resolve_external(
             if let Some(decl) = ext.as_declare(map) {
                 let lib = decl.library_name(map).unwrap_or("?");
                 let func = decl.function_name(map).unwrap_or("?");
-                // Surface by-ordinal imports — the API name is absent and the
+                // Surface by-ordinal imports - the API name is absent and the
                 // runtime resolves via GetProcAddress(ordinal), a name-hiding tell.
                 match decl.api_stub(map) {
                     Some(stub) if stub.is_by_ordinal() => {

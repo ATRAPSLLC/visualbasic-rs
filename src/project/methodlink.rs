@@ -17,7 +17,7 @@
 //! ```
 //!
 //! The `this_adjust` values observed:
-//! - `0xFFFF`: placeholder — the method uses runtime vtable dispatch, not
+//! - `0xFFFF`: placeholder - the method uses runtime vtable dispatch, not
 //!   direct COM interface delegation. Common for standalone class modules.
 //! - Non-zero small values (e.g., `0x33`, `0x93`): real COM interface offset
 //!   adjustment. Matches the event sink thunk adjustments for the same object.
@@ -43,7 +43,7 @@ pub struct MethodLink {
     pub code_va: u32,
     /// COM `this` pointer adjustment from the SUB instruction.
     ///
-    /// - `Some(0xFFFF)`: placeholder — runtime vtable dispatch method.
+    /// - `Some(0xFFFF)`: placeholder - runtime vtable dispatch method.
     /// - `Some(n)`: real interface offset adjustment (n bytes subtracted from `this`).
     /// - `None`: no SUB instruction follows the JMP (direct call, no adjustment).
     pub this_adjust: Option<u32>,
@@ -127,7 +127,7 @@ impl<'a, 'p> Iterator for MethodLinkIterator<'a, 'p> {
                 .wrapping_add(5)
                 .wrapping_add(i64::from(rel32)) as u32
         } else {
-            // Not a JMP — the thunk VA IS the code VA
+            // Not a JMP - the thunk VA IS the code VA
             thunk_va
         };
 

@@ -1,4 +1,4 @@
-//! ProjectInfo2 structure parser — COM dispatch interface metadata.
+//! ProjectInfo2 structure parser - COM dispatch interface metadata.
 //!
 //! The `ProjectInfo2` structure is pointed to by `ObjectTable.lpProjectInfo2`
 //! (+0x08). It contains COM type information for the project's forms and
@@ -151,12 +151,12 @@ impl<'a> InterfaceMetadata<'a> {
     /// VA of the typelib path string at offset 0x10.
     ///
     /// Points to a null-terminated ANSI path identifying the source typelib
-    /// for this interface — typically the path of the OCX/DLL whose typelib
+    /// for this interface - typically the path of the OCX/DLL whose typelib
     /// declares the dispatch interface (e.g. `"C:\Windows\System32\Comctl32.ocx"`).
     /// May be `0` for project-internal interfaces with no external typelib.
     ///
     /// Pair with [`typelib_guid_va`](Self::typelib_guid_va) to get the
-    /// typelib's CLSID — together they identify which DLL/OCX provides
+    /// typelib's CLSID - together they identify which DLL/OCX provides
     /// the type information for this interface (a supply-chain signal
     /// useful for malware triage).
     ///
@@ -449,7 +449,7 @@ fn extract_all_name_blocks(data: &[u8]) -> Vec<Vec<&str>> {
             continue;
         }
 
-        // Found a valid identifier — extract the full block
+        // Found a valid identifier - extract the full block
         let (block, end) = extract_name_block(data, pos);
         if !block.is_empty() {
             blocks.push(block);

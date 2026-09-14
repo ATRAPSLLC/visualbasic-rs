@@ -42,7 +42,7 @@ pub enum DispatchTable {
 /// traced from MSVBVM60.DLL handler disassembly.
 ///
 /// All semantic fields (`semantics`, `data_type`) are resolved at
-/// **build time** from the CSV data — no runtime string parsing.
+/// **build time** from the CSV data - no runtime string parsing.
 #[derive(Debug, Clone, Copy)]
 pub struct OpcodeInfo {
     /// Which dispatch table this opcode belongs to.
@@ -137,7 +137,7 @@ impl OpcodeInfo {
     ///
     /// Includes returns ([`OpcodeSemantics::Return`]) and unconditional
     /// branches ([`OpcodeSemantics::Branch`] with `conditional: false`).
-    /// Conditional branches **do not** terminate — control falls through
+    /// Conditional branches **do not** terminate - control falls through
     /// to the next instruction on the not-taken path.
     ///
     /// Useful for CFG construction and basic-block splitting.
@@ -162,7 +162,7 @@ impl OpcodeInfo {
 
     /// Returns `true` if this opcode is a beginning-of-statement marker.
     ///
-    /// Matches [`OpcodeSemantics::Bos`] — the `LargeBos` markers (primary
+    /// Matches [`OpcodeSemantics::Bos`] - the `LargeBos` markers (primary
     /// `0x00`/`0x02`, Lead1 `0xC4`, Lead4 `0x1C`) the compiler emits at the
     /// start of each source statement. Their 1-byte operand is the byte
     /// distance to the next BOS (`0` = last statement). Useful for grouping a
@@ -177,7 +177,7 @@ impl OpcodeInfo {
 /// somehow falls outside the 256-entry dispatch table.
 ///
 /// Statically the cast `u8 as usize` cannot exceed 255 and the tables are
-/// `[OpcodeInfo; 256]`, so this fallback is unreachable at runtime — it
+/// `[OpcodeInfo; 256]`, so this fallback is unreachable at runtime - it
 /// exists to satisfy `clippy::indexing_slicing` without resorting to
 /// unchecked indexing in the generated code.
 pub static UNKNOWN_OPCODE: OpcodeInfo = OpcodeInfo {
@@ -354,23 +354,23 @@ mod tests {
 
     #[test]
     fn test_is_terminator() {
-        // ExitProc (0x14) — Return semantics, terminates the block.
+        // ExitProc (0x14) - Return semantics, terminates the block.
         assert!(PRIMARY_TABLE[0x14].is_terminator());
-        // Branch (0x1E) — unconditional Branch{conditional:false}, terminates.
+        // Branch (0x1E) - unconditional Branch{conditional:false}, terminates.
         assert!(PRIMARY_TABLE[0x1E].is_terminator());
-        // BranchT (0x1C) — conditional, does NOT terminate (falls through).
+        // BranchT (0x1C) - conditional, does NOT terminate (falls through).
         assert!(!PRIMARY_TABLE[0x1C].is_terminator());
-        // BranchF (0x1D) — conditional, does NOT terminate.
+        // BranchF (0x1D) - conditional, does NOT terminate.
         assert!(!PRIMARY_TABLE[0x1D].is_terminator());
-        // AddI2 (0xA9) — arithmetic, not a terminator.
+        // AddI2 (0xA9) - arithmetic, not a terminator.
         assert!(!PRIMARY_TABLE[0xA9].is_terminator());
-        // FLdRfVar (0x04) — load, not a terminator.
+        // FLdRfVar (0x04) - load, not a terminator.
         assert!(!PRIMARY_TABLE[0x04].is_terminator());
     }
 
     #[test]
     fn test_is_call() {
-        // ImpAdCallI4 lives in Lead3 — find any Call-classified opcode.
+        // ImpAdCallI4 lives in Lead3 - find any Call-classified opcode.
         let any_primary_call = PRIMARY_TABLE.iter().any(|o| o.is_call());
         let any_lead3_call = LEAD3_TABLE.iter().any(|o| o.is_call());
         // At least one of the primary or Lead3 tables must contain calls.

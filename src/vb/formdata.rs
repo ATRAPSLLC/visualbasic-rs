@@ -7,13 +7,13 @@
 //! # Format Overview
 //!
 //! ```text
-//! [FormDataHeader]              — magic 0xCCFF, GUIDs, dimensions
-//! [form property stream]        — opcode+value pairs, terminated by 0xFF
+//! [FormDataHeader]              - magic 0xCCFF, GUIDs, dimensions
+//! [form property stream]        - opcode+value pairs, terminated by 0xFF
 //! [hierarchy markers + child control records]
-//!   0x01 [first child record]   — NEW marker
-//!   0x03 [sibling record]       — SIB marker
-//!   0x02                        — END marker
-//! [0x05 menu section]           — optional
+//!   0x01 [first child record]   - NEW marker
+//!   0x03 [sibling record]       - SIB marker
+//!   0x02                        - END marker
+//! [0x05 menu section]           - optional
 //! [0x04 form end]
 //! ```
 //!
@@ -400,13 +400,13 @@ impl<'a> FormDataHeader<'a> {
 /// # Record Layout
 ///
 /// ```text
-/// [u32 size]                    — total record size (bit 31 = has array index)
-/// [u8 cId]                      — control ID (links to ControlInfo.index)
-/// [u16_le name_len]             — name string length
-/// [name_len + 1 bytes]          — name + null terminator
-/// [u8 cType]                    — authoritative control type code
-/// [property bytes...]           — opcode + value pairs
-/// [0xFF]                        — property stream terminator
+/// [u32 size]                    - total record size (bit 31 = has array index)
+/// [u8 cId]                      - control ID (links to ControlInfo.index)
+/// [u16_le name_len]             - name string length
+/// [name_len + 1 bytes]          - name + null terminator
+/// [u8 cType]                    - authoritative control type code
+/// [property bytes...]           - opcode + value pairs
+/// [0xFF]                        - property stream terminator
 /// ```
 ///
 /// For control array members (bit 31 of size set), a 2-byte array index
@@ -731,7 +731,7 @@ impl<'a> FormDataParser<'a> {
             }
             pos = pos.saturating_add(1);
         }
-        // No marker found — return everything after header
+        // No marker found - return everything after header
         let end = data.len().min(start.saturating_add(256));
         data.get(start..end).unwrap_or(&[])
     }

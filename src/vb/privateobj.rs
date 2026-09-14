@@ -10,21 +10,21 @@
 //! | Offset | Size | Field |
 //! |--------|------|-------|
 //! | 0x00 | 4 | Reserved (always 0 in compiled binaries) |
-//! | 0x04 | 4 | `lpObjectInfo` — back-pointer to parent ObjectInfo |
+//! | 0x04 | 4 | `lpObjectInfo` - back-pointer to parent ObjectInfo |
 //! | 0x08 | 4 | Reserved (always 0xFFFFFFFF) |
 //! | 0x0C | 4 | Reserved (always 0 in compiled binaries) |
-//! | 0x10 | 2 | `wFuncCount` — number of public functions/methods |
-//! | 0x12 | 2 | `wFuncCount2` — secondary count (non-zero in ActiveX OCXs) |
-//! | 0x14 | 2 | `wVarCount` — number of public variables |
+//! | 0x10 | 2 | `wFuncCount` - number of public functions/methods |
+//! | 0x12 | 2 | `wFuncCount2` - secondary count (non-zero in ActiveX OCXs) |
+//! | 0x14 | 2 | `wVarCount` - number of public variables |
 //! | 0x16 | 2 | Padding (always 0) |
-//! | 0x18 | 4 | `lpFuncTypDescs` — VA to array of FuncTypDesc pointers |
-//! | 0x1C | 4 | `lpExtendedFuncData` — secondary FuncTypDesc metadata array (always 0 in compiled; IDE/debug only) |
-//! | 0x20 | 4 | `lpMethodNameTable` — secondary method name table (FuncTypDesc pointer array indexed by func index) |
-//! | 0x24 | 4 | `lpParamNames` — parameter name string table |
-//! | 0x28 | 4 | `lpVarStubs` — runtime stub reference table |
+//! | 0x18 | 4 | `lpFuncTypDescs` - VA to array of FuncTypDesc pointers |
+//! | 0x1C | 4 | `lpExtendedFuncData` - secondary FuncTypDesc metadata array (always 0 in compiled; IDE/debug only) |
+//! | 0x20 | 4 | `lpMethodNameTable` - secondary method name table (FuncTypDesc pointer array indexed by func index) |
+//! | 0x24 | 4 | `lpParamNames` - parameter name string table |
+//! | 0x28 | 4 | `lpVarStubs` - runtime stub reference table |
 //! | 0x2C | 12 | Reserved (always 0 in compiled binaries) |
-//! | 0x38 | 4 | `dwDescSize` — total size of function type descriptors area |
-//! | 0x3C | 4 | `dwFlags` — bit 2=valid, bit 8=class module |
+//! | 0x38 | 4 | `dwDescSize` - total size of function type descriptors area |
+//! | 0x3C | 4 | `dwFlags` - bit 2=valid, bit 8=class module |
 //!
 //! # Unknown Field Verification (2026-03-29)
 //!
@@ -107,7 +107,7 @@ impl<'a> PrivateObjectDescriptor<'a> {
     /// Secondary function count at offset 0x12 (u16).
     ///
     /// Non-zero in ActiveX DLLs/OCXs (e.g., CoolBar=13, EmbossedPicture=2).
-    /// **Not read by any code in MSVBVM60.DLL** — exhaustive search confirmed
+    /// **Not read by any code in MSVBVM60.DLL** - exhaustive search confirmed
     /// the runtime ignores this field. Likely vestigial or IDE-only metadata.
     #[inline]
     pub fn func_count2(&self) -> Result<u16, Error> {
@@ -156,7 +156,7 @@ impl<'a> PrivateObjectDescriptor<'a> {
     /// which VBA runtime functions implement the property accessors for a
     /// public variable. Use [`VarStubIter`](super::varstub::VarStubIter) to iterate.
     ///
-    /// **Not read by MSVBVM60.DLL at runtime** — compiler/IDE metadata only.
+    /// **Not read by MSVBVM60.DLL at runtime** - compiler/IDE metadata only.
     /// Still useful for analysis: reveals runtime function dependencies and
     /// method names for each public variable.
     #[inline]
@@ -173,8 +173,8 @@ impl<'a> PrivateObjectDescriptor<'a> {
     /// Object flags at offset 0x3C.
     ///
     /// Bit field with the following known flags:
-    /// - Bit 2 (`0x0004`): Always set — indicates a valid PrivateObjectDescriptor.
-    /// - Bit 8 (`0x0100`): Class module flag — set for `.cls` files.
+    /// - Bit 2 (`0x0004`): Always set - indicates a valid PrivateObjectDescriptor.
+    /// - Bit 8 (`0x0100`): Class module flag - set for `.cls` files.
     ///
     /// Observed values across 709 objects in 104 samples:
     /// - `0x0004` (557 objects): Forms, standard modules, UserControls, UserDocuments.
@@ -245,7 +245,7 @@ mod tests {
         assert!(!pod.is_class());
     }
 
-    // Real data from CoolBar in ComCt332.ocx — func_count2 is non-zero (13)
+    // Real data from CoolBar in ComCt332.ocx - func_count2 is non-zero (13)
     const COOLBAR_OCX: [u8; 0x40] = [
         0x00, 0x00, 0x00, 0x00, 0x84, 0x71, 0x08, 0x28, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00,
         0x00, 0x1E, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x25, 0x09, 0x28, 0x00, 0x00,

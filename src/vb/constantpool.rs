@@ -139,7 +139,7 @@ impl<'a> ConstantPool<'a> {
     ///
     /// Returns `Ok(Some(bstr))` for valid string entries, `Ok(None)` for
     /// null entries (`pool[index] == 0`) and entries that don't look like
-    /// BSTRs (likely API stubs, GUIDs, or code refs — try
+    /// BSTRs (likely API stubs, GUIDs, or code refs - try
     /// [`api_stub_at`](Self::api_stub_at) for those). Returns `Err` only
     /// when address translation fails.
     ///
@@ -234,7 +234,7 @@ impl<'a> ConstantPool<'a> {
 
     /// Reserved signature for the future type-hint-enriched entry iterator.
     ///
-    /// Today this is a thin alias for [`entries`](Self::entries) — it yields
+    /// Today this is a thin alias for [`entries`](Self::entries) - it yields
     /// the same `ConstPoolEntry` items. The reserved name lets downstream
     /// code reference the "rich" iterator now without breakage when the
     /// hint-enriched implementation lands (planned: per-entry classification

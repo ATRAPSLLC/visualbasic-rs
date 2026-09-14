@@ -3,9 +3,9 @@
 //! The `PublicObjectDescriptor.public_bytes_va` field points to a structure
 //! that varies by object type:
 //!
-//! - **Standard modules (.bas)**: [`PublicVarTable`] — variable descriptor table
+//! - **Standard modules (.bas)**: [`PublicVarTable`] - variable descriptor table
 //!   with frame offsets and type codes for each public variable.
-//! - **Classes/Forms**: [`ClassFormPublicBytes`] — COM interface GUIDs, instance
+//! - **Classes/Forms**: [`ClassFormPublicBytes`] - COM interface GUIDs, instance
 //!   size, and runtime function stubs.
 //!
 //! Both formats share `+0x02` as a u16 read by `EbLoadRunTime` in the runtime.
@@ -17,17 +17,17 @@
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x00 | 2 | `wTotalSize` — total byte size of the structure |
-//! | 0x02 | 2 | `wDataFrameSize` — instance data frame size in bytes |
+//! | 0x00 | 2 | `wTotalSize` - total byte size of the structure |
+//! | 0x02 | 2 | `wDataFrameSize` - instance data frame size in bytes |
 //! | 0x04 | 2 | Reserved (0) |
-//! | 0x06 | 2 | `wVarCount` — number of public variable descriptors |
+//! | 0x06 | 2 | `wVarCount` - number of public variable descriptors |
 //!
 //! After the 8-byte header, variable descriptors follow as 4-byte entries:
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x00 | 2 | `wFrameOffset` — byte offset within the module's public data area |
-//! | 0x02 | 2 | `wTypeCode` — variable type (see below) |
+//! | 0x00 | 2 | `wFrameOffset` - byte offset within the module's public data area |
+//! | 0x02 | 2 | `wTypeCode` - variable type (see below) |
 //!
 //! # Known Type Codes
 //!
@@ -42,8 +42,8 @@
 //!
 //! Reverse-engineered from pe\_x86\_vb\_loader sample. The format is confirmed
 //! for standard modules (`mod_Variaveis`, `modUtil`). Class/form objects use
-//! a different format at the same VA — the per-instance member descriptor
-//! table — parsed by [`ClassFormPublicBytes`] and
+//! a different format at the same VA - the per-instance member descriptor
+//! table - parsed by [`ClassFormPublicBytes`] and
 //! [`controlprop`](super::controlprop) (member types and resource-cleanup
 //! classification verified against the runtime init/cleanup dispatchers).
 
@@ -64,10 +64,10 @@ use crate::{
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 2 | `wTotalSize` — total byte size of the structure |
-/// | 0x02 | 2 | `wDataFrameSize` — instance data frame size in bytes (see below) |
-/// | 0x04 | 2 | `wExtraCount` — number of non-variable entries mixed in |
-/// | 0x06 | 2 | `wVarCount` — total entry count (includes extra entries) |
+/// | 0x00 | 2 | `wTotalSize` - total byte size of the structure |
+/// | 0x02 | 2 | `wDataFrameSize` - instance data frame size in bytes (see below) |
+/// | 0x04 | 2 | `wExtraCount` - number of non-variable entries mixed in |
+/// | 0x06 | 2 | `wVarCount` - total entry count (includes extra entries) |
 /// | 0x08 | 4 | Padding (always 0) |
 ///
 /// # Data Frame Size (+0x02)
@@ -202,7 +202,7 @@ impl<'a> PublicVarTable<'a> {
 /// # Available data
 ///
 /// Each entry is exactly 4 bytes: `frame_offset` (u16) + `type_code` (u16).
-/// There is **no per-entry name VA** in `PublicVarTable` — the runtime
+/// There is **no per-entry name VA** in `PublicVarTable` - the runtime
 /// (`EbLoadRunTime` at `0x6602F6CE`) reads only the table header for the
 /// instance-buffer size and never inspects entries for names.
 ///
@@ -336,10 +336,10 @@ impl Iterator for PublicVarIter<'_> {
 ///
 /// | Offset | Size | Field | Runtime reads? |
 /// |--------|------|-------|----------------|
-/// | 0x00 | 2 | `wDataSize` — compiler metadata (header size) | No |
-/// | 0x02 | 2 | `wInstanceSize` — per-object instance size in bytes | Yes |
-/// | 0x04 | 2 | `wPropertyCount` — property init entries in the array | Yes |
-/// | 0x06 | 2 | `wControlCount` — total control init entries | Yes |
+/// | 0x00 | 2 | `wDataSize` - compiler metadata (header size) | No |
+/// | 0x02 | 2 | `wInstanceSize` - per-object instance size in bytes | Yes |
+/// | 0x04 | 2 | `wPropertyCount` - property init entries in the array | Yes |
+/// | 0x06 | 2 | `wControlCount` - total control init entries | Yes |
 /// | 0x08 | 4 | Reserved / flags | No |
 /// | 0x0C | var | Control/property init entries (typed, variable-length) | Yes (when counts > 0) |
 ///
@@ -471,7 +471,7 @@ mod tests {
         0x00, 0x01, 0x00,
     ];
 
-    // Real data from modUtil — 1 public variable of type Long
+    // Real data from modUtil - 1 public variable of type Long
     const MOD_UTIL: [u8; 16] = [
         0x10, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
         0x00,

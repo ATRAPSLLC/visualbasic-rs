@@ -61,23 +61,23 @@ for obj in project.objects()? {
 For consumer code that wants a single tagged stream rather than walking
 each substructure by hand:
 
-- [`VbProject::code_entrypoints()`] — every code VA in the project
+- [`VbProject::code_entrypoints()`] - every code VA in the project
   (P-Code stubs, native procs, native thunks, event handlers, `Sub Main`)
   in one `Vec<CodeEntrypoint>`.
-- [`VbObject::events()`] — joined `(control, event_slot, handler_va)`
+- [`VbObject::events()`] - joined `(control, event_slot, handler_va)`
   bindings for a form, with per-control-type event-name resolution.
-- [`VbProject::gui_entries_with_form_data()`] — pairs each GUI table
+- [`VbProject::gui_entries_with_form_data()`] - pairs each GUI table
   entry with its parsed form binary in one iterator.
-- [`VbProject::compilation_mode()`] — distinguishes `Pcode` / `Native` /
+- [`VbProject::compilation_mode()`] - distinguishes `Pcode` / `Native` /
   `Mixed` binaries (combines the project flag with a per-object scan).
-- [`VbProject::diagnostics()`] — eager parse-health probe surfacing
+- [`VbProject::diagnostics()`] - eager parse-health probe surfacing
   missing optional structures and known-anomaly patterns.
 
 ## Cargo features
 
 | Feature | Default | Effect |
 |---|---|---|
-| `tracing` | off | Emits structured `tracing::warn!` events at silent fail-soft sites. No effect when disabled — the helpers compile to no-ops. |
+| `tracing` | off | Emits structured `tracing::warn!` events at silent fail-soft sites. No effect when disabled - the helpers compile to no-ops. |
 
 ## Example tool
 

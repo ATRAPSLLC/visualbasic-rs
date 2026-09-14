@@ -82,7 +82,7 @@ pub enum Error {
     /// a VB6 file at all (e.g., a Delphi/MFC/CRT-only PE).
     ///
     /// Consumers tagging files as "VB6 or not" should treat this as the
-    /// quiet-path negative — log nothing or only at debug level.
+    /// quiet-path negative - log nothing or only at debug level.
     NotRecognized,
 
     /// The container looks like VB6 but a structural read overran the file.
@@ -93,7 +93,7 @@ pub enum Error {
     /// [`ObjectTable`](crate::vb::objecttable::ObjectTable) at the
     /// referenced VA falls off the end of the buffer or off the end of
     /// any PE section. Indicates a truncated, corrupt, or section-table-
-    /// inconsistent file — log at warn level and surface to the analyst.
+    /// inconsistent file - log at warn level and surface to the analyst.
     TruncatedContainer {
         /// Which structure failed to read fully.
         context: &'static str,
@@ -107,7 +107,7 @@ pub enum Error {
     /// Distinct from [`NotRecognized`](Self::NotRecognized) which fires
     /// only after the PE walk succeeded.
     UnrecognizedFormat {
-        /// Short reason — `"goblin: <message>"` or `"PE32+ unsupported"`.
+        /// Short reason - `"goblin: <message>"` or `"PE32+ unsupported"`.
         reason: String,
     },
 
@@ -272,7 +272,7 @@ impl Error {
     ///   [`Error::Not32Bit`] (no PE container or PE32+).
     /// - `None` for downstream errors that occur **after** the
     ///   project structure has been recognized (per-field reads,
-    ///   address-translation failures, etc.) — those are not
+    ///   address-translation failures, etc.) - those are not
     ///   recognition failures and consumers should not silently
     ///   suppress them.
     ///
@@ -309,15 +309,15 @@ pub enum RecognitionFailure {
     /// Consumer recommendation: log at debug level or not at all.
     NotRecognized,
     /// Recognized as VB6 but a structural read overran the file/section.
-    /// Consumer recommendation: log at warn level — truncated or
+    /// Consumer recommendation: log at warn level - truncated or
     /// inconsistent file worth investigating.
     TruncatedContainer,
     /// Not a recognizable PE container (or PE32+, which isn't VB6).
-    /// Consumer recommendation: log at debug level — file isn't even
+    /// Consumer recommendation: log at debug level - file isn't even
     /// a candidate.
     UnrecognizedFormat,
     /// **Reserved.** Future heuristic for detecting packed/protected
-    /// VB6 binaries. The crate does not currently emit this variant —
+    /// VB6 binaries. The crate does not currently emit this variant -
     /// it is exposed so downstream `match` arms can include it now and
     /// not break when the heuristic lands.
     CompressedAndOpaque,

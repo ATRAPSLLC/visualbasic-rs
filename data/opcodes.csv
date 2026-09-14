@@ -1,4 +1,4 @@
-# VB6 P-Code opcodes — encoding + verified runtime semantics
+# VB6 P-Code opcodes - encoding + verified runtime semantics
 # Merged from opcodes.csv (encoding) and opcode_semantics.csv (semantics)
 #
 # Encoding columns:

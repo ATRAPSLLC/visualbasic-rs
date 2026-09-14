@@ -30,7 +30,7 @@ pub struct ObjectTypeFlags(pub u32);
 impl ObjectTypeFlags {
     /// Optional info structure is present (bit 0, always set in compiled binaries).
     pub const HAS_OPTIONAL_INFO: u32 = 0x01;
-    /// Object has COM interface — set for classes and forms, NOT for modules (bit 1).
+    /// Object has COM interface - set for classes and forms, NOT for modules (bit 1).
     pub const HAS_COM_INTERFACE: u32 = 0x02;
     /// Object is visual / has a form designer (bit 7).
     pub const IS_VISUAL: u32 = 0x80;
@@ -76,7 +76,7 @@ impl ObjectTypeFlags {
     /// Returns a human-readable kind string for this object type.
     ///
     /// Cannot distinguish UserControl from Class or UserDocument from Form
-    /// using flags alone — those require project-level context.
+    /// using flags alone - those require project-level context.
     pub fn kind_name(self) -> &'static str {
         if self.is_form() {
             "Form"

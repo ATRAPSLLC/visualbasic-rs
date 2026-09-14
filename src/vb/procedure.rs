@@ -34,17 +34,17 @@ use crate::{
 ///
 /// This is the common table format used by both the primary cleanup table
 /// (at ProcDscInfo +0x18, processed by `InitLocalCleanupAll`) and the
-/// secondary table (immediately following table 1, purpose unknown —
+/// secondary table (immediately following table 1, purpose unknown -
 /// not processed by MSVBVM60.DLL during normal method entry/exit).
 ///
 /// # Layout
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 2 | `wSize` — total table size in bytes (including this header) |
+/// | 0x00 | 2 | `wSize` - total table size in bytes (including this header) |
 /// | 0x02 | 2 | Reserved (always 0) |
-/// | 0x04 | 2 | `wCount` — entries to actively process on exit/error |
-/// | 0x06 | 2 | `wTotal` — total entry count in the table |
+/// | 0x04 | 2 | `wCount` - entries to actively process on exit/error |
+/// | 0x06 | 2 | `wTotal` - total entry count in the table |
 /// | 0x08 | 4 | Flags (bit 0 at byte +0x0B checked by `InitLocalCleanupEntries`) |
 /// | 0x0C | var | [`ControlPropertyEntry`](super::controlprop::ControlPropertyEntry) records |
 ///
@@ -92,7 +92,7 @@ impl<'a> CleanupTable<'a> {
 
     /// Total number of entries in the table at offset 0x06.
     ///
-    /// May exceed [`count`](Self::count) — entries beyond `count` exist
+    /// May exceed [`count`](Self::count) - entries beyond `count` exist
     /// in the table but are not actively processed for cleanup.
     #[inline]
     pub fn total(&self) -> Result<u16, Error> {
@@ -173,7 +173,7 @@ impl<'a> CleanupTable<'a> {
 ///   +0x0C  var  ControlPropertyEntry[] records
 ///
 /// +0x18 + primary_size: Secondary CleanupTable (NOT processed by runtime)
-///   Same header format as primary table. Purpose unknown —
+///   Same header format as primary table. Purpose unknown -
 ///   not read by MSVBVM60.DLL during method entry/exit.
 ///   Always present (minimum 0x0C bytes).
 /// ```
@@ -201,7 +201,7 @@ impl<'a> ProcDscInfo<'a> {
     /// Parses a ProcDscInfo from the given byte slice.
     ///
     /// Reads at least [`MIN_SIZE`](Self::MIN_SIZE) bytes. The full structure
-    /// may be larger — use [`total_size`](Self::total_size) to determine
+    /// may be larger - use [`total_size`](Self::total_size) to determine
     /// the actual extent.
     ///
     /// # Errors
@@ -324,7 +324,7 @@ impl<'a> ProcDscInfo<'a> {
     ///
     /// Self-relative offset from the start of `ProcDscInfo` to a per-procedure
     /// fixup table consulted by the runtime's `Resume Next` handler
-    /// (`op_Lead2_Resume` at 0x6610F212) — and **only** on a narrow fallback
+    /// (`op_Lead2_Resume` at 0x6610F212) - and **only** on a narrow fallback
     /// path. Earlier revisions of this crate mislabelled the field
     /// `wBosSkipTableOffset` and treated it as a per-opcode instruction-size
     /// table; subsequent reverse engineering (see below) shows that is wrong.
@@ -335,15 +335,15 @@ impl<'a> ProcDscInfo<'a> {
     /// `Resume <label>` (positive) jumps directly; bare `Resume` (`-2`)
     /// re-dispatches the faulting statement; `Resume Next` (`-1`) advances to the
     /// next statement. That advance normally uses the **inline length byte of the
-    /// `LargeBos` statement marker** at the saved position — *not* this field.
+    /// `LargeBos` statement marker** at the saved position - *not* this field.
     /// This field's table is the rare fallback used only when the saved position
     /// is **not** a BOS marker.
     ///
     /// # Why it is almost always zero
     ///
     /// Across a 100-binary VB6 malware corpus this field is `0` for the vast
-    /// majority of methods — including 457 of 461 methods that contain a literal
-    /// `Resume` opcode — because the fallback path is essentially never compiled.
+    /// majority of methods - including 457 of 461 methods that contain a literal
+    /// `Resume` opcode - because the fallback path is essentially never compiled.
     /// `0` is therefore the normal, expected value, **not** "missing data." A
     /// small population of (non-error) methods carry a non-zero value equal to
     /// the procedure's `total_size`/`actual_size` that points at the following
@@ -360,7 +360,7 @@ impl<'a> ProcDscInfo<'a> {
     /// Equal to `(OptionalObjectInfo.initialize_event_offset / 4) - 1`,
     /// i.e., the 0-based index of the last dispatch table slot before the
     /// Initialize event. Constant across all methods within the same object.
-    /// Not read by MSVBVM60.DLL at runtime — compiler metadata only.
+    /// Not read by MSVBVM60.DLL at runtime - compiler metadata only.
     ///
     /// Known values: Class=2, Form/UserDoc=25, UserControl=25.
     #[inline]
@@ -407,7 +407,7 @@ impl<'a> ProcDscInfo<'a> {
 
     /// Total number of cleanup entries at offset 0x1E.
     ///
-    /// May be larger than [`cleanup_count`](Self::cleanup_count) — entries
+    /// May be larger than [`cleanup_count`](Self::cleanup_count) - entries
     /// beyond `count` exist but are not actively processed for resource release.
     #[inline]
     pub fn cleanup_total(&self) -> u16 {
@@ -443,7 +443,7 @@ impl<'a> ProcDscInfo<'a> {
     ///
     /// This table has the same header format as the primary table and is
     /// always present (minimum 0x0C bytes). It is **not** processed by
-    /// MSVBVM60.DLL during normal method entry/exit — its purpose is
+    /// MSVBVM60.DLL during normal method entry/exit - its purpose is
     /// unknown (possibly compiler/IDE metadata).
     ///
     /// Located at `ProcDscInfo + total_size`, i.e., immediately after the
@@ -577,7 +577,7 @@ impl fmt::Display for ProcOptFlags {
 /// the frame pointer as `arg1` and access slots via `arg1[-N]` indexing.
 ///
 /// This struct documents the layout for P-Code analysis and lifting.
-/// The frame is NOT stored in the PE file — it exists only at runtime.
+/// The frame is NOT stored in the PE file - it exists only at runtime.
 ///
 /// # Stack Layout (high to low addresses)
 ///
