@@ -1,11 +1,13 @@
 //! MSVBVM60.DLL export function signature database.
 //!
-//! Provides lookup of correct calling conventions, parameter types, and
-//! return types for every exported function in the VB6 runtime DLL.
+//! Provides lookup of calling conventions, parameter types, and return types
+//! for the exported functions of the VB6 runtime DLL.
 //!
-//! The signature table is generated at build time from
-//! `data/msvbvm60_exports.csv`, which was reverse-engineered from
-//! MSVBVM60.DLL v6.00.9848 via BinaryNinja decompilation.
+//! The table has one entry per export of MSVBVM60.DLL: 635 named exports,
+//! ordinals 100 to 2010, the same names and ordinals in 6.00.8176 and
+//! 6.00.9848. 31 entries have [`CallingConv::Unknown`] (named, not
+//! described). It is generated at build time from
+//! `data/msvbvm60_exports.csv`; the signatures describe 6.00.9848.
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/msvbvm60_exports_generated.rs"));
@@ -20,9 +22,15 @@ pub enum CallingConv {
     Stdcall,
     /// `__cdecl`: all args on stack; caller cleans stack.
     Cdecl,
-    /// Special: x87 FPU intrinsic, FDIV workaround, or custom register convention.
-    /// No standard parameter passing - skip during prototype application.
+    /// Special: an FDIV/FPU workaround (`_adj_*`), the x87 intrinsics `_CIexp`
+    /// and `_CItan`, `__vbaChkstk`, or the P-Code engines (`ProcCallEngine`,
+    /// `MethCallEngine`). No standard parameter passing - skip during
+    /// prototype application. The other `_CI*` intrinsics, which take and
+    /// return their value on the x87 stack the same way, are listed as
+    /// [`Cdecl`](CallingConv::Cdecl) with no parameters.
     Special,
+    /// Not analyzed: the export is named, its signature is not described.
+    Unknown,
 }
 
 /// Parameter or return type for an MSVBVM60 export.
@@ -80,6 +88,8 @@ pub enum VbParamType {
     UInt8Ptr,
     /// `int64_t*` - pointer to 64-bit integer.
     Int64Ptr,
+    /// Not analyzed.
+    Unknown,
 }
 
 /// A single parameter in an export function signature.
@@ -96,7 +106,7 @@ pub struct ExportParam {
 pub struct ExportSignature {
     /// Export name (e.g., `"__vbaFreeStr"` or `"rtcDoEvents"`).
     pub name: &'static str,
-    /// Export ordinal (0 = named export, looked up by name).
+    /// Export ordinal in MSVBVM60.DLL (100 to 2010). Every entry has one.
     pub ordinal: u16,
     /// Calling convention.
     pub calling_convention: CallingConv,
@@ -112,8 +122,12 @@ pub struct ExportSignature {
 
 /// Look up an MSVBVM60 export signature by name.
 ///
-/// The `name` should match the export name as it appears in the PE import
-/// table (e.g., `"__vbaFreeStr"`, `"ThunRTMain"`, `"_CIcos"`).
+/// The `name` is the export name (e.g., `"__vbaFreeStr"`, `"ThunRTMain"`,
+/// `"_CIcos"`). A VB6 executable imports the `__vba*` functions, the
+/// engines, `EVENT_SINK_*`, `DllFunctionCall` and the `_CI*`/`_adj_*`
+/// intrinsics by name, but `ThunRTMain`, the `rtc*` functions and the
+/// `GetMem*`/`PutMem*`/`SetMem*` accessors by ordinal: look those up with
+/// [`lookup_export_by_ordinal`].
 ///
 /// Returns `None` if the name is not in the database.
 pub fn lookup_export(name: &str) -> Option<&'static ExportSignature> {
@@ -122,8 +136,9 @@ pub fn lookup_export(name: &str) -> Option<&'static ExportSignature> {
 
 /// Look up an MSVBVM60 export signature by ordinal number.
 ///
-/// Used for ordinal-only imports (e.g., `Ordinal_MSVBVM60_598` in the PE
-/// import table maps to ordinal 598 → `rtcDoEvents`).
+/// Used for imports by ordinal: an import table entry for ordinal 598
+/// (which disassemblers show as `MSVBVM60.598` or `Ordinal_MSVBVM60_598`)
+/// maps to `rtcDoEvents`.
 ///
 /// Returns `None` if the ordinal is not in the database.
 pub fn lookup_export_by_ordinal(ordinal: u16) -> Option<&'static ExportSignature> {
@@ -132,7 +147,7 @@ pub fn lookup_export_by_ordinal(ordinal: u16) -> Option<&'static ExportSignature
 
 /// Returns the full export signature table.
 ///
-/// Sorted by name for binary search. Useful for iteration.
+/// Sorted by name (byte order) for binary search. Useful for iteration.
 pub fn all_exports() -> &'static [ExportSignature] {
     generated::EXPORTS
 }

@@ -1,14 +1,18 @@
-//! ProjectInfo2 structure parser - COM dispatch interface metadata.
+//! ProjectInfo2 structure parser, and the event-source records that follow it.
 //!
 //! The `ProjectInfo2` structure is pointed to by `ObjectTable.lpProjectInfo2`
-//! (+0x08). It contains COM type information for the project's forms and
-//! classes, including control type registrations with CLSIDs and instance
-//! names, plus property/parameter name strings.
+//! (+0x08). Its 0x28-byte header points to the per-object
+//! `PrivateObjectDescriptor` array.
 //!
 //! # Layout
 //!
-//! The structure has a 0x28-byte header, followed by a variable number of
-//! 12-byte control type entries, followed by null-terminated name strings.
+//! The compiler places the 0x28-byte header at the end of the data that
+//! precedes the first procedure's P-Code. After it, up to the P-Code, come
+//! 12-byte event-source records interleaved with null-terminated parameter
+//! name strings (each padded to a 4-byte boundary). There is no count: in
+//! `dispid` and `forms` records follow name strings. Projects with only
+//! standard modules have nothing after the header. [`ProjectInfo2Iter`]
+//! walks the region and tells the two apart (see [`ProjectInfo2Item`]).
 //!
 //! ## Header (0x28 bytes)
 //!
@@ -23,15 +27,21 @@
 //! | 0x20 | 4 | Reserved (always 0xFFFFFFFF) |
 //! | 0x24 | 4 | Reserved (always 0) |
 //!
-//! ## Control Type Entries (0x0C bytes each, at +0x28)
+//! ## Event-source records (0x0C bytes each)
 //!
-//! Each entry registers a unique control type used in the project:
+//! One record per event source of the project's objects: the object's own
+//! events (name `"Class"`, `"Form"` or `"UserControl"`) and its controls
+//! (named by instance, e.g. `"Text1"`). The GUID is the source's event
+//! interface IID, not a CLSID: in `VB6.OLB` the fixtures' GUIDs are
+//! `TextBoxEvents`, `LabelEvents`, `CommandButtonEvents`, `FormEvents` and
+//! `UserControlEvents`, and `"Class"` is `IClassModuleEvt` of the runtime's
+//! `VBRUN` library.
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x00 | 4 | `lpInterfaceMetadata` (interface method/property info) |
-//! | 0x04 | 4 | `lpGuidData` (16-byte CLSID + instance name string) |
-//! | 0x08 | 4 | `lpDispatchSlot` (.data section dispatch table entry) |
+//! | 0x00 | 4 | `lpInterfaceMetadata` (the type library reference; 0 for a control array or the project's own UserControl) |
+//! | 0x04 | 4 | `lpGuidData` (16-byte event IID + source name string) |
+//! | 0x08 | 4 | `lpDispatchSlot` (.data section slot, one per record) |
 
 use std::str;
 
@@ -84,27 +94,33 @@ impl<'a> ProjectInfo2<'a> {
 
     /// VA of the PrivateObjectDescriptor pointer array at offset 0x10.
     ///
-    /// Contains one DWORD per object (total_objects entries). Each entry
-    /// is either a PrivateObjectDescriptor VA or 0xFFFFFFFF (for modules).
+    /// Contains one DWORD per object (total_objects entries), in object
+    /// table order. Each entry equals that object's
+    /// `ObjectInfo.lpPrivateObject`: a PrivateObjectDescriptor VA, or
+    /// 0xFFFFFFFF for a standard module (every fixture).
     #[inline]
     pub fn object_descs_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x10)
     }
 }
 
-/// Interface metadata structure (0x24 bytes) at each entry's `interface_metadata_va`.
+/// Type library reference (0x24 bytes) at each entry's `interface_metadata_va`.
 ///
-/// Contains typelib GUID/path references and a dispatch name table.
+/// Names the type library that declares the record's event interface.
+/// Records of one library share one structure. In the fixtures it is
+/// either `VB` (`VB6.OLB`, GUID `FCFB3D2E-A0FA-1068-A738-08002B3371B5`,
+/// path `C:\VB98\VB6.OLB`) or `VBRUN` (GUID
+/// `EA544A21-C82D-11D1-A3E4-00A0C90AEA82`, no path).
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 4 | `lpTypelibGuid` (16-byte GUID followed by path string) |
+/// | 0x00 | 4 | `lpTypelibGuid` (VA of the library's 16-byte GUID) |
 /// | 0x04 | 4 | Reserved (always 0) |
-/// | 0x08 | 4 | Flags A (always 6) |
-/// | 0x0C | 4 | Flags B (always 9) |
-/// | 0x10 | 4 | `lpTypelibPath` (null-terminated path string) |
-/// | 0x14 | 4 | `lpNameTable` (dispatch method/property name strings) |
-/// | 0x18 | 4 | `lpDataSlot` (.data section VA) |
+/// | 0x08 | 4 | Always 6 (both libraries' `MSFT` headers carry version 6) |
+/// | 0x0C | 4 | Always 9 (both libraries' `MSFT` headers carry LCID 9) |
+/// | 0x10 | 4 | `lpTypelibPath` (null-terminated path string, or 0) |
+/// | 0x14 | 4 | `lpNameTable` (the library name, e.g. `"VB"`, `"VBRUN"`) |
+/// | 0x18 | 4 | `lpDataSlot` (.data section VA, just below the slots of the records that use it) |
 /// | 0x1C | 4 | Reserved (always 0) |
 /// | 0x20 | 4 | Reserved (always 0) |
 #[derive(Clone, Copy, Debug)]
@@ -133,10 +149,11 @@ impl<'a> InterfaceMetadata<'a> {
         Ok(Self { bytes })
     }
 
-    /// VA of the dispatch name table at offset 0x14.
+    /// VA of the library name at offset 0x14.
     ///
-    /// Points to null-terminated name strings: a library/module name
-    /// followed by method/property names for this interface.
+    /// Points to the null-terminated library name (`"VB"`, `"VBRUN"`); in
+    /// the fixtures this structure itself follows the name, so no method or
+    /// property names follow it.
     #[inline]
     pub fn name_table_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x14)
@@ -150,10 +167,9 @@ impl<'a> InterfaceMetadata<'a> {
 
     /// VA of the typelib path string at offset 0x10.
     ///
-    /// Points to a null-terminated ANSI path identifying the source typelib
-    /// for this interface - typically the path of the OCX/DLL whose typelib
-    /// declares the dispatch interface (e.g. `"C:\Windows\System32\Comctl32.ocx"`).
-    /// May be `0` for project-internal interfaces with no external typelib.
+    /// Points to a null-terminated ANSI path of the type library file
+    /// (`"C:\VB98\VB6.OLB"` in `controls` and `forms`). `0` for the
+    /// runtime's own `VBRUN` library.
     ///
     /// Pair with [`typelib_guid_va`](Self::typelib_guid_va) to get the
     /// typelib's CLSID - together they identify which DLL/OCX provides
@@ -170,15 +186,9 @@ impl<'a> InterfaceMetadata<'a> {
 
     /// Raw `.data` section VA at offset 0x18.
     ///
-    /// **Purpose undocumented.** Per `pcode/TODO.md`'s prior reverse-engineering
-    /// notes, this field consistently points into the binary's `.data`
-    /// section but its runtime use was not traced. Tracked as a Medium
-    /// Priority TODO ("InterfaceMetadata VA resolution") with the field
-    /// label `lpDataSlot`.
-    ///
-    /// Surface the raw VA so consumers can experiment without the crate
-    /// claiming semantics it has not verified. Future revisions may add a
-    /// typed accessor once the field's role is confirmed.
+    /// Points into the binary's `.data` section (zero on disk), 4 to 12
+    /// bytes below the slots of the records that use this library. How the
+    /// runtime uses it is not verified.
     ///
     /// # Errors
     ///
@@ -188,12 +198,11 @@ impl<'a> InterfaceMetadata<'a> {
         read_u32_le(self.bytes, 0x18)
     }
 
-    /// Reads dispatch name strings from the first block in the name table.
+    /// Reads the identifier strings that start at the name table.
     ///
-    /// Returns a list of null-terminated ANSI strings (library name +
-    /// method/property names) from the first name block only. Use
-    /// [`all_dispatch_names`](Self::all_dispatch_names) to get names
-    /// from all blocks.
+    /// In the fixtures this is the library name alone (`["VB"]`,
+    /// `["VBRUN"]`). The scan stops at the first byte sequence that is not
+    /// an identifier.
     pub fn dispatch_names(&self, map: &AddressMap<'a>) -> Vec<&'a str> {
         let Ok(va) = self.name_table_va() else {
             return Vec::new();
@@ -207,12 +216,12 @@ impl<'a> InterfaceMetadata<'a> {
         extract_name_block(data, 0).0
     }
 
-    /// Reads ALL dispatch name blocks from the name table.
+    /// Scans up to 4096 bytes from the name table for runs of identifier
+    /// strings.
     ///
-    /// The name table contains multiple blocks (one per class) interleaved
-    /// with binary metadata. Each block contains a library name followed
-    /// by method/property names for that class. Returns a vector of
-    /// name blocks, where each block is a vector of strings.
+    /// Heuristic: the first run is the library name; later runs are
+    /// whatever identifier-like strings follow in the image (the scan does
+    /// not know where the structure ends). Returns one vector per run.
     pub fn all_dispatch_names(&self, map: &AddressMap<'a>) -> Vec<Vec<&'a str>> {
         let Ok(va) = self.name_table_va() else {
             return Vec::new();
@@ -227,25 +236,28 @@ impl<'a> InterfaceMetadata<'a> {
     }
 }
 
-/// A single control type registration entry (0x0C bytes).
+/// A single event-source record (0x0C bytes).
 #[derive(Debug, Clone, Copy)]
 pub struct ControlTypeEntry {
-    /// VA of the interface metadata structure (method/property counts and names).
+    /// VA of the [`InterfaceMetadata`] type library reference; 0 for a
+    /// control array and for an instance of the project's own UserControl.
     pub interface_metadata_va: u32,
-    /// VA of the GUID data: 16-byte CLSID followed by null-terminated instance name.
+    /// VA of the GUID data: 16-byte event interface IID followed by the
+    /// null-terminated source name (`"Class"`, `"Form"`, `"UserControl"` or
+    /// a control instance name).
     pub guid_data_va: u32,
-    /// VA of the dispatch table slot in the .data section.
+    /// VA of this record's slot in the .data section.
     pub dispatch_slot_va: u32,
 }
 
 impl ControlTypeEntry {
-    /// Reads the 16-byte control CLSID from the GUID data.
+    /// Reads the 16-byte event interface IID from the GUID data.
     pub fn control_guid<'a>(&self, map: &AddressMap<'a>) -> Option<Guid> {
         let data = map.slice_from_va(self.guid_data_va, 16).ok()?;
         Guid::from_bytes(data)
     }
 
-    /// Reads the control instance name string (after the 16-byte GUID).
+    /// Reads the source name string (after the 16-byte GUID).
     pub fn control_name<'a>(&self, map: &AddressMap<'a>) -> Option<&'a str> {
         let data = map
             .slice_from_va(self.guid_data_va.wrapping_add(16), 64)
@@ -266,16 +278,122 @@ impl ControlTypeEntry {
     }
 }
 
-/// Iterates control type entries in a ProjectInfo2 structure.
+/// One item of the region after a ProjectInfo2 header.
+#[derive(Debug, Clone, Copy)]
+pub enum ProjectInfo2Item<'a> {
+    /// A 12-byte event-source record.
+    Record(ControlTypeEntry),
+    /// A null-terminated name string, padded to a 4-byte boundary.
+    Name(&'a str),
+}
+
+/// Walks the region after a ProjectInfo2 header: the event-source records
+/// and the parameter name strings between them, in file order.
 ///
-/// Entries are 12-byte triplets starting at header+0x28. The iterator
-/// stops when it encounters a value that doesn't resolve as a valid VA
-/// in the PE image (indicating the start of the name string area).
+/// At each 4-byte-aligned position it reads either
+///
+/// - a record: its second dword is the VA of a 16-byte GUID followed by an
+///   identifier (the source name), its first dword 0 or a VA in the image,
+///   and its third a VA inside a section (the records' slots are in the
+///   zero-filled `.data`), or
+/// - a name: an identifier (ASCII letter, then letters, digits or `_`),
+///   its terminating NUL and NUL padding to the next 4-byte boundary,
+///
+/// and stops at the first position that is neither: the P-Code of the
+/// first procedure, or the end of the file. Every step advances at least 4
+/// bytes. `forms` yields the records `Text1`, `Label1`, `Form`, `Command1`
+/// (a control array: no type library), `Gauge1` (the project's own
+/// UserControl), the names `start` and `s`, the record `UserControl` and
+/// the names `v` and `NewValue`; `data` the record `Class` and the name
+/// `Name`.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct ProjectInfo2Iter<'a> {
+    map: &'a AddressMap<'a>,
+    /// VA of the next item.
+    va: u32,
+    /// Set once the walk has met something that is neither item.
+    done: bool,
+}
+
+impl<'a> ProjectInfo2Iter<'a> {
+    /// Creates a walk of the region after the ProjectInfo2 header at
+    /// `pi2_va`.
+    pub fn new(map: &'a AddressMap<'a>, pi2_va: u32) -> Self {
+        Self {
+            map,
+            va: pi2_va.wrapping_add(ProjectInfo2::HEADER_SIZE as u32),
+            done: false,
+        }
+    }
+
+    /// Reads a record at the current position, if there is one.
+    fn record(&self, data: &[u8]) -> Option<ControlTypeEntry> {
+        let entry = ControlTypeEntry {
+            interface_metadata_va: read_u32_le(data, 0).ok()?,
+            guid_data_va: read_u32_le(data, 4).ok()?,
+            dispatch_slot_va: read_u32_le(data, 8).ok()?,
+        };
+        let metadata_ok = entry.interface_metadata_va == 0
+            || self.map.is_va_in_image(entry.interface_metadata_va);
+        // The slot is in the zero-filled .data: inside a section, not
+        // necessarily file-backed.
+        let slot_ok = matches!(
+            self.map.va_to_offset(entry.dispatch_slot_va),
+            Ok(_) | Err(Error::RvaInBssRegion { .. })
+        );
+        let name = self
+            .map
+            .slice_from_va(entry.guid_data_va.checked_add(16)?, 1)
+            .ok()
+            .and_then(|tail| identifier(tail));
+        (metadata_ok && slot_ok && name.is_some()).then_some(entry)
+    }
+}
+
+impl<'a> Iterator for ProjectInfo2Iter<'a> {
+    type Item = ProjectInfo2Item<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let Ok(data) = self.map.slice_from_va(self.va, 4) else {
+            self.done = true;
+            return None;
+        };
+        if let Some(entry) = data
+            .get(..ProjectInfo2::ENTRY_SIZE)
+            .and_then(|d| self.record(d))
+        {
+            self.va = self.va.wrapping_add(ProjectInfo2::ENTRY_SIZE as u32);
+            return Some(ProjectInfo2Item::Record(entry));
+        }
+        let Some(name) = identifier(data) else {
+            self.done = true;
+            return None;
+        };
+        // The name, its NUL, then NUL padding to a 4-byte boundary.
+        let end = name.len().saturating_add(4) & !3;
+        if data
+            .get(name.len()..end)
+            .is_none_or(|pad| pad.iter().any(|&b| b != 0))
+        {
+            self.done = true;
+            return None;
+        }
+        self.va = self.va.wrapping_add(u32::try_from(end).unwrap_or(u32::MAX));
+        Some(ProjectInfo2Item::Name(name))
+    }
+}
+
+/// Iterates the event-source records that follow a ProjectInfo2 header.
+///
+/// The [`ProjectInfo2Item::Record`]s of a [`ProjectInfo2Iter`], skipping the
+/// name strings between them: `forms` yields its 6 records and `dispid` its
+/// 4 (`Class`, `Form`, `Dial1`, `UserControl`).
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct ControlTypeIter<'a> {
-    map: &'a AddressMap<'a>,
-    base_va: u32,
-    index: u32,
+    inner: ProjectInfo2Iter<'a>,
 }
 
 impl<'a> ControlTypeIter<'a> {
@@ -284,9 +402,7 @@ impl<'a> ControlTypeIter<'a> {
     /// `pi2_va` is the VA of the ProjectInfo2 header.
     pub fn new(map: &'a AddressMap<'a>, pi2_va: u32) -> Self {
         Self {
-            map,
-            base_va: pi2_va.wrapping_add(ProjectInfo2::HEADER_SIZE as u32),
-            index: 0,
+            inner: ProjectInfo2Iter::new(map, pi2_va),
         }
     }
 }
@@ -295,78 +411,40 @@ impl<'a> Iterator for ControlTypeIter<'a> {
     type Item = ControlTypeEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let entry_offset = self.index.checked_mul(ProjectInfo2::ENTRY_SIZE as u32)?;
-        let entry_va = self.base_va.checked_add(entry_offset)?;
-        let data = self
-            .map
-            .slice_from_va(entry_va, ProjectInfo2::ENTRY_SIZE)
-            .ok()?;
-
-        let a = read_u32_le(data, 0).ok()?;
-        let b = read_u32_le(data, 4).ok()?;
-
-        // Stop if first two DWORDs don't resolve as valid VAs in the PE
-        if !self.map.is_va_in_image(a) || !self.map.is_va_in_image(b) {
-            return None;
-        }
-
-        let c = read_u32_le(data, 8).ok()?;
-        self.index = self.index.checked_add(1)?;
-
-        Some(ControlTypeEntry {
-            interface_metadata_va: a,
-            guid_data_va: b,
-            dispatch_slot_va: c,
+        self.inner.find_map(|item| match item {
+            ProjectInfo2Item::Record(entry) => Some(entry),
+            ProjectInfo2Item::Name(_) => None,
         })
     }
 }
 
-/// Collects the null-terminated name strings that follow the entries.
+/// Collects the name strings of the region after the ProjectInfo2 header at
+/// `pi2_va` (the [`ProjectInfo2Item::Name`]s of a [`ProjectInfo2Iter`]).
 ///
-/// Returns a vector of property/parameter name strings.
-pub fn read_name_strings<'a>(
-    map: &'a AddressMap<'a>,
-    pi2_va: u32,
-    entry_count: u32,
-) -> Vec<&'a str> {
-    let entries_size = entry_count.wrapping_mul(ProjectInfo2::ENTRY_SIZE as u32);
-    let names_va = pi2_va
-        .wrapping_add(ProjectInfo2::HEADER_SIZE as u32)
-        .wrapping_add(entries_size);
+/// The strings are parameter names of the objects' procedures, event
+/// handlers included (`calls`: `v`, `o`, `a`, `b`, `factor`, ...; `forms`:
+/// `NewValue` of `Gauge1_Changed`), not property names. The walk ends
+/// before the P-Code that follows (`data` yields `Name` alone).
+pub fn read_name_strings<'a>(map: &'a AddressMap<'a>, pi2_va: u32) -> Vec<&'a str> {
+    ProjectInfo2Iter::new(map, pi2_va)
+        .filter_map(|item| match item {
+            ProjectInfo2Item::Name(name) => Some(name),
+            ProjectInfo2Item::Record(_) => None,
+        })
+        .collect()
+}
 
-    let Ok(data) = map.slice_from_va(names_va, 1024) else {
-        return Vec::new();
-    };
-
-    let mut names = Vec::new();
-    let mut pos = 0usize;
-    while pos < data.len() {
-        let Some(&b) = data.get(pos) else { break };
-        // Skip null padding
-        if b == 0 {
-            pos = pos.saturating_add(1);
-            continue;
-        }
-        // Stop if not printable ASCII
-        if !(0x20..=0x7E).contains(&b) {
-            break;
-        }
-        let Ok(name) = read_cstr(data, pos) else {
-            break;
-        };
-        if name.is_empty() {
-            break;
-        }
-        if let Ok(s) = str::from_utf8(name) {
-            names.push(s);
-        }
-        pos = pos.saturating_add(name.len()).saturating_add(1);
-        // Align to 4-byte boundary
-        while !pos.is_multiple_of(4) && pos < data.len() {
-            pos = pos.saturating_add(1);
-        }
-    }
-    names
+/// The identifier `data` starts with, if it is one terminated by a NUL: an
+/// ASCII letter, then letters, digits or `_`, at most 255 of them (VB's
+/// limit), so the search for the NUL stays short.
+fn identifier(data: &[u8]) -> Option<&str> {
+    let window = data.get(..data.len().min(256))?;
+    let len = window.iter().position(|&b| b == 0)?;
+    let name = data.get(..len)?;
+    let (first, rest) = name.split_first()?;
+    (first.is_ascii_alphabetic() && rest.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_'))
+        .then(|| str::from_utf8(name).ok())
+        .flatten()
 }
 
 /// Checks if a byte sequence looks like a VB6 identifier.

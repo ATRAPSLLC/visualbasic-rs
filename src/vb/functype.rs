@@ -1,37 +1,43 @@
 //! Function type descriptor (FuncTypDesc) parser.
 //!
-//! Describes the prototype of a public VB6 function, including its return
-//! type, argument count, property kind, and vtable offset. These descriptors
-//! are found via the [`PrivateObjectDescriptor`](super::privateobj::PrivateObjectDescriptor)'s
-//! `lpFuncTypDescs` pointer array.
+//! Describes the prototype of a public VB6 function, including its parameter
+//! and return types, property kind, and vtable offset. These descriptors are
+//! found via the [`PrivateObjectDescriptor`](super::privateobj::PrivateObjectDescriptor)'s
+//! `lpFuncTypDescs` pointer array, which runs parallel to the object's method
+//! table: entry `i` describes method `i`, and is null for a method with no
+//! public prototype (a `Private` or `Friend` procedure).
 //!
-//! # Layout (20 bytes meaningful, padded to 32)
+//! # Layout
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x00 | 1 | `bArgSize` - encodes arg count (bits 3-7) and property kind (bits 0-2) |
-//! | 0x01 | 1 | `bFlags` - bit 0: function has a return type |
-//! | 0x02 | 2 | `wVTableOffset` - COM vtable offset; bit 0 is runtime flag (mask off) |
+//! | 0x00 | 1 | `bEntries` - bits 2-7: type-list entries (parameters plus the return value); bits 0-1: property kind |
+//! | 0x01 | 1 | `bFlags` - bit 0: has a return value; bits 2-7: 0x3F when the last parameter is a `ParamArray` |
+//! | 0x02 | 2 | `wVTableOffset` - COM vtable offset; bit 0 repeats `bFlags` bit 0 (mask off) |
 //! | 0x04 | 2 | `iObjectIndex` - signed; -1 (0xFFFF) = no COM object type reference |
 //! | 0x06 | 2 | Reserved (always 0) |
 //! | 0x08 | 4 | `lpOptionalDefaults` - VA to optional param default values header (see below) |
-//! | 0x0C | 2 | `wNameIndex` - method DISPID for IDispatch::GetIDsOfNames resolution |
-//! | 0x0E | 1 | `bReturnType` - [`VbType`] byte for the return value |
+//! | 0x0C | 2 | `wDispId` - the member's DISPID |
+//! | 0x0E | 1 | Always 3 in compiled projects (not the return type) |
 //! | 0x0F | 1 | `bFuncFlags` - 0x60 for regular Sub/Function, 0x68 for Property |
 //! | 0x10 | 4 | `lpParamNames` - VA to parameter name string pointer array |
-//! | 0x14 | 12 | Padding (always 0) |
+//! | 0x20 | n | Type list: `this` (0x1E), each parameter, then the return value |
 //!
 //! # Property Kind Encoding
 //!
-//! The lowest 3 bits of `bArgSize` encode the property type:
+//! The low 2 bits of `bEntries`:
 //!
 //! | Value | Meaning |
 //! |-------|---------|
-//! | 0 (`000`) | Regular Sub or Function |
-//! | 1 (`001`) | Property Get |
-//! | 2 (`010`) | Property Let |
-//! | 5 (`101`) | Property Get (variant, observed in native-compiled) |
-//! | 7 (`111`) | Property Set |
+//! | 0 | Regular Sub or Function |
+//! | 1 | Property Get |
+//! | 2 | Property Let |
+//! | 3 | Property Set |
+//!
+//! The entry count is `bEntries >> 2`: a `Function F(a, b)` has 3 (two
+//! parameters and the return value), a `Property Let P(i, v)` has 2, a `Sub`
+//! with no parameters 0. Verified against compiled fixtures of known source
+//! (`tests/fixtures/calls`, `tests/fixtures/types`).
 //!
 //! # References
 //!
@@ -44,7 +50,7 @@ use crate::{
     addressmap::AddressMap,
     error::Error,
     util::{read_cstr, read_u16_le, read_u32_le},
-    vb::external::{VarType, VbType},
+    vb::external::VarType,
 };
 
 /// Property type encoded in the lowest 3 bits of `arg_size`.
@@ -77,8 +83,8 @@ impl fmt::Display for PropertyKind {
 /// View over a function type descriptor (FuncTypDesc).
 ///
 /// Describes a single public function, sub, or property procedure in a
-/// VB6 class or form. The structure is always 0x14 bytes of meaningful
-/// data (padded to 0x20 with zeros in practice).
+/// VB6 class or form: the fixed header (0x20 bytes) and the type list that
+/// follows it.
 ///
 /// # Example
 ///
@@ -86,20 +92,25 @@ impl fmt::Display for PropertyKind {
 /// - `arg_count() == 0`
 /// - `property_kind() == PropertyKind::Get`
 /// - `has_return_type() == true`
-/// - `return_type() == Some(VbType(0x03))` (Long)
+/// - `return_type() == Some(ArgType::new(0x28))` (the `[out, retval]` Long)
 #[derive(Clone, Copy, Debug)]
 pub struct FuncTypDesc<'a> {
     bytes: &'a [u8],
 }
 
 impl<'a> FuncTypDesc<'a> {
-    /// Minimum size needed to parse the descriptor.
+    /// Minimum size needed to parse the descriptor's header fields.
     pub const MIN_SIZE: usize = 0x14;
+
+    /// Offset of the type list (its first entry is `this`).
+    const TYPE_LIST: usize = 0x20;
 
     /// Parses a FuncTypDesc from the given byte slice.
     ///
-    /// Requires at least 20 bytes (`MIN_SIZE`). Additional padding bytes
-    /// beyond offset 0x14 are ignored.
+    /// Requires at least 20 bytes (`MIN_SIZE`) for the header. The type list
+    /// at 0x20 is read from the rest of the slice, so pass the bytes to the
+    /// end of the section for [`arg_types`](Self::arg_types) and
+    /// [`return_type`](Self::return_type).
     ///
     /// # Errors
     ///
@@ -112,54 +123,55 @@ impl<'a> FuncTypDesc<'a> {
                 context: "FuncTypDesc",
             });
         }
-        Ok(Self {
-            bytes: data.get(..Self::MIN_SIZE).ok_or(Error::Truncated {
-                needed: Self::MIN_SIZE,
-                available: data.len(),
-            })?,
-        })
+        Ok(Self { bytes: data })
     }
 
-    /// Raw `arg_size` byte at offset 0x00.
+    /// Raw `bEntries` byte at offset 0x00.
     ///
-    /// Encodes both the argument count (bits 3-7) and property kind (bits 0-2).
+    /// Encodes the type-list entry count (bits 2-7) and the property kind
+    /// (bits 0-1).
     #[inline]
     pub fn raw_arg_size(&self) -> u8 {
         self.bytes.first().copied().unwrap_or(0)
     }
 
-    /// Number of explicit arguments (extracted from bits 3-7 of `arg_size`).
-    ///
-    /// Does not include the implicit return value or `this` pointer.
+    /// Number of type-list entries: the parameters plus the return value.
     #[inline]
-    pub fn arg_count(&self) -> u8 {
-        self.raw_arg_size() >> 3
+    pub fn entry_count(&self) -> u8 {
+        self.raw_arg_size() >> 2
     }
 
-    /// Property kind encoded in the lowest 3 bits of `arg_size`.
+    /// Number of explicit parameters.
+    ///
+    /// Does not include the return value or the `this` pointer.
+    #[inline]
+    pub fn arg_count(&self) -> u8 {
+        self.entry_count()
+            .saturating_sub(u8::from(self.has_return_type()))
+    }
+
+    /// Property kind encoded in the low 2 bits of `bEntries`.
     pub fn property_kind(&self) -> PropertyKind {
-        match self.raw_arg_size() & 0x07 {
+        match self.raw_arg_size() & 0x03 {
             0 => PropertyKind::None,
-            1 | 5 => PropertyKind::Get,
+            1 => PropertyKind::Get,
             2 => PropertyKind::Let,
-            7 => PropertyKind::Set,
-            other => PropertyKind::Unknown(other),
+            _ => PropertyKind::Set,
         }
     }
 
     /// Returns `true` if this is a Property (Get/Let/Set) rather than Sub/Function.
     #[inline]
     pub fn is_property(&self) -> bool {
-        self.raw_arg_size() & 0x07 != 0
+        self.raw_arg_size() & 0x03 != 0
     }
 
     /// Raw flags byte at offset 0x01.
     ///
-    /// | Bit | Mask | Meaning |
-    /// |-----|------|---------|
-    /// | 0 | 0x01 | Has return type |
-    /// | 1 | 0x02 | Has ParamArray (variable argument list) - confirmed in `MarshalDispParamsToNative` |
-    /// | 2-7 | 0xFC | Bits 2-7 encode the named argument count (0x3F = none) |
+    /// | Bits | Mask | Meaning |
+    /// |------|------|---------|
+    /// | 0 | 0x01 | Has a return value |
+    /// | 2-7 | 0xFC | 0x3F when the last parameter is a `ParamArray`; otherwise a small count (1 for a procedure with an `Optional ... As Variant` without default, 0 seen elsewhere) |
     #[inline]
     pub fn flags(&self) -> u8 {
         self.bytes.get(1).copied().unwrap_or(0)
@@ -174,14 +186,13 @@ impl<'a> FuncTypDesc<'a> {
         self.flags() & 0x01 != 0
     }
 
-    /// Returns `true` if this function has a ParamArray (variable argument list).
+    /// Returns `true` if the last parameter is a `ParamArray`.
     ///
-    /// Confirmed in `MarshalDispParamsToNative` (0x6600f796): when set, one
-    /// parameter slot is subtracted from the total argument count to account
-    /// for the ParamArray parameter consuming the remaining arguments.
+    /// `bFlags` bits 2-7 hold 0x3F then; the parameter's type is a ByRef
+    /// Variant array, passed as one SAFEARRAY pointer.
     #[inline]
     pub fn has_param_array(&self) -> bool {
-        self.flags() & 0x02 != 0
+        self.flags() >> 2 == 0x3F
     }
 
     /// VTable offset at offset 0x02 (2 bytes, little-endian).
@@ -241,23 +252,23 @@ impl<'a> FuncTypDesc<'a> {
     ///
     /// Used by `ResolveDispatchToFuncTypDesc` (0x6600EFC3) in the runtime
     /// for `IDispatch::GetIDsOfNames` resolution. Matches the DISPID that
-    /// COM clients use to invoke this method. Observed as a decreasing
-    /// index within the object's function type descriptor array.
+    /// COM clients use to invoke this method.
     #[inline]
     pub fn dispid(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x0C)
     }
 
-    /// Return type as a [`VbType`] at offset 0x0E.
+    /// Return type: the last type-list entry, when the procedure has one.
     ///
-    /// Only meaningful when [`has_return_type`](Self::has_return_type) is true.
-    /// Returns `None` if the function has no return type (i.e., it's a Sub).
-    pub fn return_type(&self) -> Option<VbType> {
-        if self.has_return_type() {
-            self.bytes.get(0x0E).copied().map(VbType)
-        } else {
-            None
+    /// The entry is the `[out, retval]` parameter, so it carries the ByRef
+    /// bit; [`ArgType::base_type`] gives the value's type. Returns `None` for
+    /// a `Sub`, `Property Let` or `Property Set`, and when the type list is
+    /// not in the parsed slice.
+    pub fn return_type(&self) -> Option<ArgType> {
+        if !self.has_return_type() {
+            return None;
         }
+        self.type_list().last().copied()
     }
 
     /// Secondary function flags at offset 0x0F.
@@ -358,107 +369,91 @@ impl<'a> FuncTypDesc<'a> {
         }
     }
 
-    /// Parses argument type information from the inline data at offset 0x20.
+    /// Returns the parameter types (not the return value).
     ///
-    /// The runtime's `MarshalDispParamsToNative` (0x6600F796) reads type
-    /// data from `FuncTypDesc+0x20`, **not** from the `lpArgTypes` VA.
-    /// The `lpArgTypes` field (+0x08) is used separately for optional
-    /// parameter default value lookup.
+    /// Read from the type list at offset 0x20: its first entry is `this`
+    /// (0x1E), then one per parameter, then the return value. Each entry is
+    /// one [`ArgType`] byte; an array type is followed by padding to a 4-byte
+    /// boundary, and a typed object, record or interface by padding and a
+    /// 4-byte descriptor VA (see [`ArgType::object_va`]).
     ///
-    /// # Inline Arg Type Format (verified via MSVBVM60.DLL disassembly)
-    ///
-    /// Starting at byte offset 0x20 within the FuncTypDesc data, each
-    /// argument is encoded as one or more bytes:
-    ///
-    /// ```text
-    /// byte[0]: type descriptor
-    ///   bits 0-4: VbType base code (0x00-0x1F)
-    ///   bit 5 (0x20): Array modifier
-    ///   bit 6 (0x40): ByRef modifier / extended data
-    ///   bit 7 (0x80): Optional argument
-    ///
-    /// If base type in {0x11(UDT), 0x13(TypedObject), 0x14(TypedArray),
-    ///                   0x1C(ExtDecimal), 0x1D(ExternalCOM)}:
-    ///   4-byte aligned extra data follows (object ref, UDT descriptor)
-    /// ```
-    ///
-    /// To use this method, the `data` slice passed to [`parse`](Self::parse)
-    /// must extend beyond the 0x14-byte minimum - at least `0x20 + arg_count`
-    /// bytes are needed. Use [`parse_extended`](Self::parse_extended) to
-    /// ensure the slice is large enough.
-    ///
-    /// Returns a [`Vec<ArgType>`] with one entry per argument.
-    ///
-    /// Each [`ArgType`] wraps the raw byte and provides `type_name()`,
-    /// `is_byref()`, `is_array()`, `is_optional()`, and a `Display` impl
-    /// that formats like `"ByRef String()"`.
-    ///
-    /// Empty if the data doesn't extend to offset 0x20 or there are no arguments.
+    /// Empty when the slice the descriptor was parsed from ends before the
+    /// type list.
     pub fn arg_types(&self) -> Vec<ArgType> {
-        let count = self.arg_count() as usize;
-        if count == 0 {
-            return Vec::new();
+        let mut list = self.type_list();
+        if self.has_return_type() {
+            list.pop();
         }
+        list
+    }
 
-        // Arg types start at offset 0x20 within the extended FuncTypDesc data
-        let Some(data) = self.bytes.get(0x20..) else {
-            return Vec::new();
-        };
-        if data.is_empty() {
-            return Vec::new();
+    /// Returns the evaluation-stack slots a call passes: each parameter's
+    /// width ([`ArgType::slots`]) plus one for the return value's pointer.
+    ///
+    /// The receiver is not counted (the call opcodes push it themselves).
+    /// `None` when the type list is not in the parsed slice.
+    pub fn arg_slots(&self) -> Option<u16> {
+        let list = self.type_list();
+        if list.len() != usize::from(self.entry_count()) {
+            return None;
         }
+        Some(list.iter().map(|t| u16::from(t.slots())).sum())
+    }
 
+    /// Returns the frame offset (from ebp) of each parameter inside the
+    /// called procedure, and of the return value's pointer last.
+    ///
+    /// Arguments follow `this` at `ebp+8`, each [`ArgType::slots`] wide.
+    pub fn param_offsets(&self) -> Vec<i16> {
+        let mut offset: i16 = 0x0C;
+        self.type_list()
+            .iter()
+            .map(|t| {
+                let at = offset;
+                offset = offset.saturating_add(i16::from(t.slots()).saturating_mul(4));
+                at
+            })
+            .collect()
+    }
+
+    /// Parses the type list's entries after `this`: the parameters, then the
+    /// return value.
+    fn type_list(&self) -> Vec<ArgType> {
+        let count = usize::from(self.entry_count());
         let mut types = Vec::with_capacity(count);
-        let mut pos = 0;
+        // Entry 0 is `this`; positions are relative to the descriptor.
+        let mut pos = Self::TYPE_LIST.saturating_add(1);
         for _ in 0..count {
-            let Some(&type_byte) = data.get(pos) else {
+            let Some(&code) = self.bytes.get(pos) else {
                 break;
             };
-            types.push(ArgType(type_byte));
-            pos = pos.saturating_add(calc_arg_type_entry_size(data, pos));
+            let mut t = ArgType::new(code);
+            let next = pos.saturating_add(1);
+            pos = if t.has_descriptor() {
+                let aligned = next.saturating_add(3) & !3;
+                t = t.with_descriptor(self.bytes.get(aligned..aligned.saturating_add(4)));
+                aligned.saturating_add(4)
+            } else if t.is_array() {
+                next.saturating_add(3) & !3
+            } else {
+                next
+            };
+            types.push(t);
         }
         types
     }
 
-    /// Parses a FuncTypDesc with extended data (0x20 + arg type bytes).
-    ///
-    /// Unlike [`parse`](Self::parse) which reads only 0x14 bytes, this
-    /// reads enough data to include the inline arg type stream at +0x20.
-    /// The actual size depends on the arg count and types.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - Byte slice starting at the FuncTypDesc. Should be at
-    ///   least `0x24` bytes for proper arg type access.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::TooShort`] if `data.len() < 0x14`.
-    pub fn parse_extended(data: &'a [u8]) -> Result<Self, Error> {
-        if data.len() < Self::MIN_SIZE {
-            return Err(Error::TooShort {
-                expected: Self::MIN_SIZE,
-                actual: data.len(),
-                context: "FuncTypDesc",
-            });
-        }
-        // Keep as much data as available (up to a reasonable max)
-        let usable = data.len().min(0x40);
-        Ok(Self {
-            bytes: data.get(..usable).ok_or(Error::Truncated {
-                needed: usable,
-                available: data.len(),
-            })?,
-        })
-    }
-
     /// Parses optional parameter default values from the defaults area.
     ///
-    /// The header at [`optional_defaults_va`](Self::optional_defaults_va) contains
-    /// a size and VA pointer. Each entry in the defaults area is a u16 VarType
-    /// code followed by type-dependent value data.
+    /// The header at [`optional_defaults_va`](Self::optional_defaults_va)
+    /// holds the defaults area's byte size and VA. Each entry is a u16
+    /// VARTYPE then its value: a BSTR as a u16 character count and the
+    /// UTF-16LE characters, other types at their natural width. An `Optional`
+    /// Variant without a default has no entry. Verified on the `types`
+    /// fixture (`Opts(Optional a As Long = 5, Optional st As String = "d",
+    /// Optional db As Double = 1.5, Optional bo As Boolean = True, Optional va)`).
     ///
-    /// Returns a `Vec` of [`OptionalDefault`] entries, one per optional parameter.
+    /// Returns a `Vec` of [`OptionalDefault`] entries in parameter order.
     /// Returns empty if `optional_defaults_va` is 0 or if parsing fails.
     pub fn optional_defaults(&self, map: &AddressMap<'_>) -> Vec<OptionalDefault> {
         let Ok(header_va) = self.optional_defaults_va() else {
@@ -467,122 +462,58 @@ impl<'a> FuncTypDesc<'a> {
         if header_va == 0 {
             return Vec::new();
         }
-
-        // Read the 8-byte header: u32 size + u32 va_defaults
-        let Ok(hdr) = map.slice_from_va(header_va, 8) else {
-            return Vec::new();
-        };
-        let Ok(total_size) = read_u32_le(hdr, 0) else {
+        let Some((total_size, defaults_va)) = map
+            .slice_from_va(header_va, 8)
+            .ok()
+            .and_then(|hdr| Some((read_u32_le(hdr, 0).ok()?, read_u32_le(hdr, 4).ok()?)))
+        else {
             return Vec::new();
         };
         let total_size = total_size as usize;
-        let Ok(defaults_va) = read_u32_le(hdr, 4) else {
-            return Vec::new();
-        };
         if defaults_va == 0 || total_size == 0 {
             return Vec::new();
         }
-
-        let Ok(data) = map.slice_from_va(defaults_va, total_size) else {
+        let Some(data) = map
+            .slice_from_va(defaults_va, total_size)
+            .ok()
+            .and_then(|d| d.get(..total_size))
+        else {
             return Vec::new();
         };
 
         let mut defaults = Vec::new();
         let mut pos: usize = 0;
-        while pos.checked_add(2).is_some_and(|p| p <= data.len()) {
-            let Ok(vt_raw) = read_u16_le(data, pos) else {
-                break;
-            };
+        while let Ok(vt_raw) = read_u16_le(data, pos) {
             let vt = VarType::from_raw(vt_raw).unwrap_or(VarType::Empty);
-            let data_size = vt.data_size();
-            let Some(value_start) = pos.checked_add(2) else {
-                break;
-            };
-
-            if vt == VarType::Bstr {
-                // BSTR: u16 type + u16 byte_length + UTF-16LE data
-                let Some(after_len) = value_start.checked_add(2) else {
+            let value_start = pos.saturating_add(2);
+            let (value, len) = if vt == VarType::Bstr {
+                let Ok(chars) = read_u16_le(data, value_start) else {
                     break;
                 };
-                if after_len > data.len() {
-                    break;
-                }
-                let Ok(byte_len_raw) = read_u16_le(data, value_start) else {
-                    break;
-                };
-                let byte_len = byte_len_raw as usize;
-                let str_start = after_len;
-                let str_end = str_start.saturating_add(byte_len).min(data.len());
-                let Some(str_bytes) = data.get(str_start..str_end) else {
+                let start = value_start.saturating_add(2);
+                let end = start.saturating_add(usize::from(chars).saturating_mul(2));
+                let Some(bytes) = data.get(start..end) else {
                     break;
                 };
-                let text = String::from_utf16_lossy(
-                    &str_bytes
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|&c| u16::from_le_bytes(c))
-                        .collect::<Vec<_>>(),
-                );
-                defaults.push(OptionalDefault {
-                    vt,
-                    vt_raw,
-                    value: DefaultValue::String(text),
-                });
-                // Advance: u16 type(2) + u16 byte_length(2) + aligned string data
-                let aligned_len = byte_len.saturating_add(1) & !1;
-                let Some(next) = after_len.checked_add(aligned_len) else {
-                    break;
-                };
-                pos = next;
-            } else if data_size > 0 {
-                let val_end = value_start.saturating_add(data_size).min(data.len());
-                let Some(val_bytes) = data.get(value_start..val_end) else {
-                    break;
-                };
-                let value = match vt {
-                    VarType::I2 | VarType::Bool | VarType::I1 | VarType::Ui1 | VarType::Ui2 => {
-                        if val_bytes.len() >= 2 {
-                            match read_u16_le(val_bytes, 0) {
-                                Ok(v) => DefaultValue::Integer(i64::from(v as i16)),
-                                Err(_) => DefaultValue::Raw(val_bytes.to_vec()),
-                            }
-                        } else {
-                            DefaultValue::Raw(val_bytes.to_vec())
-                        }
-                    }
-                    VarType::I4
-                    | VarType::Dispatch
-                    | VarType::Unknown
-                    | VarType::R4
-                    | VarType::Record
-                    | VarType::Int
-                    | VarType::Uint => {
-                        if val_bytes.len() >= 4 {
-                            match read_u32_le(val_bytes, 0) {
-                                Ok(v) => DefaultValue::Integer(i64::from(v as i32)),
-                                Err(_) => DefaultValue::Raw(val_bytes.to_vec()),
-                            }
-                        } else {
-                            DefaultValue::Raw(val_bytes.to_vec())
-                        }
-                    }
-                    _ => DefaultValue::Raw(val_bytes.to_vec()),
-                };
-                defaults.push(OptionalDefault { vt, vt_raw, value });
-                let Some(next) = value_start.checked_add(data_size) else {
-                    break;
-                };
-                pos = next;
+                let units: Vec<u16> = bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&c| u16::from_le_bytes(c))
+                    .collect();
+                (
+                    DefaultValue::String(String::from_utf16_lossy(&units)),
+                    end.saturating_sub(value_start),
+                )
             } else {
-                // Zero-size types (Empty, Null, Variant)
-                defaults.push(OptionalDefault {
-                    vt,
-                    vt_raw,
-                    value: DefaultValue::Empty,
-                });
-                pos = value_start;
-            }
+                let size = vt.data_size();
+                let Some(bytes) = data.get(value_start..value_start.saturating_add(size)) else {
+                    break;
+                };
+                (DefaultValue::decode(vt, bytes), size)
+            };
+            defaults.push(OptionalDefault { vt, vt_raw, value });
+            pos = value_start.saturating_add(len);
         }
         defaults
     }
@@ -606,10 +537,41 @@ pub enum DefaultValue {
     Empty,
     /// Integer value (VT_I2, VT_I4, VT_BOOL, etc.).
     Integer(i64),
+    /// Floating-point value (VT_R4, VT_R8, VT_DATE as its serial number).
+    Float(f64),
+    /// Currency value, scaled by 10000 (VT_CY).
+    Currency(i64),
     /// String value (VT_BSTR).
     String(String),
     /// Raw bytes for types we don't decode inline.
     Raw(Vec<u8>),
+}
+
+impl DefaultValue {
+    /// Decodes a fixed-width value of type `vt` from its bytes.
+    fn decode(vt: VarType, bytes: &[u8]) -> Self {
+        let raw = || Self::Raw(bytes.to_vec());
+        match vt {
+            VarType::Empty | VarType::Null | VarType::Variant => Self::Empty,
+            VarType::I2 | VarType::Bool | VarType::I1 | VarType::Ui1 | VarType::Ui2 => {
+                read_u16_le(bytes, 0).map_or_else(|_| raw(), |v| Self::Integer(i64::from(v as i16)))
+            }
+            VarType::I4 | VarType::Int | VarType::Uint | VarType::Error => {
+                read_u32_le(bytes, 0).map_or_else(|_| raw(), |v| Self::Integer(i64::from(v as i32)))
+            }
+            VarType::R4 => read_u32_le(bytes, 0)
+                .map_or_else(|_| raw(), |v| Self::Float(f64::from(f32::from_bits(v)))),
+            VarType::R8 | VarType::Date => bytes
+                .get(..8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map_or_else(raw, |b| Self::Float(f64::from_le_bytes(b))),
+            VarType::Cy => bytes
+                .get(..8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map_or_else(raw, |b| Self::Currency(i64::from_le_bytes(b))),
+            _ => raw(),
+        }
+    }
 }
 
 impl fmt::Display for OptionalDefault {
@@ -623,6 +585,8 @@ impl fmt::Display for OptionalDefault {
                     write!(f, "{v}")
                 }
             }
+            DefaultValue::Float(v) => write!(f, "{v}"),
+            DefaultValue::Currency(v) => write!(f, "{}@", *v as f64 / 10000.0),
             DefaultValue::String(s) => write!(f, "\"{s}\""),
             DefaultValue::Raw(b) => {
                 write!(
@@ -635,56 +599,94 @@ impl fmt::Display for OptionalDefault {
     }
 }
 
-/// Computes the byte size of a single entry in the lpArgTypes stream.
+/// One entry of a FuncTypDesc's type list (offset 0x20): a parameter's or
+/// the return value's type.
 ///
-/// Mirrors the logic of `CalcArgTypeEntrySize` (0x66009D34) in MSVBVM60.DLL.
-///
-/// Most entries are 1 byte. Types with base codes 0x11, 0x13, 0x14, 0x1C,
-/// or 0x1D include 4-byte aligned extra data (e.g., object reference or
-/// UDT descriptor pointer).
-fn calc_arg_type_entry_size(data: &[u8], pos: usize) -> usize {
-    let Some(&type_byte) = data.get(pos) else {
-        return 1;
-    };
-    let base = type_byte & 0x1F;
-
-    // Base size: 1 byte for the type descriptor
-    let base_size: usize = 1;
-
-    // Types that carry 4-byte aligned extra data
-    match base {
-        0x11 | 0x13 | 0x14 | 0x1C | 0x1D => {
-            // Align (pos + base_size) up to 4-byte boundary, then add 4
-            let after_type = pos.saturating_add(base_size);
-            let aligned = after_type.saturating_add(3) & !3;
-            aligned.saturating_sub(pos).saturating_add(4)
-        }
-        _ => base_size,
-    }
-}
-
-/// Inline argument type byte from FuncTypDesc+0x20.
-///
-/// **Uses a DIFFERENT numbering than [`VbType`] (which is for return types).**
-///
-/// Mapping verified from the lookup table at `0x6600FC48` in MSVBVM60.DLL,
-/// used by `sub_6600fbff` to convert arg types to COM VARIANT type codes
-/// for `IDispatch::Invoke` parameter marshalling.
+/// **Uses a different numbering than [`VbType`](crate::vb::external::VbType).** Codes verified against
+/// compiled fixtures of known source (`tests/fixtures/types`): Boolean 0x03,
+/// Byte 0x05, Integer 0x06, Long 0x08, Single 0x0A, Double 0x0B, Date 0x0C,
+/// Currency 0x0D, Variant 0x0F, String 0x10, a class 0x13 (with the class's
+/// ObjectInfo VA), Object 0x1B.
 ///
 /// # Encoding
 ///
 /// ```text
 /// bits 0-4: base type code (see type_name())
-/// bit 5 (0x20): ByRef modifier (→ VT_BYREF in COM)
-/// bit 6 (0x40): Array modifier (→ VT_ARRAY in COM)
+/// bit 5 (0x20): ByRef modifier (the `[out, retval]` entry has it too)
+/// bit 6 (0x40): Array modifier
 /// bit 7 (0x80): Optional parameter
 /// ```
-///
-/// Note: modifier bits are DIFFERENT from VbType (which has 0x20=Array, 0x40=ByRef).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ArgType(pub u8);
+pub struct ArgType {
+    /// The type byte.
+    code: u8,
+    /// The descriptor VA that follows a typed object, record or interface
+    /// entry; 0 for other types.
+    descriptor: u32,
+}
 
 impl ArgType {
+    /// Creates a type from its type-list byte, without a descriptor.
+    #[must_use]
+    pub const fn new(code: u8) -> Self {
+        Self {
+            code,
+            descriptor: 0,
+        }
+    }
+
+    /// Returns the raw type-list byte.
+    #[inline]
+    pub fn code(self) -> u8 {
+        self.code
+    }
+
+    /// Returns the VA of the class's ObjectInfo (typed object, 0x13), record
+    /// descriptor (0x11, 0x14) or interface (0x1C, 0x1D) that follows the
+    /// entry in the type list.
+    #[inline]
+    pub fn object_va(self) -> Option<u32> {
+        (self.descriptor != 0).then_some(self.descriptor)
+    }
+
+    /// Returns the evaluation-stack slots (4 bytes each) a call passes for
+    /// this parameter.
+    ///
+    /// By reference and arrays: one pointer. By value: two for Double, Date
+    /// and Currency, four for Variant (and Decimal, which only a Variant
+    /// holds), one for everything else.
+    pub fn slots(self) -> u8 {
+        if self.is_byref() || self.is_array() {
+            return 1;
+        }
+        match self.base_type() {
+            Self::DOUBLE | Self::DATE | Self::CURRENCY => 2,
+            Self::VARIANT | Self::DECIMAL => 4,
+            _ => 1,
+        }
+    }
+
+    /// Returns the type without the ByRef bit: the value type of an
+    /// `[out, retval]` entry.
+    #[must_use]
+    pub fn value_type(self) -> Self {
+        Self {
+            code: self.code & !Self::BYREF,
+            ..self
+        }
+    }
+
+    /// Returns `true` if a descriptor VA follows the entry.
+    fn has_descriptor(self) -> bool {
+        matches!(self.base_type(), 0x11 | 0x13 | 0x14 | 0x1C | 0x1D)
+    }
+
+    /// Returns the type with the descriptor VA read from `bytes`.
+    fn with_descriptor(self, bytes: Option<&[u8]>) -> Self {
+        let descriptor = bytes.and_then(|b| read_u32_le(b, 0).ok()).unwrap_or(0);
+        Self { descriptor, ..self }
+    }
+
     /// Void / Empty (0x00). Maps to VT_NULL.
     pub const VOID: u8 = 0x00;
     /// Boolean (0x03). Maps to VT_BOOL.
@@ -717,7 +719,8 @@ impl ArgType {
     pub const STRING: u8 = 0x10;
     /// User Defined Type (0x11). Followed by extra data.
     pub const UDT: u8 = 0x11;
-    /// Object / IDispatch (0x13). Maps to VT_DISPATCH.
+    /// A class of the project (0x13), followed by its ObjectInfo VA. Maps to
+    /// VT_DISPATCH.
     pub const OBJECT: u8 = 0x13;
     /// Record (0x14). Maps to VT_RECORD.
     pub const RECORD: u8 = 0x14;
@@ -734,25 +737,25 @@ impl ArgType {
     /// Returns the base type code (bits 0-4).
     #[inline]
     pub fn base_type(self) -> u8 {
-        self.0 & 0x1F
+        self.code & 0x1F
     }
 
     /// Returns `true` if this is a ByRef parameter (bit 5).
     #[inline]
     pub fn is_byref(self) -> bool {
-        self.0 & Self::BYREF != 0
+        self.code & Self::BYREF != 0
     }
 
     /// Returns `true` if this is an array type (bit 6).
     #[inline]
     pub fn is_array(self) -> bool {
-        self.0 & Self::ARRAY != 0
+        self.code & Self::ARRAY != 0
     }
 
     /// Returns `true` if this is an optional parameter (bit 7).
     #[inline]
     pub fn is_optional(self) -> bool {
-        self.0 & Self::OPTIONAL != 0
+        self.code & Self::OPTIONAL != 0
     }
 
     /// Returns the VB6 type name for the base type.
@@ -775,7 +778,8 @@ impl ArgType {
             Self::VARIANT => "Variant",
             Self::STRING => "String",
             Self::UDT => "UDT",
-            Self::OBJECT | 0x1B | 0x1D => "Object",
+            Self::OBJECT => "Class",
+            0x1B | 0x1D => "Object",
             Self::RECORD => "Record",
             0x16 => "IDispatch",
             0x1C => "IUnknown",
@@ -805,78 +809,122 @@ impl fmt::Display for ArgType {
 mod tests {
     use super::*;
 
-    // Real data from Cls_Zip entry[0]: Function with 1 arg, returns Long
-    // AddFile(ByRef Data() As ...) As Long
-    const ZIP_FUNC0: [u8; 0x14] = [
-        0x08, 0x01, 0x1D, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x03,
-        0x60, 0x74, 0x55, 0x40, 0x00,
-    ];
+    /// Builds a descriptor: the 0x20-byte header from its first bytes, then
+    /// the type list (`this` first).
+    fn ftd(header: &[u8], types: &[u8]) -> Vec<u8> {
+        let mut data = vec![0u8; 0x20];
+        data[..header.len()].copy_from_slice(header);
+        data.extend_from_slice(types);
+        data
+    }
 
-    // Real data from Cls_Zip entry[2]: Function with 3 args, returns Long
-    const ZIP_FUNC2: [u8; 0x14] = [
-        0x18, 0x01, 0x25, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x18, 0x56, 0x40, 0x00, 0x12, 0x00, 0x03,
-        0x60, 0x6C, 0x56, 0x40, 0x00,
-    ];
-
-    // Real data from Cls_Zip entry[5]: Property Get with 1 arg, returns Long
-    const ZIP_PROP_GET: [u8; 0x14] = [
-        0x09, 0x01, 0x31, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0D, 0x00, 0x03,
-        0x68, 0x7C, 0x55, 0x40, 0x00,
-    ];
-
-    // Real data from Cls_CRC32 entry[0]: Sub with 0 args, no return
-    const CRC32_SUB: [u8; 0x14] = [
-        0x00, 0x00, 0x1D, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x03,
-        0x60, 0x44, 0x55, 0x40, 0x00,
+    // tests/fixtures/calls Counter.AddLong(ByVal a As Long, ByVal b As Long) As Long
+    const ADD_LONG: [u8; 0x14] = [
+        0x0C, 0x01, 0x29, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x03,
+        0x60, 0xC8, 0x1C, 0x40, 0x00,
     ];
 
     #[test]
-    fn test_function_with_one_arg() {
-        let ftd = FuncTypDesc::parse(&ZIP_FUNC0).unwrap();
-        assert_eq!(ftd.arg_count(), 1);
-        assert_eq!(ftd.property_kind(), PropertyKind::None);
-        assert!(ftd.has_return_type());
-        assert_eq!(ftd.return_type(), Some(VbType(0x03))); // Long
-        assert_eq!(ftd.vtable_offset().unwrap(), 0x001C);
-        assert_eq!(ftd.object_index().unwrap(), -1);
-        assert_eq!(ftd.optional_defaults_va().unwrap(), 0);
-        assert_eq!(ftd.param_names_va().unwrap(), 0x00405574);
-        assert_eq!(ftd.kind_keyword(), "Function");
+    fn function_with_two_args() {
+        let data = ftd(&ADD_LONG, &[0x1E, 0x08, 0x08, 0x28]);
+        let f = FuncTypDesc::parse(&data).unwrap();
+        assert_eq!(f.entry_count(), 3);
+        assert_eq!(f.arg_count(), 2);
+        assert_eq!(f.property_kind(), PropertyKind::None);
+        assert!(f.has_return_type());
+        assert_eq!(f.return_type(), Some(ArgType::new(0x28)));
+        assert_eq!(f.arg_types(), vec![ArgType::new(0x08), ArgType::new(0x08)]);
+        assert_eq!(f.arg_slots(), Some(3));
+        assert_eq!(f.param_offsets(), vec![0x0C, 0x10, 0x14]);
+        assert_eq!(f.vtable_offset().unwrap(), 0x0028);
+        assert_eq!(f.dispid().unwrap(), 2);
+        assert_eq!(f.kind_keyword(), "Function");
     }
 
     #[test]
-    fn test_function_with_three_args() {
-        let ftd = FuncTypDesc::parse(&ZIP_FUNC2).unwrap();
-        assert_eq!(ftd.arg_count(), 3);
-        assert_eq!(ftd.property_kind(), PropertyKind::None);
-        assert!(ftd.has_return_type());
-        assert_eq!(ftd.return_type(), Some(VbType(0x03)));
-        assert_eq!(ftd.vtable_offset().unwrap(), 0x0024);
-        assert!(ftd.optional_defaults_va().unwrap() != 0); // Has optional defaults header
-        assert_eq!(ftd.kind_keyword(), "Function");
+    fn property_let_with_index() {
+        // tests/fixtures/types Kinds.Item(ByVal row As Long, ByVal col As Long, ByVal value As String)
+        let data = ftd(&[0x0E, 0x00, 0x61, 0x00], &[0x1E, 0x08, 0x08, 0x10]);
+        let f = FuncTypDesc::parse(&data).unwrap();
+        assert_eq!(f.property_kind(), PropertyKind::Let);
+        assert_eq!(f.arg_count(), 3);
+        assert_eq!(f.return_type(), None);
+        assert_eq!(f.kind_keyword(), "Property Let");
+        assert_eq!(f.arg_slots(), Some(3));
     }
 
     #[test]
-    fn test_property_get() {
-        let ftd = FuncTypDesc::parse(&ZIP_PROP_GET).unwrap();
-        assert_eq!(ftd.arg_count(), 1);
-        assert_eq!(ftd.property_kind(), PropertyKind::Get);
-        assert!(ftd.is_property());
-        assert!(ftd.has_return_type());
-        assert_eq!(ftd.return_type(), Some(VbType(0x03)));
-        assert_eq!(ftd.vtable_offset().unwrap(), 0x0030);
-        assert_eq!(ftd.func_flags(), 0x68); // Property flag
-        assert_eq!(ftd.kind_keyword(), "Property Get");
+    fn wide_and_by_value_variant_parameters() {
+        // Describe(ByVal v As Variant, ByRef text As String) As Variant, then
+        // ScaleBy-like Double and Currency by value.
+        let data = ftd(&[0x0C, 0x01], &[0x1E, 0x0F, 0x30, 0x2F]);
+        let f = FuncTypDesc::parse(&data).unwrap();
+        assert_eq!(f.arg_slots(), Some(4 + 1 + 1));
+        assert_eq!(f.param_offsets(), vec![0x0C, 0x1C, 0x20]);
+        assert_eq!(ArgType::new(0x0B).slots(), 2);
+        assert_eq!(ArgType::new(0x0D).slots(), 2);
+        assert_eq!(ArgType::new(0x0C).slots(), 2);
+        assert_eq!(ArgType::new(0x2B).slots(), 1);
     }
 
     #[test]
-    fn test_sub_no_args() {
-        let ftd = FuncTypDesc::parse(&CRC32_SUB).unwrap();
-        assert_eq!(ftd.arg_count(), 0);
-        assert_eq!(ftd.property_kind(), PropertyKind::None);
-        assert!(!ftd.has_return_type());
-        assert_eq!(ftd.return_type(), None);
-        assert_eq!(ftd.kind_keyword(), "Sub");
+    fn arrays_align_and_classes_carry_their_object() {
+        // Arrays(ByRef al() As Long, ByRef sa() As String, ByRef va() As Variant) As Long()
+        let data = ftd(
+            &[0x10, 0x01],
+            &[0x1E, 0x68, 0, 0, 0x70, 0, 0, 0, 0x6F, 0, 0, 0, 0x68],
+        );
+        let f = FuncTypDesc::parse(&data).unwrap();
+        assert_eq!(
+            f.arg_types(),
+            vec![ArgType::new(0x68), ArgType::new(0x70), ArgType::new(0x6F)]
+        );
+        assert_eq!(f.return_type(), Some(ArgType::new(0x68)));
+        // K(ByVal x As Kinds) As Kinds: each class entry is followed by the
+        // class's ObjectInfo VA at the next 4-byte boundary.
+        let data = ftd(
+            &[0x08, 0x01],
+            &[
+                0x1E, 0x13, 0, 0, 0xF4, 0x14, 0x40, 0, 0x33, 0, 0, 0, 0xF4, 0x14, 0x40, 0,
+            ],
+        );
+        let f = FuncTypDesc::parse(&data).unwrap();
+        let args = f.arg_types();
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].object_va(), Some(0x004014F4));
+        assert_eq!(args[0].type_name(), "Class");
+        assert_eq!(
+            f.return_type().and_then(|t| t.object_va()),
+            Some(0x004014F4)
+        );
+    }
+
+    #[test]
+    fn param_array_flag() {
+        // Total(ParamArray values() As Variant) As Long
+        let data = ftd(&[0x08, 0xFD], &[0x1E, 0x6F, 0, 0, 0x28]);
+        let f = FuncTypDesc::parse(&data).unwrap();
+        assert!(f.has_param_array());
+        assert!(f.has_return_type());
+        assert_eq!(f.arg_types(), vec![ArgType::new(0x6F)]);
+        assert_eq!(f.arg_slots(), Some(2));
+    }
+
+    #[test]
+    fn sub_without_parameters() {
+        let data = ftd(&[0x00, 0x00, 0x69, 0x00], &[0x1E]);
+        let f = FuncTypDesc::parse(&data).unwrap();
+        assert_eq!(f.arg_count(), 0);
+        assert_eq!(f.return_type(), None);
+        assert_eq!(f.kind_keyword(), "Sub");
+        assert_eq!(f.arg_slots(), Some(0));
+    }
+
+    #[test]
+    fn type_list_outside_the_slice() {
+        let f = FuncTypDesc::parse(&ADD_LONG).unwrap();
+        assert!(f.arg_types().is_empty());
+        assert_eq!(f.arg_slots(), None);
     }
 
     #[test]
@@ -886,45 +934,40 @@ mod tests {
     }
 
     #[test]
-    fn test_vtable_offset_masks_runtime_bit() {
-        // vtable_offset raw = 0x001D, masked = 0x001C
-        let ftd = FuncTypDesc::parse(&ZIP_FUNC0).unwrap();
-        assert_eq!(ftd.vtable_offset().unwrap(), 0x001C);
-    }
-
-    #[test]
     fn test_arg_type_names() {
         // Arg type encoding is DIFFERENT from VbType
-        assert_eq!(ArgType(0x10).type_name(), "String"); // NOT Byte!
-        assert_eq!(ArgType(0x08).type_name(), "Long"); // NOT String!
-        assert_eq!(ArgType(0x06).type_name(), "Integer");
-        assert_eq!(ArgType(0x03).type_name(), "Boolean");
-        assert_eq!(ArgType(0x0A).type_name(), "Single");
-        assert_eq!(ArgType(0x0B).type_name(), "Double");
-        assert_eq!(ArgType(0x0F).type_name(), "Variant");
-        assert_eq!(ArgType(0x13).type_name(), "Object");
-        assert_eq!(ArgType(0x1E).type_name(), "DispPtr");
+        assert_eq!(ArgType::new(0x10).type_name(), "String");
+        assert_eq!(ArgType::new(0x08).type_name(), "Long");
+        assert_eq!(ArgType::new(0x06).type_name(), "Integer");
+        assert_eq!(ArgType::new(0x03).type_name(), "Boolean");
+        assert_eq!(ArgType::new(0x05).type_name(), "Byte");
+        assert_eq!(ArgType::new(0x0A).type_name(), "Single");
+        assert_eq!(ArgType::new(0x0B).type_name(), "Double");
+        assert_eq!(ArgType::new(0x0C).type_name(), "Date");
+        assert_eq!(ArgType::new(0x0D).type_name(), "Currency");
+        assert_eq!(ArgType::new(0x0F).type_name(), "Variant");
+        assert_eq!(ArgType::new(0x1B).type_name(), "Object");
+        assert_eq!(ArgType::new(0x13).type_name(), "Class");
     }
 
     #[test]
     fn test_arg_type_display() {
-        assert_eq!(format!("{}", ArgType(0x1E)), "DispPtr");
-        assert_eq!(format!("{}", ArgType(0x10)), "String");
-        assert_eq!(format!("{}", ArgType(0x30)), "ByRef String");
-        assert_eq!(format!("{}", ArgType(0x50)), "String()");
-        assert_eq!(format!("{}", ArgType(0x70)), "ByRef String()");
-        assert_eq!(format!("{}", ArgType(0x90)), "Optional String");
+        assert_eq!(format!("{}", ArgType::new(0x10)), "String");
+        assert_eq!(format!("{}", ArgType::new(0x30)), "ByRef String");
+        assert_eq!(format!("{}", ArgType::new(0x50)), "String()");
+        assert_eq!(format!("{}", ArgType::new(0x70)), "ByRef String()");
+        assert_eq!(format!("{}", ArgType::new(0x90)), "Optional String");
     }
 
     #[test]
     fn test_arg_type_modifiers() {
-        let t = ArgType(0x70); // ByRef + Array + String
+        let t = ArgType::new(0x70); // ByRef + Array + String
         assert!(t.is_byref());
         assert!(t.is_array());
         assert!(!t.is_optional());
         assert_eq!(t.base_type(), ArgType::STRING);
 
-        let t = ArgType(0x90); // Optional + String
+        let t = ArgType::new(0x90); // Optional + String
         assert!(t.is_optional());
         assert!(!t.is_byref());
         assert!(!t.is_array());

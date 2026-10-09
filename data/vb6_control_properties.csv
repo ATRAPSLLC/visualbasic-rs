@@ -1,6 +1,10 @@
 # VB6 Control Property Descriptor Tables
 # Extracted from MSVBVM60.DLL v6.00.9848 runtime descriptor pointer tables.
 # Each row represents one entry in a control's property pointer table.
+# A row's name is its descriptor's own (the descriptor's first field), except
+# the composite labels Bounds (Left, Top, Width, Height), ClientSize (ClientLeft to
+# ClientHeight) and DataSource(obj). A property stream names a property by
+# its index in the table.
 # Status: active=serializable, fontsub=flag-only, skip=runtime-only, sep=separator, obj=COM object ref
 #
 # Descriptor Table VAs:
@@ -37,7 +41,7 @@ CheckBox,1,Caption,1,0,active,0x80EA4401,0x66022290
 CheckBox,2,Index,17,0,active,0x84C1D411,0x66001F00
 CheckBox,3,BackColor,5,0,active,0x80F12405,0x66022260
 CheckBox,4,ForeColor,5,0,active,0x80F12405,0x66022280
-CheckBox,5,LeftTop,8,4,active,0x90222408,0x66001DC0
+CheckBox,5,Bounds,8,4,active,0x90222408,0x66001DC0
 CheckBox,6,Top,10,0,flag,0x9020240A,0x66001DE0
 CheckBox,7,Width,9,0,flag,0x90202409,0x66001E00
 CheckBox,8,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -86,7 +90,7 @@ ComboBox,1,Style,6,0,active,0x00C13406,0x66025ED8
 ComboBox,2,Index,17,0,active,0x84C1D411,0x66001F00
 ComboBox,3,BackColor,5,0,active,0x80F12405,0x66001E40
 ComboBox,4,ForeColor,5,0,active,0x80F12405,0x66001E60
-ComboBox,5,LeftTop,8,4,active,0x90222408,0x66001DC0
+ComboBox,5,Bounds,8,4,active,0x90222408,0x66001DC0
 ComboBox,6,Top,10,0,flag,0x9020240A,0x66001DE0
 ComboBox,7,Width,9,0,flag,0x90202409,0x66001E00
 ComboBox,8,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -141,7 +145,7 @@ CommandButton,0,Name,18,0,skip,0x8400D412,0x66001E50
 CommandButton,1,Caption,1,0,active,0x80EA4401,0x66022290
 CommandButton,2,Index,17,0,active,0x84C1D411,0x66001F00
 CommandButton,3,BackColor,5,0,active,0x80F12405,0x66022260
-CommandButton,4,LeftTop,8,4,active,0x90222408,0x66001DC0
+CommandButton,4,Bounds,8,4,active,0x90222408,0x66001DC0
 CommandButton,5,Top,10,0,flag,0x9020240A,0x66001DE0
 CommandButton,6,Width,9,0,flag,0x90202409,0x66001E00
 CommandButton,7,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -182,7 +186,7 @@ CommandButton,41,Style,6,0,active,0x00C13406,0x660283B0
 CommandButton,42,CausesValidation,4,0,active,0x80C12204,0x66002010
 Data,0,Name,18,0,skip,0x8400D412,0x66001E50
 Data,1,Index,17,0,active,0x84C1D411,0x66001F00
-Data,2,LeftTop,8,4,active,0x90222408,0x66001DC0
+Data,2,Bounds,8,4,active,0x90222408,0x66001DC0
 Data,3,Top,10,0,flag,0x9020240A,0x66001DE0
 Data,4,Width,9,0,flag,0x90202409,0x66001E00
 Data,5,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -201,7 +205,7 @@ Data,17,_,4,0,sep,0xE0000804,0x660024A0
 Data,18,Connect,13,0,active,0x0011260D,0x660240C0
 Data,19,DatabaseName,13,0,active,0x0431260D,0x660240F8
 Data,20,Database,22,0,flag,0x00005C16,0x660240E0
-Data,21,RecordSource,22,0,flag,0x00204C16,0x66024158
+Data,21,Recordset,22,0,flag,0x00204C16,0x66024158
 Data,22,Exclusive,4,0,active,0x00012604,0x66024118
 Data,23,ReadOnly,4,0,active,0x00012604,0x66024138
 Data,24,RecordSource,13,0,active,0x0431260D,0x66024148
@@ -217,7 +221,7 @@ Data,33,Font,20,0,active,0x80224414,0x66001CC0
 Data,34,Align,6,0,active,0x80C12406,0x66024040
 Data,35,BOFAction,6,0,active,0x00C12206,0x66024170
 Data,36,EOFAction,6,0,active,0x00C12206,0x66024188
-Data,37,DefaultCursorType,6,0,active,0x00014406,0x660241A0
+Data,37,RecordsetType,6,0,active,0x00014406,0x660241A0
 Data,38,WhatsThisHelpID,3,0,active,0x80C12203,0x66001EF0
 Data,39,Appearance,6,0,active,0x80C12606,0x66001CA0
 Data,40,Negotiate,4,0,active,0x82C13404,0x66024058
@@ -225,10 +229,10 @@ Data,41,RightToLeft,4,0,active,0x80C14404,0x66114000
 Data,42,OLEDropMode,6,0,active,0x80412406,0x66001D70
 Data,43,ToolTipText,1,0,active,0x80D12401,0x66001F20
 Data,44,DefaultType,6,0,active,0x00014406,0x660241B8
-Data,45,RecordsetType,6,0,active,0x00014406,0x660241D0
+Data,45,DefaultCursorType,6,0,active,0x00014406,0x660241D0
 DirListBox,2,BackColor,5,0,active,0x80F12405,0x66001E40
 DirListBox,3,ForeColor,5,0,active,0x80F12405,0x66001E60
-DirListBox,4,LeftTop,8,4,active,0x90222408,0x66001DC0
+DirListBox,4,Bounds,8,4,active,0x90222408,0x66001DC0
 DirListBox,5,Top,10,0,flag,0x9020240A,0x66001DE0
 DirListBox,6,Width,9,0,flag,0x90202409,0x66001E00
 DirListBox,7,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -255,7 +259,7 @@ DirListBox,37,OLEDropMode,6,0,active,0x80412406,0x66001D70
 DirListBox,39,CausesValidation,4,0,active,0x80C12204,0x66002010
 DriveListBox,2,BackColor,5,0,active,0x80F12405,0x66001E40
 DriveListBox,3,ForeColor,5,0,active,0x80F12405,0x66001E60
-DriveListBox,4,LeftTop,8,4,active,0x90222408,0x66001DC0
+DriveListBox,4,Bounds,8,4,active,0x90222408,0x66001DC0
 DriveListBox,5,Top,10,0,flag,0x9020240A,0x66001DE0
 DriveListBox,6,Width,9,0,flag,0x90202409,0x66001E00
 DriveListBox,7,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -280,7 +284,7 @@ DriveListBox,35,OLEDropMode,6,0,active,0x80412406,0x66001D70
 DriveListBox,37,CausesValidation,4,0,active,0x80C12204,0x66002010
 FileListBox,2,BackColor,5,0,active,0x80F12405,0x66001E40
 FileListBox,3,ForeColor,5,0,active,0x80F12405,0x66001E60
-FileListBox,4,LeftTop,8,4,active,0x90222408,0x66001DC0
+FileListBox,4,Bounds,8,4,active,0x90222408,0x66001DC0
 FileListBox,5,Top,10,0,flag,0x9020240A,0x66001DE0
 FileListBox,6,Width,9,0,flag,0x90202409,0x66001E00
 FileListBox,7,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -288,13 +292,13 @@ FileListBox,8,Enabled,4,0,active,0x80E14404,0x66001D90
 FileListBox,9,Visible,4,0,active,0x80E14404,0x66001DF0
 FileListBox,10,MousePointer,6,0,active,0x80C12406,0x66001D50
 FileListBox,11,TabIndex,2,0,active,0x84012402,0x66001FF0
-FileListBox,13,FileName,1,0,active,0x00E12401,0x6601E890
-FileListBox,15,Pattern,4,0,active,0x00E12404,0x6601E870
-FileListBox,16,Archive,4,0,active,0x00C12404,0x6601E8A0
-FileListBox,17,Normal,4,0,active,0x00E12404,0x6601E810
-FileListBox,18,ReadOnly,4,0,active,0x00E12404,0x6601E830
+FileListBox,13,Pattern,1,0,active,0x00E12401,0x6601E890
+FileListBox,15,Normal,4,0,active,0x00E12404,0x6601E870
+FileListBox,16,ReadOnly,4,0,active,0x00C12404,0x6601E8A0
+FileListBox,17,Archive,4,0,active,0x00E12404,0x6601E810
+FileListBox,18,Hidden,4,0,active,0x00E12404,0x6601E830
 FileListBox,19,System,4,0,active,0x00E12404,0x6601E8B0
-FileListBox,22,Hidden,1,0,flag,0x00005901,0x6601E840
+FileListBox,22,List,1,0,flag,0x00005901,0x6601E840
 FileListBox,24,FontSize,7,0,flag,0x90304C07,0x66001D00
 FileListBox,25,FontBold,4,0,flag,0x90204C04,0x66001CD0
 FileListBox,26,FontItalic,4,0,flag,0x90204C04,0x66001CE0
@@ -352,16 +356,16 @@ Form,36,LinkTopic,1,0,active,0x00C1A401,0x66022518
 Form,37,LinkMode,6,0,active,0x00C12406,0x66022500
 Form,38,MaxButton,4,0,active,0x00C13604,0x66022528
 Form,39,MinButton,4,0,active,0x00C13604,0x66022538
-Form,40,Moveable,4,0,active,0x00C13604,0x660224E0
+Form,40,ControlBox,4,0,active,0x00C13604,0x660224E0
 Form,41,Image,21,0,flag,0x04005815,0x660221F8
-Form,42,ShowInTaskbar,4,0,active,0x00C13204,0x660226A0
+Form,42,HasDC,4,0,active,0x00C13204,0x660226A0
 Form,43,_,4,0,sep,0xE0000804,0x660024A0
 Form,44,_,4,0,sep,0xE0000804,0x660024A0
 Form,45,_,4,0,sep,0xE0000804,0x660024A0
 Form,46,Visible,4,0,active,0x80E14404,0x66001DF0
 Form,47,Tag,13,0,active,0x80C1220D,0x66001DD0
 Form,48,MDIChild,4,0,active,0x00C15404,0x66022580
-Form,49,NegotiateMenus,4,0,active,0x00C12204,0x66022570
+Form,49,KeyPreview,4,0,active,0x00C12204,0x66022570
 Form,50,ClipControls,4,0,active,0x80C12204,0x66022270
 Form,51,HelpContextID,3,0,active,0x80C12203,0x66001DB0
 Form,52,ActiveControl,26,0,flag,0x0000581A,0x66022590
@@ -370,7 +374,7 @@ Form,54,ClientTop,10,0,flag,0x12005A0A,0x660225B0
 Form,55,ClientWidth,8,0,flag,0x12005A08,0x660225C0
 Form,56,ClientHeight,10,0,flag,0x12005A0A,0x660225D0
 Form,57,Count,2,0,flag,0x00005802,0x660225E0
-Form,58,Palette,32,0,skip,0x00005820,0x660225F0
+Form,58,Controls,32,0,skip,0x00005820,0x660225F0
 Form,59,MouseIcon,21,0,active,0x84C1A615,0x66001D40
 Form,60,_,4,0,sep,0xE0000804,0x660024A0
 Form,61,LockControls,4,0,active,0x02C13A04,0x66022600
@@ -380,19 +384,19 @@ Form,64,Font,20,0,active,0x80224414,0x66001CC0
 Form,65,Appearance,6,0,active,0x80C12606,0x66001CA0
 Form,66,WhatsThisButton,4,0,active,0x00C13404,0x66022680
 Form,67,WhatsThisHelp,4,0,active,0x00C13404,0x66022690
-Form,68,StartUpPosition,4,0,active,0x00C13204,0x66022658
+Form,68,ShowInTaskbar,4,0,active,0x00C13204,0x66022658
 Form,69,RightToLeft,4,0,active,0x80C14404,0x66114000
-Form,70,PaletteMode,6,0,active,0x00C13406,0x66022668
+Form,70,StartUpPosition,6,0,active,0x00C13406,0x66022668
 Form,71,OLEDropMode,6,0,active,0x80412406,0x66001D70
-Form,72,Icon,21,0,active,0x04E12415,0x66022620
-Form,73,HasDC,6,0,active,0x00C1A406,0x66022630
+Form,72,Palette,21,0,active,0x04E12415,0x66022620
+Form,73,PaletteMode,6,0,active,0x00C1A406,0x66022630
 Form,74,Moveable,4,0,active,0x00C13204,0x66022648
 Frame,0,Name,18,0,skip,0x8400D412,0x66001E50
 Frame,1,Caption,1,0,active,0x80EA4401,0x66022290
 Frame,2,Index,17,0,active,0x84C1D411,0x66001F00
 Frame,3,BackColor,5,0,active,0x80F12405,0x66022260
 Frame,4,ForeColor,5,0,active,0x80F12405,0x66022280
-Frame,5,LeftTop,8,4,active,0x90222408,0x66001DC0
+Frame,5,Bounds,8,4,active,0x90222408,0x66001DC0
 Frame,6,Top,10,0,flag,0x9020240A,0x66001DE0
 Frame,7,Width,9,0,flag,0x90202409,0x66001E00
 Frame,8,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -424,7 +428,7 @@ Frame,33,OLEDropMode,6,0,active,0x80412406,0x66001D70
 Frame,34,BorderStyle,6,0,active,0x00C12606,0x66025690
 HScrollBar,0,Name,18,0,skip,0x8400D412,0x66001E50
 HScrollBar,1,Index,17,0,active,0x84C1D411,0x66001F00
-HScrollBar,2,LeftTop,8,4,active,0x90222408,0x66001DC0
+HScrollBar,2,Bounds,8,4,active,0x90222408,0x66001DC0
 HScrollBar,3,Top,10,0,flag,0x9020240A,0x66001DE0
 HScrollBar,4,Width,9,0,flag,0x90202409,0x66001E00
 HScrollBar,5,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -452,7 +456,7 @@ HScrollBar,26,CausesValidation,4,0,active,0x80C12204,0x66002010
 Image,0,Name,18,0,skip,0x8400D412,0x66001E50
 Image,1,Index,17,0,active,0x84C1D411,0x66001F00
 Image,2,Picture,21,0,active,0x04E12695,0x660272D8
-Image,3,LeftTop,8,4,active,0x90222408,0x66001DC0
+Image,3,Bounds,8,4,active,0x90222408,0x66001DC0
 Image,4,Top,10,0,flag,0x9020240A,0x66001DE0
 Image,5,Width,9,0,flag,0x90202409,0x66001E00
 Image,6,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -483,7 +487,7 @@ Label,1,Caption,1,0,active,0x80EA4401,0x66022290
 Label,2,Index,17,0,active,0x84C1D411,0x66001F00
 Label,3,BackColor,5,0,active,0x80F12405,0x66022260
 Label,4,ForeColor,5,0,active,0x80F12405,0x66022280
-Label,5,LeftTop,8,4,active,0x90222408,0x66001DC0
+Label,5,Bounds,8,4,active,0x90222408,0x66001DC0
 Label,6,Top,10,0,flag,0x9020240A,0x66001DE0
 Label,7,Width,9,0,flag,0x90202409,0x66001E00
 Label,8,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -543,7 +547,7 @@ ListBox,0,Name,18,0,skip,0x8400D412,0x66001E50
 ListBox,1,Index,17,0,active,0x84C1D411,0x66001F00
 ListBox,2,BackColor,5,0,active,0x80F12405,0x66001E40
 ListBox,3,ForeColor,5,0,active,0x80F12405,0x66001E60
-ListBox,4,LeftTop,8,4,active,0x90222408,0x66001DC0
+ListBox,4,Bounds,8,4,active,0x90222408,0x66001DC0
 ListBox,5,Top,10,0,flag,0x9020240A,0x66001DE0
 ListBox,6,Width,9,0,flag,0x90202409,0x66001E00
 ListBox,7,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -635,16 +639,16 @@ MDIForm,36,LinkTopic,1,0,active,0x00C1A401,0x66022518
 MDIForm,37,LinkMode,6,0,active,0x00C12406,0x66022500
 MDIForm,38,MaxButton,4,0,active,0x00C13604,0x66022528
 MDIForm,39,MinButton,4,0,active,0x00C13604,0x66022538
-MDIForm,40,Moveable,4,0,active,0x00C13604,0x660224E0
+MDIForm,40,ControlBox,4,0,active,0x00C13604,0x660224E0
 MDIForm,41,Image,21,0,flag,0x04005815,0x660221F8
-MDIForm,42,ShowInTaskbar,4,0,active,0x00C13204,0x660226A0
+MDIForm,42,HasDC,4,0,active,0x00C13204,0x660226A0
 MDIForm,43,_,4,0,sep,0xE0000804,0x660024A0
 MDIForm,44,_,4,0,sep,0xE0000804,0x660024A0
 MDIForm,45,_,4,0,sep,0xE0000804,0x660024A0
 MDIForm,46,Visible,4,0,active,0x80E14404,0x66001DF0
 MDIForm,47,Tag,13,0,active,0x80C1220D,0x66001DD0
 MDIForm,48,MDIChild,4,0,active,0x00C15404,0x66022580
-MDIForm,49,NegotiateMenus,4,0,active,0x00C12204,0x66022570
+MDIForm,49,KeyPreview,4,0,active,0x00C12204,0x66022570
 MDIForm,50,ClipControls,4,0,active,0x80C12204,0x66022270
 MDIForm,51,HelpContextID,3,0,active,0x80C12203,0x66001DB0
 MDIForm,52,ActiveControl,26,0,flag,0x0000581A,0x66022590
@@ -653,7 +657,7 @@ MDIForm,54,ClientTop,10,0,flag,0x12005A0A,0x660225B0
 MDIForm,55,ClientWidth,8,0,flag,0x12005A08,0x660225C0
 MDIForm,56,ClientHeight,10,0,flag,0x12005A0A,0x660225D0
 MDIForm,57,Count,2,0,flag,0x00005802,0x660225E0
-MDIForm,58,Palette,32,0,skip,0x00005820,0x660225F0
+MDIForm,58,Controls,32,0,skip,0x00005820,0x660225F0
 MDIForm,59,MouseIcon,21,0,active,0x84C1A615,0x66001D40
 MDIForm,60,_,4,0,sep,0xE0000804,0x660024A0
 MDIForm,61,LockControls,4,0,active,0x02C13A04,0x66022600
@@ -663,12 +667,12 @@ MDIForm,64,Font,20,0,active,0x80224414,0x66001CC0
 MDIForm,65,Appearance,6,0,active,0x80C12606,0x66001CA0
 MDIForm,66,WhatsThisButton,4,0,active,0x00C13404,0x66022680
 MDIForm,67,WhatsThisHelp,4,0,active,0x00C13404,0x66022690
-MDIForm,68,StartUpPosition,4,0,active,0x00C13204,0x66022658
+MDIForm,68,ShowInTaskbar,4,0,active,0x00C13204,0x66022658
 MDIForm,69,RightToLeft,4,0,active,0x80C14404,0x66114000
-MDIForm,70,PaletteMode,6,0,active,0x00C13406,0x66022668
+MDIForm,70,StartUpPosition,6,0,active,0x00C13406,0x66022668
 MDIForm,71,OLEDropMode,6,0,active,0x80412406,0x66001D70
-MDIForm,72,Icon,21,0,active,0x04E12415,0x66022620
-MDIForm,73,HasDC,6,0,active,0x00C1A406,0x66022630
+MDIForm,72,Palette,21,0,active,0x04E12415,0x66022620
+MDIForm,73,PaletteMode,6,0,active,0x00C1A406,0x66022630
 MDIForm,74,Moveable,4,0,active,0x00C13204,0x66022648
 Menu,0,Name,18,0,skip,0x8400D412,0x66001E50
 Menu,1,Index,17,0,active,0x84C1D411,0x66001F00
@@ -687,7 +691,7 @@ Menu,13,NegotiatePosition,6,0,active,0x02C1B206,0x66027928
 OLE,0,Name,18,0,skip,0x8400D412,0x66001E50
 OLE,1,Index,17,0,active,0x84C1D411,0x66001F00
 OLE,2,BackColor,5,0,active,0x80F12405,0x66001E40
-OLE,3,LeftTop,8,4,active,0x90222408,0x66001DC0
+OLE,3,Bounds,8,4,active,0x90222408,0x66001DC0
 OLE,4,Top,10,0,flag,0x9020240A,0x66001DE0
 OLE,5,Width,9,0,flag,0x90202409,0x66001E00
 OLE,6,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -712,8 +716,8 @@ OLE,24,AutoActivate,6,0,active,0x00C12206,0x66024C38
 OLE,25,AutoVerbMenu,4,0,active,0x00C12204,0x66024C60
 OLE,26,AppIsRunning,4,0,flag,0x00004C04,0x66024C88
 OLE,27,Picture,21,0,flag,0x00005815,0x66024CA0
-OLE,28,OleObjectBlob,32,0,skip,0x00005820,0x66024AA8
-OLE,29,EditMode,3,0,flag,0x00004C03,0x66024CB8
+OLE,28,Object,32,0,skip,0x00005820,0x66024AA8
+OLE,29,Data,3,0,flag,0x00004C03,0x66024CB8
 OLE,30,DataText,1,0,flag,0x00004C01,0x66024CE0
 OLE,31,Format,1,0,flag,0x00002A01,0x66024D00
 OLE,32,ObjectAcceptFormats,1,0,flag,0x00005901,0x66024D30
@@ -729,15 +733,15 @@ OLE,41,Verb,2,0,active,0x00C12202,0x66024EB0
 OLE,42,FileNumber,2,0,flag,0x00002A02,0x66024ED8
 OLE,43,Action,2,0,flag,0x02000C02,0x66024EF8
 OLE,44,MiscFlags,2,0,active,0x00C12202,0x66024F20
-OLE,45,OleObjectBlob2,3,0,active,0x02021803,0x66024AD0
+OLE,45,OleObjectBlob,3,0,flag,0x02021803,0x66024AD0
 OLE,46,_,4,0,sep,0xE0000804,0x660024A0
 OLE,47,CausesValidation,4,0,active,0x80C12204,0x66002010
-OLE,48,DisplayType,4,0,active,0x22011804,0x66024F40
+OLE,48,fFFHk,4,0,active,0x22011804,0x66024F40
 OLE,49,hWnd,3,0,flag,0x80005803,0x66024FC0
 OLE,50,HelpContextID,3,0,active,0x80C12203,0x66001DB0
-OLE,51,LpOleObject,6,0,active,0x00C14406,0x66024F68
-OLE,52,BackStyle,3,0,flag,0x00005803,0x66024F90
-OLE,53,OLEDropAllowed,6,0,active,0x00C12406,0x66024FA8
+OLE,51,DisplayType,6,0,active,0x00C14406,0x66024F68
+OLE,52,LpOleObject,3,0,flag,0x00005803,0x66024F90
+OLE,53,BackStyle,6,0,active,0x00C12406,0x66024FA8
 OLE,54,MouseIcon,21,0,active,0x84C1A615,0x66001D40
 OLE,55,_,4,0,sep,0xE0000804,0x660024A0
 OLE,56,_,4,0,sep,0xE0000804,0x660024A0
@@ -764,7 +768,7 @@ OptionButton,1,Caption,1,0,active,0x80EA4401,0x66022290
 OptionButton,2,Index,17,0,active,0x84C1D411,0x66001F00
 OptionButton,3,BackColor,5,0,active,0x80F12405,0x66022260
 OptionButton,4,ForeColor,5,0,active,0x80F12405,0x66022280
-OptionButton,5,LeftTop,8,4,active,0x90222408,0x66001DC0
+OptionButton,5,Bounds,8,4,active,0x90222408,0x66001DC0
 OptionButton,6,Top,10,0,flag,0x9020240A,0x66001DE0
 OptionButton,7,Width,9,0,flag,0x90202409,0x66001E00
 OptionButton,8,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -807,7 +811,7 @@ PictureBox,1,BackColor,5,0,active,0x80F12405,0x66022260
 PictureBox,2,Index,17,0,active,0x84C1D411,0x66001F00
 PictureBox,3,Picture,21,0,active,0x04E12415,0x66027FB8
 PictureBox,4,ForeColor,5,0,active,0x80F12405,0x66022280
-PictureBox,5,LeftTop,8,4,active,0x90222408,0x66001DC0
+PictureBox,5,Bounds,8,4,active,0x90222408,0x66001DC0
 PictureBox,6,Top,10,0,flag,0x9020240A,0x66001DE0
 PictureBox,7,Width,9,0,flag,0x90202409,0x66001E00
 PictureBox,8,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -828,7 +832,7 @@ PictureBox,22,ScaleLeft,7,0,flag,0x10404407,0x66022218
 PictureBox,23,ScaleTop,7,0,flag,0x10404407,0x66022240
 PictureBox,24,ScaleWidth,7,0,flag,0x10004407,0x66022250
 PictureBox,25,ScaleHeight,7,0,flag,0x10004407,0x66022208
-PictureBox,26,ScaleMode,6,0,active,0x10422406,0x66022228
+PictureBox,26,ScaleMode,6,3,active,0x10422406,0x66022228
 PictureBox,27,FontTransparent,4,0,flag,0x10404404,0x660221E8
 PictureBox,28,DrawStyle,6,0,active,0x00C14406,0x66022198
 PictureBox,29,DrawWidth,2,0,active,0x00C14402,0x660221B0
@@ -920,7 +924,7 @@ PropertyPage,45,_,4,0,sep,0xE0000804,0x660024A0
 PropertyPage,46,_,4,0,sep,0xE0000804,0x660024A0
 PropertyPage,47,Tag,13,0,active,0x80C1220D,0x66001DD0
 PropertyPage,48,_,4,0,sep,0xE0000804,0x660024A0
-PropertyPage,49,NegotiateMenus,4,0,active,0x00C12204,0x66022570
+PropertyPage,49,KeyPreview,4,0,active,0x00C12204,0x66022570
 PropertyPage,50,ClipControls,4,0,active,0x80C12204,0x66022270
 PropertyPage,51,HelpContextID,3,0,active,0x80C12203,0x66001DB0
 PropertyPage,52,ActiveControl,26,0,flag,0x0000581A,0x66022590
@@ -929,7 +933,7 @@ PropertyPage,54,ClientTop,10,0,flag,0x12005A0A,0x660225B0
 PropertyPage,55,ClientWidth,8,0,flag,0x12005A08,0x660225C0
 PropertyPage,56,ClientHeight,10,0,flag,0x12005A0A,0x660225D0
 PropertyPage,57,Count,2,0,flag,0x00005802,0x660225E0
-PropertyPage,58,Palette,32,0,skip,0x00005820,0x660225F0
+PropertyPage,58,Controls,32,0,skip,0x00005820,0x660225F0
 PropertyPage,59,MouseIcon,21,0,active,0x84C1A615,0x66001D40
 PropertyPage,60,_,4,0,sep,0xE0000804,0x660024A0
 PropertyPage,61,LockControls,4,0,active,0x02C13A04,0x66022600
@@ -941,9 +945,9 @@ PropertyPage,66,_,4,0,sep,0xE0000804,0x660024A0
 PropertyPage,67,_,4,0,sep,0xE0000804,0x660024A0
 PropertyPage,68,_,4,0,sep,0xE0000804,0x660024A0
 PropertyPage,69,RightToLeft,4,0,active,0x80C14404,0x66114000
-PropertyPage,70,ShowInTaskbar,4,0,active,0x00C13204,0x660226A0
+PropertyPage,70,HasDC,4,0,active,0x00C13204,0x660226A0
 PropertyPage,71,OLEDropMode,6,0,active,0x80412406,0x66001D70
-PropertyPage,72,Icon,21,0,active,0x04E12415,0x66022620
+PropertyPage,72,Palette,21,0,active,0x04E12415,0x66022620
 PropertyPage,73,PaletteMode,6,0,active,0x00C12406,0x6602A3A0
 PropertyPage,74,_,4,0,sep,0xE0000804,0x660024A0
 PropertyPage,75,SelectedControls,22,0,flag,0x00005816,0x6602A370
@@ -953,7 +957,7 @@ Shape,0,Name,18,0,skip,0x8400D412,0x66001E50
 Shape,1,Index,17,0,active,0x84C1D411,0x66001F00
 Shape,2,BackColor,5,0,active,0x80F12405,0x66001E40
 Shape,3,BorderColor,5,0,active,0x01F12285,0x660288F0
-Shape,4,LeftTop,8,4,active,0x90222408,0x66001DC0
+Shape,4,Bounds,8,4,active,0x90222408,0x66001DC0
 Shape,5,Top,10,0,flag,0x9020240A,0x66001DE0
 Shape,6,Width,9,0,flag,0x90202409,0x66001E00
 Shape,7,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -972,7 +976,7 @@ TextBox,0,Name,18,0,skip,0x8400D412,0x66001E50
 TextBox,1,Index,17,0,active,0x84C1D411,0x66001F00
 TextBox,2,BackColor,5,0,active,0x80F12405,0x66001E40
 TextBox,3,ForeColor,5,0,active,0x80F12405,0x66001E60
-TextBox,4,LeftTop,8,4,active,0x90222408,0x66001DC0
+TextBox,4,Bounds,8,4,active,0x90222408,0x66001DC0
 TextBox,5,Top,10,0,flag,0x9020240A,0x66001DE0
 TextBox,6,Width,9,0,flag,0x90202409,0x66001E00
 TextBox,7,Height,11,0,flag,0x9020240B,0x66001DA0
@@ -1084,7 +1088,7 @@ UserControl,45,Windowless,4,0,active,0x02C15444,0x660294E0
 UserControl,46,_,4,0,sep,0xE0000804,0x660024A0
 UserControl,47,Tag,13,0,active,0x80C1220D,0x66001DD0
 UserControl,48,_,4,0,sep,0xE0000804,0x660024A0
-UserControl,49,NegotiateMenus,4,0,active,0x00C12204,0x66022570
+UserControl,49,KeyPreview,4,0,active,0x00C12204,0x66022570
 UserControl,50,ClipControls,4,0,active,0x80C12204,0x66022270
 UserControl,51,_,4,0,sep,0xE0000804,0x660024A0
 UserControl,52,ActiveControl,26,0,flag,0x0000581A,0x66022590
@@ -1093,7 +1097,7 @@ UserControl,54,ClientTop,10,0,flag,0x12005A0A,0x660225B0
 UserControl,55,ClientWidth,8,0,flag,0x12005A08,0x660225C0
 UserControl,56,ClientHeight,10,0,flag,0x12005A0A,0x660225D0
 UserControl,57,Count,2,0,flag,0x00005802,0x660225E0
-UserControl,58,Palette,32,0,skip,0x00005820,0x660225F0
+UserControl,58,Controls,32,0,skip,0x00005820,0x660225F0
 UserControl,59,MouseIcon,21,0,active,0x84C1A615,0x66001D40
 UserControl,60,DataMembers,22,0,flag,0x00005816,0x660293B8
 UserControl,61,LockControls,4,0,active,0x02C13A04,0x66022600
@@ -1103,32 +1107,32 @@ UserControl,64,Font,20,0,active,0x80224414,0x66001CC0
 UserControl,65,Appearance,6,0,active,0x80C12606,0x66001CA0
 UserControl,66,DataSourceBehavior,6,0,active,0x02C15446,0x66119060
 UserControl,67,_,4,0,sep,0xE0000804,0x660024A0
-UserControl,68,HyperLink,3,0,flag,0x00005803,0x66029520
+UserControl,68,ContainerHwnd,3,0,flag,0x00005803,0x66029520
 UserControl,69,RightToLeft,4,0,active,0x80C14404,0x66114000
-UserControl,70,ShowInTaskbar,4,0,active,0x00C13204,0x660226A0
+UserControl,70,HasDC,4,0,active,0x00C13204,0x660226A0
 UserControl,71,OLEDropMode,6,0,active,0x80412406,0x66001D70
-UserControl,72,Icon,21,0,active,0x04E12415,0x66022620
+UserControl,72,Palette,21,0,active,0x04E12415,0x66022620
 UserControl,73,PaletteMode,6,0,active,0x00E1A406,0x66029410
-UserControl,74,PropertyChanged,6,0,active,0x00C12406,0x660294F0
+UserControl,74,HitBehavior,6,0,active,0x00C12406,0x660294F0
 UserControl,75,_,4,0,sep,0xE0000804,0x660024A0
-UserControl,76,DefaultCancel,4,0,active,0x02C15444,0x66029340
-UserControl,77,ContainedControls,22,0,flag,0x00005816,0x660293A0
+UserControl,76,ControlContainer,4,0,active,0x02C15444,0x66029340
+UserControl,77,Ambient,22,0,flag,0x00005816,0x660293A0
 UserControl,78,PropertyPages,1,0,active,0x08064501,0x660293E0
 UserControl,79,Extender,32,0,skip,0x00005820,0x660293D0
-UserControl,80,ContainerHwnd,22,0,flag,0x00005816,0x660293F8
+UserControl,80,ContainedControls,22,0,flag,0x00005816,0x660293F8
 UserControl,81,ParentControls,22,0,flag,0x00005816,0x66029428
-UserControl,82,ForwardFocus,4,0,active,0x02C15444,0x66029350
+UserControl,82,InvisibleAtRuntime,4,0,active,0x02C15444,0x66029350
 UserControl,83,CanGetFocus,4,0,active,0x02C15444,0x66029360
-UserControl,84,CanPropertyChange,4,0,active,0x02C15444,0x66029370
-UserControl,85,Alignable,4,0,active,0x02C15444,0x66029380
-UserControl,86,Ambient,4,0,active,0x02C15444,0x66029390
+UserControl,84,Alignable,4,0,active,0x02C15444,0x66029370
+UserControl,85,ForwardFocus,4,0,active,0x02C15444,0x66029380
+UserControl,86,DefaultCancel,4,0,active,0x02C15444,0x66029390
 UserControl,87,BackStyle,6,0,active,0x00C12406,0x66029440
 UserControl,88,EventsFrozen,4,0,flag,0x00005804,0x66029458
 UserControl,89,BorderStyle,6,0,active,0x00C12406,0x66029468
-UserControl,90,InvisibleAtRuntime,4,0,flag,0x0200D404,0x66029480
+UserControl,90,Public,4,0,flag,0x0200D404,0x66029480
 UserControl,91,AccessKeys,1,0,active,0x08D14401,0x66029490
-UserControl,92,HitBehavior,4,0,active,0x02C1B204,0x660294A8
-UserControl,93,EditAtDesignTime,22,0,flag,0x00005816,0x660294B8
+UserControl,92,EditAtDesignTime,4,0,active,0x02C1B204,0x660294A8
+UserControl,93,HyperLink,22,0,flag,0x00005816,0x660294B8
 UserDocument,0,Name,1,0,active,0x8400D412,0x660222A0
 UserDocument,1,_,4,0,sep,0xE0000804,0x660024A0
 UserDocument,2,hWnd,3,0,flag,0x80003803,0x66001D30
@@ -1182,7 +1186,7 @@ UserDocument,49,KeyPreview,4,0,active,0x00C12204,0x66022570
 UserDocument,50,ClipControls,4,0,active,0x80C12204,0x66022270
 UserDocument,51,_,4,0,sep,0xE0000804,0x660024A0
 UserDocument,52,ActiveControl,26,0,flag,0x0000581A,0x66022590
-UserDocument,53,ClientLeft,8,12,active,0x12025A08,0x660225A0
+UserDocument,53,ClientSize,8,12,active,0x12025A08,0x660225A0
 UserDocument,54,ClientTop,10,0,flag,0x12005A0A,0x660225B0
 UserDocument,55,ClientWidth,8,0,flag,0x12005A08,0x660225C0
 UserDocument,56,ClientHeight,10,0,flag,0x12005A0A,0x660225D0
@@ -1219,7 +1223,7 @@ UserDocument,86,HyperLink,22,0,flag,0x00005816,0x66029CF8
 UserDocument,87,_,4,0,sep,0xE0000804,0x660024A0
 VScrollBar,0,Name,18,0,skip,0x8400D412,0x66001E50
 VScrollBar,1,Index,17,0,active,0x84C1D411,0x66001F00
-VScrollBar,2,LeftTop,8,4,active,0x90222408,0x66001DC0
+VScrollBar,2,Bounds,8,4,active,0x90222408,0x66001DC0
 VScrollBar,3,Top,10,0,flag,0x9020240A,0x66001DE0
 VScrollBar,4,Width,9,0,flag,0x90202409,0x66001E00
 VScrollBar,5,Height,11,0,flag,0x9020240B,0x66001DA0

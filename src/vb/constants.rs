@@ -1,22 +1,27 @@
 //! VB6 constant name resolution.
 //!
 //! Provides reverse lookup from integer values to VB6 named constants
-//! (e.g., `13` → `"vbCr"`, `65` → `"vbKeyA"`).
+//! (e.g., `65` -> `"vbKeyA"`).
 //!
 //! The lookup table is generated at build time from `data/vb6_constants.csv`,
-//! which is extracted from the MSVBVM60.DLL type libraries.
+//! which is extracted from the MSVBVM60.DLL type libraries. It holds only
+//! integer enum members: string constants such as `vbCr` are not in it.
 
 use crate::vb::control::generated;
 
 /// Returns the VB6 constant name for an integer value, if known.
 ///
-/// Searches the ~711 named constants extracted from the VB6 runtime
+/// Searches the 711 named constants extracted from the VB6 runtime
 /// type libraries (KeyCode, MouseButton, Color, MsgBox constants, etc.).
+/// Many values have several names; the result is the first one in
+/// `data/vb6_constants.csv` order (`13` gives
+/// `"vbAsyncStatusCodeMIMETypeAvailable"`, not `vbKeyReturn`).
 ///
 /// # Examples
 ///
-/// ```ignore
-/// assert_eq!(constant_name(13), Some("vbCr"));
+/// ```
+/// use visualbasic::vb::constants::constant_name;
+///
 /// assert_eq!(constant_name(65), Some("vbKeyA"));
 /// assert_eq!(constant_name(999999), None);
 /// ```

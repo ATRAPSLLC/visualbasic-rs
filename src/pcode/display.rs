@@ -10,7 +10,10 @@
 
 use std::fmt;
 
-use crate::pcode::{decoder::Instruction, operand::Operand};
+use crate::pcode::{
+    decoder::Instruction,
+    operand::{NamedArgKind, Operand},
+};
 
 /// Formats as `{offset:04X}  {mnemonic} {operands...}`.
 ///
@@ -62,16 +65,21 @@ impl fmt::Display for Operand {
             }
             Operand::ConstPoolIndex(i) => write!(f, "[pool+{i:04X}]"),
             Operand::JumpTarget(t) => write!(f, "loc_{t:04X}"),
-            Operand::ControlIndex(i) => write!(f, "ctrl_{i:04X}"),
-            Operand::VTableRef { offset, control } => {
-                write!(f, "vtbl({offset:04X}, ctrl_{control:04X})")
+            Operand::VTableRef { offset, interface } => {
+                write!(f, "vtbl({offset:04X}, [pool+{interface:04X}])")
             }
-            Operand::ExternalCall { import, arg_info } => {
-                write!(f, "ext({import:04X}, {arg_info:04X})")
+            Operand::ExternalCall { import, arg_bytes } => {
+                write!(f, "ext([pool+{import:04X}], {arg_bytes:#x} bytes)")
             }
             Operand::VariableLength { byte_count } => {
                 write!(f, "({byte_count} bytes)")
             }
+            Operand::NamedArgs { count, kind, .. } => match kind {
+                NamedArgKind::Name => write!(f, "named[{count}]"),
+                NamedArgKind::DispId => write!(f, "named_ids[{count}]"),
+            },
+            Operand::JumpTable { count, .. } => write!(f, "targets[{count}]"),
+            Operand::FrameList { count, .. } => write!(f, "slots[{count}]"),
         }
     }
 }
@@ -139,30 +147,24 @@ mod tests {
     fn test_display_vtable_ref() {
         let op = Operand::VTableRef {
             offset: 0x10,
-            control: 3,
+            interface: 3,
         };
-        assert_eq!(format!("{op}"), "vtbl(0010, ctrl_0003)");
+        assert_eq!(format!("{op}"), "vtbl(0010, [pool+0003])");
     }
 
     #[test]
     fn test_display_external_call() {
         let op = Operand::ExternalCall {
             import: 2,
-            arg_info: 4,
+            arg_bytes: 4,
         };
-        assert_eq!(format!("{op}"), "ext(0002, 0004)");
+        assert_eq!(format!("{op}"), "ext([pool+0002], 0x4 bytes)");
     }
 
     #[test]
     fn test_display_variable_length() {
         let op = Operand::VariableLength { byte_count: 6 };
         assert_eq!(format!("{op}"), "(6 bytes)");
-    }
-
-    #[test]
-    fn test_display_control_index() {
-        let op = Operand::ControlIndex(5);
-        assert_eq!(format!("{op}"), "ctrl_0005");
     }
 
     #[test]

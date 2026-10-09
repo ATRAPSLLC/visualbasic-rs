@@ -27,7 +27,8 @@ pub(crate) struct SectionEntry {
 }
 
 impl SectionEntry {
-    /// Inclusive RVA range upper bound, saturating on overflow.
+    /// Exclusive RVA upper bound (`VirtualAddress + VirtualSize`), saturating
+    /// on overflow.
     ///
     /// Malformed PE section headers can declare absurdly large sizes; rather
     /// than panic, we cap the section at `u32::MAX`. RVAs landing past the
@@ -37,7 +38,7 @@ impl SectionEntry {
         self.virtual_address.saturating_add(self.virtual_size)
     }
 
-    /// Inclusive raw-offset upper bound, saturating on overflow.
+    /// Exclusive raw-offset upper bound, saturating on overflow.
     #[inline]
     fn raw_end(self) -> u32 {
         self.raw_data_offset.saturating_add(self.raw_data_size)
@@ -76,7 +77,8 @@ impl<'a> AddressMap<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Not32Bit`] if the PE is not a 32-bit (PE32) executable.
+    /// - [`Error::TooShort`] if the PE has no optional header.
+    /// - [`Error::Not32Bit`] if the PE is not a 32-bit (PE32) executable.
     pub fn from_goblin(file: &'a [u8], pe: &goblin::pe::PE<'_>) -> Result<Self, Error> {
         // Verify this is PE32 (not PE32+)
         let oh = pe.header.optional_header.as_ref().ok_or(Error::TooShort {
@@ -144,6 +146,10 @@ impl<'a> AddressMap<'a> {
 
     /// Converts a 32-bit relative virtual address (RVA) to a file offset.
     ///
+    /// An RVA maps when it lies in `[VirtualAddress, VirtualAddress +
+    /// VirtualSize)` of a section and within that section's raw data. The PE
+    /// headers (RVAs below the first section) are not mapped.
+    ///
     /// # Arguments
     ///
     /// * `rva` - The relative virtual address to translate.
@@ -151,8 +157,11 @@ impl<'a> AddressMap<'a> {
     /// # Errors
     ///
     /// - [`Error::RvaNotMapped`] if the RVA does not fall within any section.
-    /// - [`Error::RvaInBssRegion`] if the RVA falls in a BSS region
-    ///   (virtual size exceeds raw data size) with no file backing.
+    /// - [`Error::RvaInBssRegion`] if the RVA falls in a section past its raw
+    ///   data (virtual size exceeds raw data size), which has no file backing.
+    ///   A P-Code executable's `.data` section has no raw data at all
+    ///   (`SizeOfRawData` 0), so every VA in it, such as a module variable,
+    ///   gives this error.
     pub fn rva_to_offset(&self, rva: u32) -> Result<usize, Error> {
         for s in &self.sections {
             if rva >= s.virtual_address && rva < s.rva_end() {
@@ -211,10 +220,12 @@ impl<'a> AddressMap<'a> {
         None
     }
 
-    /// Returns `true` if the given VA falls within the PE image's mapped sections.
+    /// Returns `true` if the given VA has bytes in the file, that is, if
+    /// [`va_to_offset`](AddressMap::va_to_offset) succeeds.
     ///
-    /// This is useful for classifying pointers: a VA that returns `false` likely
-    /// points into an external DLL (e.g., MSVBVM60.DLL) rather than the PE file.
+    /// `false` covers a VA outside the image (in MSVBVM60.DLL, for example), but
+    /// also the PE headers and a section's uninitialized tail: the whole
+    /// `.data` section of a P-Code executable, which has no raw data.
     #[inline]
     pub fn is_va_in_image(&self, va: u32) -> bool {
         self.va_to_offset(va).is_ok()
@@ -226,7 +237,9 @@ impl<'a> AddressMap<'a> {
     /// from a pointer field, get a slice into the file buffer.
     ///
     /// The returned slice extends from the resolved offset to the **end of
-    /// the file buffer**, not just `min_len` bytes. This allows callers to
+    /// the file buffer**, not just `min_len` bytes, and is not bounded by the
+    /// section: past the section's raw data it holds whatever follows in the
+    /// file, not what the loader maps at those VAs. This allows callers to
     /// read variable-length data (e.g., null-terminated strings) or parse
     /// headers then access trailing fields without a second lookup. Callers
     /// that need an exact-length slice should re-slice the result.

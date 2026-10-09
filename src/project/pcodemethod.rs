@@ -7,7 +7,7 @@
 use crate::{
     addressmap::AddressMap,
     error::Error,
-    pcode::decoder::InstructionIterator,
+    pcode::decoder::{ErrorFlow, InstructionIterator},
     util::read_u32_le,
     vb::{
         constantpool::ConstantPool,
@@ -40,7 +40,11 @@ pub struct PCodeMethod<'a> {
 ///
 /// Returned by [`PCodeMethod::statement_markers`]. Each corresponds to a
 /// `LargeBos` instruction the compiler emits at the start of a source
-/// statement.
+/// statement, only in a procedure that needs statement boundaries at run
+/// time. In `tests/fixtures/flow` those are the procedures with `Resume`,
+/// `Resume Next`, `On Error Resume Next` or line numbers; procedures whose
+/// handler only exits or uses `Resume <label>`, and every procedure without
+/// error handling, have none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementMarker {
     /// P-Code offset of the `LargeBos` marker (the statement boundary).
@@ -50,14 +54,66 @@ pub struct StatementMarker {
     pub distance: u8,
 }
 
+/// A procedure's error handling: every `On Error` and `Resume` it holds.
+///
+/// Returned by [`PCodeMethod::error_handling`]. The compiler records error
+/// handling only in the code (`OnErrorGoto`, `Resume`); the procedure's
+/// descriptor has no flag for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ErrorHandling {
+    /// Each `On Error` / `Resume` with its P-Code offset, in code order.
+    pub flows: Vec<(u16, ErrorFlow)>,
+}
+
+impl ErrorHandling {
+    /// Returns the handler labels `On Error GoTo <label>` installs.
+    pub fn handlers(&self) -> impl Iterator<Item = u16> + '_ {
+        self.flows.iter().filter_map(|(_, flow)| match flow {
+            ErrorFlow::OnErrorGoto(label) => Some(*label),
+            _ => None,
+        })
+    }
+
+    /// Returns `true` if the procedure installs a handler (`On Error GoTo
+    /// <label>`).
+    pub fn has_handler(&self) -> bool {
+        self.handlers().next().is_some()
+    }
+
+    /// Returns `true` if the procedure has `On Error Resume Next`.
+    pub fn resumes_next_on_error(&self) -> bool {
+        self.flows
+            .iter()
+            .any(|(_, flow)| *flow == ErrorFlow::OnErrorResumeNext)
+    }
+
+    /// Returns `true` if a handler leaves with `Resume`, `Resume Next` or
+    /// `Resume <label>`.
+    pub fn resumes(&self) -> bool {
+        self.flows.iter().any(|(_, flow)| {
+            matches!(
+                flow,
+                ErrorFlow::Resume | ErrorFlow::ResumeNext | ErrorFlow::ResumeLabel(_)
+            )
+        })
+    }
+
+    /// Returns `true` if the procedure has no `On Error` and no `Resume`.
+    pub fn is_empty(&self) -> bool {
+        self.flows.is_empty()
+    }
+}
+
 impl<'a> PCodeMethod<'a> {
     /// Parses a P-Code method from a method table entry.
     ///
-    /// The method table at `methods_va` contains 4-byte VA entries. For
-    /// P-Code methods the VA points to a call stub
-    /// (`mov edx, <rtmi_addr>; call ProcCallEngine`); this function
-    /// detects the stub, extracts the RTMI address, parses the
-    /// [`ProcDscInfo`], and locates the P-Code byte stream.
+    /// The method table at `methods_va` contains 4-byte VA entries. A P-Code
+    /// procedure's entry points at its [`ProcDscInfo`] (every fixture), or at
+    /// a `mov edx, <ProcDscInfo>` stub (`BA imm32`, or `33 C0 BA imm32`)
+    /// from which the address is taken. The P-Code is the `proc_size` bytes
+    /// just before the `ProcDscInfo` (`ProcCallEngine` computes the same
+    /// start, `ebx - [ebx+8]`, at 0x66104b7f), and the constant pool base is
+    /// the owning `ObjectInfo`'s +0x34 (`ProcCallEngine` 0x66104adc).
     ///
     /// # Arguments
     ///
@@ -169,7 +225,9 @@ impl<'a> PCodeMethod<'a> {
         self.pcode_bytes
     }
 
-    /// Constant pool base VA for resolving string/API references.
+    /// Constant pool base VA for resolving string/API references: the
+    /// owning `ObjectInfo`'s `constants_va` (+0x34), shared by every method
+    /// of the object.
     #[inline]
     pub fn data_const_va(&self) -> u32 {
         self.data_const_va
@@ -192,11 +250,17 @@ impl<'a> PCodeMethod<'a> {
         self.proc_dsc_va
     }
 
-    /// VA of the call stub or direct ProcDscInfo pointer.
+    /// The VA the method table entry holds.
     ///
-    /// This is the raw VA from the method dispatch table entry - the
-    /// native stub code (`mov edx, <RTMI>; call ProcCallEngine`) that
-    /// launches the P-Code interpreter for this method.
+    /// In every fixture this is the `ProcDscInfo` itself (equal to
+    /// [`proc_dsc_va`](Self::proc_dsc_va)), not code. It is a
+    /// `mov edx, <ProcDscInfo>` stub only when the entry points at one. The
+    /// code that enters a class, form or UserControl method is its
+    /// [`MethodLink`](super::MethodLink) stub
+    /// (`xor eax, eax; mov edx, <ProcDscInfo>; push <jmp [MethCallEngine]>; ret`),
+    /// and `Sub Main`'s is
+    /// [`VbHeader::sub_main_va`](crate::vb::header::VbHeader::sub_main_va)
+    /// (`mov edx, <ProcDscInfo>; mov ecx, <jmp [ProcCallEngine]>; jmp ecx`).
     #[inline]
     pub fn stub_va(&self) -> u32 {
         self.stub_va
@@ -223,11 +287,12 @@ impl<'a> PCodeMethod<'a> {
     /// Returns the procedure's beginning-of-statement markers, in order.
     ///
     /// Each `LargeBos` marker ([`Instruction::is_bos`](crate::pcode::decoder::Instruction::is_bos))
-    /// starts a source statement, so these markers partition the instruction
-    /// stream into statements. Each [`StatementMarker`] carries its P-Code
-    /// offset and the byte distance to the next boundary (`0` for the last
-    /// statement). Instructions that fail to decode are skipped (fail-soft), so
-    /// a mid-stream decode error simply truncates the marker list.
+    /// starts a source statement, so in a procedure that has them they
+    /// partition the instruction stream into statements; most procedures have
+    /// none (see [`StatementMarker`]). Each [`StatementMarker`] carries its
+    /// P-Code offset and the byte distance to the next boundary (`0` for the
+    /// last statement). An instruction that fails to decode is skipped and
+    /// decoding goes on after the bytes it consumed.
     ///
     /// # Errors
     ///
@@ -244,6 +309,23 @@ impl<'a> PCodeMethod<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Returns the procedure's error handling: each `On Error` and `Resume`
+    /// ([`Instruction::error_flow`](crate::pcode::decoder::Instruction::error_flow)).
+    /// Instructions that fail to decode are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the instruction stream cannot be created.
+    pub fn error_handling(&self) -> Result<ErrorHandling, Error> {
+        Ok(ErrorHandling {
+            flows: self
+                .instructions()?
+                .flatten()
+                .filter_map(|insn| Some((insn.offset, insn.error_flow()?)))
+                .collect(),
+        })
     }
 
     /// Iterates the procedure's local-variable cleanup table entries.

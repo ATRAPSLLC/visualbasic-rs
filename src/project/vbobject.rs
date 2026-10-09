@@ -4,45 +4,59 @@
 //! ObjectTable. Forms (`.frm`), standard modules (`.bas`), and class modules
 //! (`.cls`) are all objects. Each object has a [`PublicObjectDescriptor`]
 //! (the array entry), an [`ObjectInfo`] with method/constant table pointers,
-//! an optional [`OptionalObjectInfo`] (controls, P-Code counts), and an
-//! optional [`PrivateObjectDescriptor`] (function type descriptors, parameter
-//! name tables).
+//! an optional [`OptionalObjectInfo`] (controls, method links, vtable
+//! layout), and an optional [`PrivateObjectDescriptor`] (function type
+//! descriptors, parameter name tables).
 //!
 //! [`VbObject`] ties these structures together and provides iterators over
 //! methods, controls, and method link thunks.
 
-use std::{borrow::Cow, str};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    str,
+};
 
 use crate::{
     addressmap::AddressMap,
     error::Error,
-    project::{ControlEntryIterator, MethodEntry, MethodLinkIterator, PCodeMethod, VbProject},
-    util::read_u32_le,
+    project::{
+        ControlEntryIterator, MethodEntry, MethodLinkIterator, MethodLinkKind, PCodeMethod,
+        VbProject,
+    },
+    util::{read_u16_le, read_u32_le},
     vb::{
         constantpool::ConstantPool,
         control::Guid,
+        designer::Designer,
         eventname,
+        events::EventHandlerThunk,
         flags::ObjectTypeFlags,
         formdata::{FormControlType, FormDataParser},
         functype::FuncTypDesc,
         guitable::GuiTableEntry,
         object::{GuidTableIter, ObjectInfo, OptionalObjectInfo, PublicObjectDescriptor},
         privateobj::PrivateObjectDescriptor,
-        publicbytes::{ClassFormPublicBytes, PublicVarTable},
+        publicbytes::ClassFormPublicBytes,
         varstub::VarStubIter,
     },
 };
 
 /// Result of looking up a method name from the method names table.
 ///
-/// Distinguishes between "the object has no names table at all" (common for
-/// malware with zeroed-out metadata) and "this particular method slot has
-/// no name" (normal for null/runtime slots).
+/// Distinguishes between "the object has no names table at all" (every
+/// standard module) and "this particular method has no name" (a procedure
+/// that is not a public member).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodNameResult<'a> {
-    /// The object has no method names table (`method_names_va == 0`).
+    /// The object has no method names table (`method_names_va == 0`), as in
+    /// all 29 standard modules of the fixtures.
     NoTable,
-    /// This method slot has no name (the name VA entry is null).
+    /// This method has no name: its entry is 0. Procedures that are not
+    /// public members (`Private`, `Friend`, `Class_Initialize`/`Terminate`,
+    /// control event handlers) have none; a `Private` procedure that
+    /// implements an interface member or handles a `WithEvents` event has
+    /// one (`events`: `Ring.Measure_Area`, `Listener.m_Source_Started`).
     Unnamed,
     /// The resolved name bytes (null-terminated ASCII in the PE image).
     Name(&'a [u8]),
@@ -69,8 +83,12 @@ impl<'a> MethodNameResult<'a> {
 
 /// Formats a VB6 function signature from a [`FuncTypDesc`] and method name.
 ///
-/// Produces output like `Sub Form_Load()`, `Function GetValue(x As Long) As String`,
-/// or `Property Get Name() As String`.
+/// Produces output like `Sub Reset(start As Long)`,
+/// `Function GetValue(x As Long) As String`, or
+/// `Property Get Name() As String`. `ByVal` is not written (only `ByRef`),
+/// an `Optional` parameter's default is not shown, and a class-typed
+/// parameter or return reads `As Class` (`types`: `Function K(x As Class) As Class`
+/// for `K(ByVal x As Kinds) As Kinds`).
 ///
 /// # Arguments
 ///
@@ -81,7 +99,7 @@ pub fn format_signature(ftd: &FuncTypDesc<'_>, name: &str, map: &AddressMap<'_>)
     let kind = ftd.kind_keyword();
     let ret = ftd
         .return_type()
-        .map(|t| format!(" As {t}"))
+        .map(|t| format!(" As {}", t.value_type()))
         .unwrap_or_default();
     let param_names = ftd.param_names(map);
     let arg_types = ftd.arg_types();
@@ -97,18 +115,42 @@ pub fn format_signature(ftd: &FuncTypDesc<'_>, name: &str, map: &AddressMap<'_>)
                     .get(i)
                     .filter(|n| !n.is_empty())
                     .map(|n| String::from_utf8_lossy(n).into_owned());
-                let ptype = arg_types.get(i).map(|t| format!("{t}"));
-                match (pname, ptype) {
-                    (Some(n), Some(t)) => format!("{n} As {t}"),
-                    (Some(n), None) => n,
-                    (None, Some(t)) => format!("arg{i} As {t}"),
-                    (None, None) => format!("arg{i}"),
+                let name = pname.unwrap_or_else(|| format!("arg{i}"));
+                match arg_types.get(i) {
+                    Some(t) if ftd.has_param_array() && i.saturating_add(1) == count => {
+                        format!("ParamArray {name}() As {}", t.type_name())
+                    }
+                    Some(t) => {
+                        let optional = if t.is_optional() { "Optional " } else { "" };
+                        let byref = if t.is_byref() { "ByRef " } else { "" };
+                        let array = if t.is_array() { "()" } else { "" };
+                        format!("{optional}{byref}{name}{array} As {}", t.type_name())
+                    }
+                    None => name,
                 }
             })
             .collect();
         format!("({})", params.join(", "))
     };
     format!("{kind} {name}{args}{ret}")
+}
+
+/// How a class module can be created and seen outside its project: its
+/// `Instancing` property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Instancing {
+    /// Visible only inside the project.
+    Private,
+    /// Public, but created only by the project.
+    PublicNotCreatable,
+    /// Creatable; each object in its own server instance.
+    SingleUse,
+    /// `SingleUse`, with its members in the global namespace.
+    GlobalSingleUse,
+    /// Creatable; one server instance for all objects.
+    MultiUse,
+    /// `MultiUse`, with its members in the global namespace.
+    GlobalMultiUse,
 }
 
 /// A single VB6 object (form, module, class) within the project.
@@ -127,7 +169,8 @@ pub struct VbObject<'a, 'p> {
     descriptor: PublicObjectDescriptor<'a>,
     /// Core object info with method table and constants VAs.
     info: ObjectInfo<'a>,
-    /// Extended info (controls, P-Code counts); `None` when not flagged.
+    /// Extended info (controls, method links, vtable layout); `None` for a
+    /// standard module.
     optional_info: Option<OptionalObjectInfo<'a>>,
     /// Private descriptor with function types and param names; `None` for
     /// standard modules or when the VA is null/`0xFFFFFFFF`.
@@ -135,6 +178,23 @@ pub struct VbObject<'a, 'p> {
 }
 
 impl<'a, 'p: 'a> VbObject<'a, 'p> {
+    /// Returns the name of event sink slot `slot` of a hosted ActiveX
+    /// control whose ControlInfo names events IID `guid`: the
+    /// `VBControlExtenderEvents` member for slots 0-8 when `guid` is the
+    /// instance or control-array events IID of one of the project's
+    /// [`components`](VbProject::components). The control's own events, from
+    /// slot 9 on, are named only in its type library.
+    fn extender_event_name(&self, guid: Option<&Guid>, slot: u16) -> Option<&'static str> {
+        let guid = guid?;
+        let hosted = self.project.components().ok()?.any(|component| {
+            component.instance_events_iid().as_ref() == Some(guid)
+                || component.array_events_iid().as_ref() == Some(guid)
+        });
+        hosted
+            .then(|| eventname::event_name_for_class("Extender", slot))
+            .flatten()
+    }
+
     /// Parses a VbObject by index from the object array.
     ///
     /// Resolves the `PublicObjectDescriptor` at position `index`, then
@@ -240,44 +300,48 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
 
     /// Returns the [`PrivateObjectDescriptor`] if present.
     ///
-    /// Contains function type descriptors, parameter name tables, and
-    /// public function/variable counts. Not available for standard modules
-    /// (BAS files) - those have `private_object_va == 0xFFFFFFFF`.
+    /// Contains function type descriptors and parameter name tables. Not
+    /// available for standard modules (BAS files) - those have
+    /// `private_object_va == 0xFFFFFFFF`.
     #[inline]
     pub fn private_object(&self) -> Option<&PrivateObjectDescriptor<'a>> {
         self.private_object.as_ref()
     }
 
-    /// Number of public functions declared in this object.
+    /// Number of methods with a prototype (a [`FuncTypDesc`]).
     ///
-    /// Derived from [`PrivateObjectDescriptor::func_count`]. Returns 0
-    /// if no private object descriptor is available.
+    /// Counts the non-null entries of the FuncTypDesc array. Public members
+    /// have one, and so does a `Private` procedure that implements an
+    /// interface member or handles a `WithEvents` event (`events`: `Ring`
+    /// counts 11, its two `Radius` properties and nine `Measure_*`);
+    /// `Friend` procedures, other `Private` procedures,
+    /// `Class_Initialize`/`Terminate` and control event handlers have none.
+    /// Returns 0 if no private object descriptor is available.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying PrivateObjectDescriptor field
-    /// cannot be read.
-    #[inline]
+    /// Returns an error if the private object descriptor's fields or the
+    /// method count cannot be read.
     pub fn public_func_count(&self) -> Result<u32, Error> {
-        match self.private_object.as_ref() {
-            Some(p) => Ok(u32::from(p.func_count()?)),
-            None => Ok(0),
-        }
+        Ok(u32::try_from(self.func_type_descs()?.count()).unwrap_or(u32::MAX))
     }
 
-    /// Number of public variables declared in this object.
+    /// The private object descriptor's
+    /// [`var_stub_count`](PrivateObjectDescriptor::var_stub_count), or 0 if
+    /// no private object descriptor is available.
     ///
-    /// Derived from [`PrivateObjectDescriptor::var_count`]. Returns 0
-    /// if no private object descriptor is available.
+    /// It is 0 in every fixture, including `data`'s `Item`, which declares
+    /// `Public Name As String`, so it does not count public variables; what
+    /// it counts is unconfirmed.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying PrivateObjectDescriptor field
     /// cannot be read.
     #[inline]
-    pub fn public_var_count(&self) -> Result<u32, Error> {
+    pub fn var_stub_count(&self) -> Result<u32, Error> {
         match self.private_object.as_ref() {
-            Some(p) => Ok(u32::from(p.var_count()?)),
+            Some(p) => Ok(u32::from(p.var_stub_count()?)),
             None => Ok(0),
         }
     }
@@ -311,29 +375,85 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
             .read_string_at_va(self.descriptor.object_name_va()?)
     }
 
-    /// Classifies the object kind based on type flags.
-    ///
-    /// Uses the two discriminating bits in `fObjectType` (mask `0x82`):
-    /// - `0x82` (both `IS_VISUAL` and `HAS_COM_INTERFACE`) → `"Form"`
-    /// - `0x02` (`HAS_COM_INTERFACE` only) → `"Class"`
-    /// - `0x00` (neither) → `"Module"`
-    ///
-    /// Delegates to [`ObjectTypeFlags::kind_name`](crate::vb::flags::ObjectTypeFlags::kind_name).
+    /// Classifies the object kind: its [`designer`](Self::designer)'s name
+    /// (`"Form"`, `"UserControl"`, `"MDIForm"`, `"UserDocument"`,
+    /// `"PropertyPage"`), else what the type flags say
+    /// ([`ObjectTypeFlags::kind_name`](crate::vb::flags::ObjectTypeFlags::kind_name):
+    /// `"Class"` or `"Module"`). The flags alone cannot tell a UserControl
+    /// (`0x001DA003` in `tests/fixtures/forms` and `dispid`) from a class
+    /// (`0x00118003`).
     ///
     /// # Errors
     ///
     /// Returns an error if the descriptor's `object_type_raw` field cannot
     /// be read.
     pub fn object_kind(&self) -> Result<&'static str, Error> {
-        Ok(ObjectTypeFlags(self.descriptor.object_type_raw()?).kind_name())
+        match self.designer() {
+            Some(designer) => Ok(designer.name()),
+            None => Ok(ObjectTypeFlags(self.descriptor.object_type_raw()?).kind_name()),
+        }
+    }
+
+    /// Returns a class module's `Instancing`: [`Instancing::Private`] for a
+    /// class not exposed outside its project, otherwise from its COM
+    /// registration record (the one with its CLSID,
+    /// [`ComRegObject::reg_flag`](crate::vb::comreg::ComRegObject::reg_flag))
+    /// and its object type's global-namespace bit. `None` for a module, a
+    /// designer object (form, UserControl, ...) or an exposed class with no
+    /// record.
+    pub fn instancing(&self) -> Option<Instancing> {
+        let flags = self.object_type_flags().ok()?;
+        if !flags.is_class() || self.designer().is_some() {
+            return None;
+        }
+        if !flags.is_exposed() {
+            return Some(Instancing::Private);
+        }
+        let map = self.project.address_map();
+        let clsid = self.optional_info.as_ref()?.resolve_clsid(map)?;
+        let registration = self.project.com_registration()?;
+        let record = registration
+            .objects(map)
+            .ok()?
+            .find(|record| record.clsid() == Some(clsid))?;
+        let global = flags.is_global_namespace();
+        Some(match (record.reg_flag().ok()?, global) {
+            (0, false) => Instancing::PublicNotCreatable,
+            (1, false) => Instancing::SingleUse,
+            (1, true) => Instancing::GlobalSingleUse,
+            (2, false) => Instancing::MultiUse,
+            (2, true) => Instancing::GlobalMultiUse,
+            _ => return None,
+        })
+    }
+
+    /// Returns the designer the object was built with, for a form,
+    /// UserControl or other designer object: the events interface its own
+    /// ControlInfo (control index 0xFFFF) names. A class names
+    /// `IClassModuleEvt` `{FCFB3D21-...}` there and a module has no
+    /// ControlInfo, so both give `None`.
+    pub fn designer(&self) -> Option<Designer> {
+        self.controls().ok()?.find_map(|control| {
+            let control = control.ok()?;
+            if control.index().ok()? != 0xFFFF {
+                return None;
+            }
+            Designer::from_events_iid(control.guid()?)
+        })
     }
 
     /// Reads the name of the method at `index` from the method names table.
     ///
     /// Returns a [`MethodNameResult`] that distinguishes:
     /// - `NoTable`: the object has no method names table (`method_names_va == 0`)
-    /// - `Unnamed`: this specific method has no name (entry VA is null)
+    /// - `Unnamed`: this specific method has no name: its entry is 0, or
+    ///   `0xFFFFFFFF` (`types`: `Kinds.Rec`, a `Friend`, and `Kinds.Hidden`,
+    ///   a `Private`)
     /// - `Name(&[u8])`: the resolved name bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the names table entry or the name cannot be read.
     pub fn method_name(&self, index: u16) -> Result<MethodNameResult<'a>, Error> {
         let names_va = self.descriptor.method_names_va()?;
         if names_va == 0 {
@@ -342,7 +462,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         let entry_va = names_va.wrapping_add(u32::from(index).saturating_mul(4));
         let entry_data = self.project.address_map().slice_from_va(entry_va, 4)?;
         let name_va = read_u32_le(entry_data, 0)?;
-        if name_va == 0 {
+        if name_va == 0 || name_va == u32::MAX {
             return Ok(MethodNameResult::Unnamed);
         }
         self.project
@@ -353,8 +473,15 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     /// Returns the number of methods in this object.
     ///
     /// Uses the larger of `ObjectInfo.method_count()` and
-    /// `PublicObjectDescriptor.method_count()` - they can differ in
-    /// native-compiled binaries where the ObjectInfo count may undercount.
+    /// `PublicObjectDescriptor.method_count()`. The two are equal in every
+    /// P-Code fixture object. In the natively compiled `flow-native` module
+    /// the `ObjectInfo` count is 0 and the descriptor's 25 (its
+    /// procedures), and there is no method table, so
+    /// [`methods`](Self::methods) yields nothing.
+    ///
+    /// A standard module counts each `Declare` too: method_count is
+    /// `Declare`s plus procedures (`vtable`: 13 + 3 = 16), and the
+    /// `Declare`s take the first slots (see [`MethodEntry`]).
     ///
     /// # Errors
     ///
@@ -377,21 +504,31 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         Ok(ObjectTypeFlags(self.descriptor.object_type_raw()?))
     }
 
-    /// Returns `true` if this object has P-Code methods.
+    /// Returns `true` if any entry of the object's method table is a P-Code
+    /// procedure ([`MethodEntry::PCode`]: the slot points at one of the
+    /// object's `ProcDscInfo`s).
+    ///
+    /// `true` for every object with a procedure in the P-Code fixtures,
+    /// `false` for an object without one (`data` `Item`, `statics` `Other`,
+    /// a form with no code) and for every object of the natively compiled
+    /// `flow-native` and `events-native`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the optional info's `pcode_count` cannot be read.
+    /// Returns an error if the method table's VA or counts cannot be read.
+    /// A slot that does not read counts as not P-Code.
     pub fn has_pcode(&self) -> Result<bool, Error> {
-        match self.optional_info.as_ref() {
-            Some(opt) => Ok(opt.pcode_count()? > 0),
-            None => Ok(false),
-        }
+        Ok(self
+            .methods()?
+            .any(|entry| matches!(entry, Ok(MethodEntry::PCode(_)))))
     }
 
-    /// Returns the number of controls on this object (forms only).
+    /// Returns the number of entries in this object's control table.
     ///
-    /// Returns 0 if no optional info is present.
+    /// Forms and UserControls list their controls and themselves; a class
+    /// lists itself (`"Class"`) plus one entry per implemented interface or
+    /// `WithEvents` variable (`calls`: `Square` 2, `Counter` 1). Returns 0
+    /// if no optional info is present (standard modules).
     ///
     /// # Errors
     ///
@@ -406,9 +543,11 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
 
     /// Returns an iterator over controls on this object.
     ///
-    /// Controls are GUI elements (buttons, textboxes, etc.) on VB6 forms.
-    /// Returns an empty iterator if the object has no optional info or
-    /// no controls.
+    /// Controls are GUI elements (buttons, textboxes, etc.) on VB6 forms,
+    /// plus an entry for the object itself; a class's table holds the class
+    /// and its implemented interfaces and `WithEvents` variables (see
+    /// [`control_count`](Self::control_count)). Returns an empty iterator if
+    /// the object has no optional info or no controls.
     ///
     /// # Errors
     ///
@@ -450,16 +589,16 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         Ok(self.controls()?.with_form_data(form_data))
     }
 
-    /// Returns an iterator over method link thunks for native-compiled classes.
+    /// Returns an iterator over the method link table: the code addresses of
+    /// the object's COM vtable, in vtable order.
     ///
-    /// The method link table contains JMP thunks that bridge COM vtable
-    /// dispatch to the actual native method implementations. Each thunk is
-    /// a `jmp <native_code_body>` instruction followed by a `this` pointer
-    /// adjustment.
-    ///
-    /// This is the primary way to discover native method bodies in
-    /// native-compiled VB6 classes where `ObjectInfo.methods_va` points
-    /// into MSVBVM60.DLL (runtime-patched vtable) rather than PE code.
+    /// In the P-Code fixtures each method's entry is a
+    /// `xor eax, eax; mov edx, <ProcDscInfo>; push <jmp [MethCallEngine]>; ret`
+    /// stub; public and `WithEvents` variables add accessor thunks, and a
+    /// class that implements interfaces has three null entries per
+    /// interface, after its public variables' accessors.
+    /// Entry `k` is not method `k` when the vtable order differs from the
+    /// method table order; see [`MethodLink`](crate::project::MethodLink).
     ///
     /// Returns an empty iterator if no method link table exists.
     ///
@@ -504,27 +643,51 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
 
     /// Returns an iterator over all method table entries, classified by type.
     ///
-    /// Each entry is classified as [`MethodEntry::Null`], [`MethodEntry::PCode`],
-    /// [`MethodEntry::Native`], or [`MethodEntry::Runtime`]. This is the full
-    /// view of the dispatch table - use [`pcode_methods`](Self::pcode_methods)
-    /// if you only want P-Code methods.
+    /// Each entry is classified as [`MethodEntry::Null`],
+    /// [`MethodEntry::Declare`], [`MethodEntry::PCode`],
+    /// [`MethodEntry::Native`], or [`MethodEntry::Runtime`], one per slot,
+    /// so the position of an entry is its method index (the index of
+    /// [`method_name`](Self::method_name) and
+    /// [`func_type_descs`](Self::func_type_descs)). Use
+    /// [`pcode_methods`](Self::pcode_methods) if you only want P-Code
+    /// methods.
     ///
-    /// Returns an empty iterator if the object has no method table (e.g.,
-    /// modules that only declare public variables).
+    /// In a standard module the slots before the first procedure are its
+    /// `Declare` statements, which hold no pointer: they are
+    /// [`MethodEntry::Declare`].
+    ///
+    /// Returns an empty iterator if the object has no method table: a
+    /// module or class with no procedures (`statics` `Other`, `data`
+    /// `Item`) or a natively compiled module (`flow-native`). The count is
+    /// capped at the slots the file holds from the table on.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying method/constants VAs or method
     /// counts cannot be read.
     pub fn methods(&self) -> Result<MethodIterator<'a, 'p>, Error> {
+        let map = self.project.address_map();
+        let methods_va = self.info.methods_va()?;
+        let object_info_va = self.descriptor.object_info_va()?;
         let total = if self.has_method_table()? {
+            let available = map.slice_from_va(methods_va, 0).map_or(0, <[u8]>::len) / 4;
             self.method_count()?
+                .min(u16::try_from(available).unwrap_or(u16::MAX))
+        } else {
+            0
+        };
+        let declares = if self.descriptor.is_module() {
+            (0..total)
+                .find(|&i| MethodEntry::is_procedure(map, methods_va, i, object_info_va))
+                .unwrap_or(total)
         } else {
             0
         };
         Ok(MethodIterator {
-            map: self.project.address_map(),
-            methods_va: self.info.methods_va()?,
+            map,
+            methods_va,
+            object_info_va,
+            declares,
             index: 0,
             total,
         })
@@ -532,85 +695,80 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
 
     /// Returns an iterator over P-Code methods in this object.
     ///
-    /// Non-P-Code entries (null, native, runtime) are silently skipped.
-    /// Use [`methods`](Self::methods) to see all entries with classification.
+    /// The [`MethodEntry::PCode`] entries of [`methods`](Self::methods);
+    /// the others (null, `Declare`, native, runtime) are skipped.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying method/constants VAs or method
     /// counts cannot be read.
     pub fn pcode_methods(&self) -> Result<PCodeMethodIterator<'a, 'p>, Error> {
-        let total = if self.has_method_table()? {
-            self.method_count()?
-        } else {
-            0
-        };
         Ok(PCodeMethodIterator {
-            map: self.project.address_map(),
-            methods_va: self.info.methods_va()?,
-            index: 0,
-            total,
+            inner: self.methods()?,
         })
     }
 
-    /// Parses the [`ClassFormPublicBytes`] for this object (classes and forms only).
+    /// Parses the object's module-level variable descriptor table
+    /// ([`PublicObjectDescriptor::public_bytes_va`]).
     ///
-    /// Returns `None` for standard modules (use
-    /// [`PublicVarTable`](crate::vb::publicbytes::PublicVarTable) instead)
-    /// or when the public bytes VA is null or any backing field cannot be read.
-    pub fn class_form_public_bytes(&self) -> Option<ClassFormPublicBytes<'a>> {
-        if self.object_type_flags().ok()?.is_module() {
-            return None;
-        }
-        let pb_va = self.descriptor.public_bytes_va().ok()?;
-        if pb_va == 0 {
-            return None;
-        }
-        // Read enough for header + potential entries
-        let data = self.project.address_map().slice_from_va(pb_va, 0x80).ok()?;
-        ClassFormPublicBytes::parse(data).ok()
+    /// Modules, classes, forms and UserControls share the format (see
+    /// [`ClassFormPublicBytes`]): one variable-length entry per variable
+    /// that needs initialization or cleanup (`flow`: `Private m_Log As
+    /// String` is a String entry at offset 0). Returns `None` when the VA is
+    /// null or the table cannot be read.
+    pub fn public_bytes(&self) -> Option<ClassFormPublicBytes<'a>> {
+        self.variable_table(self.descriptor.public_bytes_va().ok()?)
     }
 
-    /// Parses the [`PublicVarTable`] for this object (modules only).
+    /// Parses the descriptor table of the object's `Static` locals
+    /// ([`PublicObjectDescriptor::static_bytes_va`]), in the same format as
+    /// [`public_bytes`](Self::public_bytes).
     ///
-    /// Returns `None` for classes/forms (use
-    /// [`class_form_public_bytes`](Self::class_form_public_bytes) instead)
-    /// or when the public bytes VA is null or any backing field cannot be read.
-    pub fn public_var_table(&self) -> Option<PublicVarTable<'a>> {
-        if !self.object_type_flags().ok()?.is_module() {
-            return None;
-        }
-        let pb_va = self.descriptor.public_bytes_va().ok()?;
-        if pb_va == 0 {
+    /// Returns `None` when the object has no `Static` locals (VA 0) or the
+    /// table cannot be read.
+    pub fn static_bytes(&self) -> Option<ClassFormPublicBytes<'a>> {
+        self.variable_table(self.descriptor.static_bytes_va().ok()?)
+    }
+
+    /// Reads the variable descriptor table at `va`, `+0x00` bytes long.
+    fn variable_table(&self, va: u32) -> Option<ClassFormPublicBytes<'a>> {
+        if va == 0 {
             return None;
         }
         let map = self.project.address_map();
-        // Read header first to get total size
-        let header = map.slice_from_va(pb_va, PublicVarTable::HEADER_SIZE).ok()?;
-        let pvt_header = PublicVarTable::parse(header).ok()?;
-        let full_size = pvt_header.total_size().ok()? as usize;
-        if full_size <= PublicVarTable::HEADER_SIZE {
-            return Some(pvt_header);
-        }
-        let full_data = map.slice_from_va(pb_va, full_size).ok()?;
-        PublicVarTable::parse(full_data).ok()
+        let header = map.slice_from_va(va, ClassFormPublicBytes::MIN_SIZE).ok()?;
+        let size = usize::from(read_u16_le(header, 0).ok()?).max(ClassFormPublicBytes::MIN_SIZE);
+        ClassFormPublicBytes::parse(header.get(..size)?).ok()
     }
 
     /// Returns all code entry points in this object.
     ///
-    /// Combines three sources into a single `Vec`:
-    /// 1. **Method table** - P-Code and native methods from the dispatch table
-    /// 2. **Method link thunks** - native code bodies discovered via JMP thunks
-    /// 3. **Event handlers** - connected event sink handler VAs from controls
+    /// Combines three sources into a single `Vec`, one entry per address:
+    /// 1. **Method table** - P-Code and native methods from the dispatch
+    ///    table. A P-Code entry's `va` is its first P-Code byte, its
+    ///    `proc_dsc_va` its `ProcDscInfo` and its `stub_va` the method link
+    ///    stub that enters it through `MethCallEngine`, when the object has
+    ///    one (classes, forms, UserControls).
+    /// 2. **Method link entries** - the [`method_links`](Self::method_links)
+    ///    that are not a method's stub: member variable accessors
+    ///    ([`MethodLinkKind::Variable`]) and, for a natively compiled object,
+    ///    jumps to code not in the method table, as
+    ///    [`CodeEntryKind::NativeThunk`]. A link that enters a listed P-Code
+    ///    method is that method's `stub_va`, not a separate entry; null
+    ///    links are skipped.
+    /// 3. **Event handlers** - the event stubs in the controls' event sink
+    ///    vtables, labelled `ControlName_EventName`, with the method index of
+    ///    the procedure each enters.
     ///
-    /// Each entry includes a code VA and a human-readable label. Null entries
-    /// and runtime VAs (pointing into MSVBVM60.DLL) are excluded.
+    /// Null entries, `Declare` slots and slot values outside the image are
+    /// excluded.
+    ///
     /// # Name Resolution
     ///
-    /// Names are resolved using a three-tier fallback:
+    /// Method names are resolved using a three-tier fallback:
     /// 1. Method name table (`method_name()`) - from PublicObjectDescriptor
-    /// 2. FuncTypDesc signature - from PrivateObjectDescriptor's type info
-    /// 3. Positional fallback - `method_NN` for methods, `Control_EventName` for events
+    /// 2. FuncTypDesc signature without a name, e.g. `Function (x As Long) As Long`
+    /// 3. `None` (callers format their own, e.g. `method_NN`)
     ///
     /// When `form_data` is provided, event handler names use the exact
     /// `FormControlType` from the form binary (e.g., `Timer1_Timer` instead
@@ -626,78 +784,116 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         form_data: Option<&FormDataParser<'a>>,
     ) -> Result<Vec<CodeEntry>, Error> {
         let mut entries = Vec::new();
+        let mut seen = HashSet::new();
         let map = self.project.address_map();
 
         // Build FuncTypDesc map for name fallback
         let ftd_map = self.build_func_type_desc_map()?;
 
-        // 1. Method table entries
-        //    One unreadable slot is dropped on its own; it says nothing about the
-        //    slots beside it.
-        if self.has_method_table()? {
-            for (i, result) in self.methods()?.enumerate() {
-                let entry = match result {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        crate::trace::warn_drop!("code_entries.methods", error = ?e);
-                        continue;
-                    }
-                };
-                match entry {
-                    MethodEntry::PCode(pm) => {
-                        let pcode_size = match pm.proc_size() {
-                            Ok(size) => size,
-                            Err(e) => {
-                                crate::trace::warn_drop!("code_entries.proc_size", error = ?e);
-                                continue;
-                            }
-                        };
-                        let name = self.resolve_method_name(i, &ftd_map);
-                        entries.push(CodeEntry {
-                            va: pm.pcode_va(),
-                            kind: CodeEntryKind::PCode,
-                            method_index: Some(i as u16),
-                            name,
-                            data_const_va: Some(pm.data_const_va()),
-                            stub_va: Some(pm.stub_va()),
-                            pcode_size: Some(pcode_size),
-                        });
-                    }
-                    MethodEntry::Native { va } => {
-                        let name = self.resolve_method_name(i, &ftd_map);
-                        entries.push(CodeEntry {
-                            va,
-                            kind: CodeEntryKind::Native,
-                            method_index: Some(i as u16),
-                            name,
-                            data_const_va: None,
-                            stub_va: None,
-                            pcode_size: None,
-                        });
-                    }
-                    _ => {}
+        // The method link table: the stub of each P-Code procedure it enters,
+        // by ProcDscInfo. An unreadable link says nothing about the others.
+        let links: Vec<_> = self
+            .method_links()?
+            .filter_map(|link| match link {
+                Ok(link) => Some(link),
+                Err(e) => {
+                    crate::trace::warn_drop!("code_entries.method_links", error = ?e);
+                    None
                 }
+            })
+            .collect();
+        let mut stub_by_dsc: HashMap<u32, u32> = HashMap::new();
+        for link in &links {
+            if let MethodLinkKind::Procedure { proc_dsc_va } = link.kind {
+                stub_by_dsc.entry(proc_dsc_va).or_insert(link.thunk_va);
             }
         }
 
-        // 2. Method link thunks (may discover natives not in method table)
-        for (link_idx, result) in self.method_links()?.enumerate() {
-            if let Ok(link) = result {
-                // Skip if we already have this VA from the method table
-                if !entries.iter().any(|e| e.va == link.code_va) {
-                    // Try to inherit name from the method table at the same index
-                    let name = self.resolve_method_name(link_idx, &ftd_map);
+        // 1. Method table entries
+        //    One unreadable slot is dropped on its own; it says nothing about the
+        //    slots beside it.
+        let mut method_by_dsc: HashMap<u32, u16> = HashMap::new();
+        for (i, result) in self.methods()?.enumerate() {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(e) => {
+                    crate::trace::warn_drop!("code_entries.methods", error = ?e);
+                    continue;
+                }
+            };
+            let index = u16::try_from(i).unwrap_or(u16::MAX);
+            match entry {
+                MethodEntry::PCode(pm) => {
+                    let pcode_size = match pm.proc_size() {
+                        Ok(size) => size,
+                        Err(e) => {
+                            crate::trace::warn_drop!("code_entries.proc_size", error = ?e);
+                            continue;
+                        }
+                    };
+                    let proc_dsc_va = pm.proc_dsc_va();
+                    method_by_dsc.entry(proc_dsc_va).or_insert(index);
+                    if !seen.insert(pm.pcode_va()) {
+                        continue;
+                    }
                     entries.push(CodeEntry {
-                        va: link.code_va,
-                        kind: CodeEntryKind::NativeThunk,
-                        method_index: Some(link_idx as u16),
-                        name,
+                        va: pm.pcode_va(),
+                        kind: CodeEntryKind::PCode,
+                        method_index: Some(index),
+                        name: self.resolve_method_name(i, &ftd_map),
+                        data_const_va: Some(pm.data_const_va()),
+                        stub_va: stub_by_dsc.get(&proc_dsc_va).copied(),
+                        proc_dsc_va: Some(proc_dsc_va),
+                        pcode_size: Some(pcode_size),
+                    });
+                }
+                MethodEntry::Native { va } => {
+                    if !seen.insert(va) {
+                        continue;
+                    }
+                    entries.push(CodeEntry {
+                        va,
+                        kind: CodeEntryKind::Native,
+                        method_index: Some(index),
+                        name: self.resolve_method_name(i, &ftd_map),
                         data_const_va: None,
                         stub_va: None,
+                        proc_dsc_va: None,
                         pcode_size: None,
                     });
                 }
+                MethodEntry::Null | MethodEntry::Declare | MethodEntry::Runtime { .. } => {}
             }
+        }
+
+        // 2. Method link entries that are not a listed method's stub.
+        for link in &links {
+            let (va, stub_va, proc_dsc_va) = match link.kind {
+                MethodLinkKind::Empty => continue,
+                MethodLinkKind::Procedure { proc_dsc_va } => {
+                    if method_by_dsc.contains_key(&proc_dsc_va) {
+                        continue;
+                    }
+                    (link.thunk_va, None, Some(proc_dsc_va))
+                }
+                MethodLinkKind::Jump => (link.code_va, Some(link.thunk_va), None),
+                MethodLinkKind::Variable { .. } | MethodLinkKind::Other => {
+                    (link.thunk_va, None, None)
+                }
+            };
+            if va == 0 || !seen.insert(va) {
+                continue;
+            }
+            entries.push(CodeEntry {
+                va,
+                kind: CodeEntryKind::NativeThunk,
+                method_index: None,
+                name: None,
+                data_const_va: None,
+                stub_va,
+                proc_dsc_va,
+                pcode_size: None,
+            });
         }
 
         // 3. Event handler VAs from control event sinks. Bad control rows
@@ -733,30 +929,42 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                 .form_control_type()
                 .or_else(|| ctrl.class_name().and_then(FormControlType::from_class_name));
             for slot in 0..ctrl.event_count()? {
-                if let Some(handler_va) = ctrl.event_handler_va(slot)
-                    && handler_va != 0
-                    && map.va_to_offset(handler_va).is_ok()
-                {
-                    // Resolve event name: typed template → standard template → Event{NN}
-                    let event_name = ctrl_type
-                        .and_then(|ct| eventname::event_name(slot, ct))
-                        .or_else(|| eventname::standard_event_name(slot));
-                    let label = match event_name {
-                        Some(en) => format!("{ctrl_name}_{en}"),
-                        None => format!("{ctrl_name}_Event{slot:02}"),
-                    };
-                    if !entries.iter().any(|e| e.va == handler_va) {
-                        entries.push(CodeEntry {
-                            va: handler_va,
-                            kind: CodeEntryKind::EventHandler,
-                            method_index: None,
-                            name: Some(label),
-                            data_const_va: None,
-                            stub_va: None,
-                            pcode_size: None,
-                        });
-                    }
+                let Some(handler_va) = ctrl.event_handler_va(slot) else {
+                    continue;
+                };
+                if handler_va == 0 || map.va_to_offset(handler_va).is_err() {
+                    continue;
                 }
+                // Resolve event name: typed table, then the GUID's class, then Event{NN}
+                let event_name = ctrl_type
+                    .and_then(|ct| eventname::event_name(slot, ct))
+                    .or_else(|| {
+                        ctrl.class_name()
+                            .and_then(|class| eventname::event_name_for_class(class, slot))
+                    })
+                    .or_else(|| self.extender_event_name(ctrl.guid(), slot));
+                let label = match event_name {
+                    Some(en) => format!("{ctrl_name}_{en}"),
+                    None => format!("{ctrl_name}_Event{slot:02}"),
+                };
+                if !seen.insert(handler_va) {
+                    continue;
+                }
+                let proc_dsc_va = map
+                    .slice_from_va(handler_va, EventHandlerThunk::SIZE)
+                    .ok()
+                    .and_then(|data| EventHandlerThunk::parse_from_event_entry(data, handler_va))
+                    .map(|thunk| thunk.proc_dsc_info_va);
+                entries.push(CodeEntry {
+                    va: handler_va,
+                    kind: CodeEntryKind::EventHandler,
+                    method_index: proc_dsc_va.and_then(|dsc| method_by_dsc.get(&dsc).copied()),
+                    name: Some(label),
+                    data_const_va: None,
+                    stub_va: None,
+                    proc_dsc_va,
+                    pcode_size: None,
+                });
             }
         }
 
@@ -770,10 +978,10 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     fn resolve_method_name(
         &self,
         index: usize,
-        ftd_map: &[(usize, FuncTypDesc<'a>)],
+        ftd_map: &HashMap<usize, FuncTypDesc<'a>>,
     ) -> Option<String> {
         // Tier 1: method name table
-        if let Ok(result) = self.method_name(index as u16)
+        if let Ok(result) = self.method_name(u16::try_from(index).ok()?)
             && let MethodNameResult::Name(n) = result
             && let Ok(s) = str::from_utf8(n)
         {
@@ -781,55 +989,25 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         }
 
         // Tier 2: FuncTypDesc signature
-        for &(fi, ref ftd) in ftd_map {
-            if fi == index {
-                let name = format_signature(ftd, "", self.project.address_map());
-                // format_signature returns " ()" for empty name - strip prefix space
-                let trimmed = name.trim();
-                if !trimmed.is_empty() && trimmed != "()" {
-                    return Some(trimmed.to_string());
-                }
+        if let Some(ftd) = ftd_map.get(&index) {
+            let name = format_signature(ftd, "", self.project.address_map());
+            // format_signature returns " ()" for empty name - strip prefix space
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && trimmed != "()" {
+                return Some(trimmed.to_string());
             }
         }
 
         None
     }
 
-    /// Builds a Vec of (index, FuncTypDesc) pairs from the PrivateObjectDescriptor.
-    fn build_func_type_desc_map(&self) -> Result<Vec<(usize, FuncTypDesc<'a>)>, Error> {
-        let Some(priv_obj) = self.private_object() else {
-            return Ok(Vec::new());
-        };
-        let ftd_array_va = priv_obj.func_type_descs_va()?;
-        if ftd_array_va == 0 {
-            return Ok(Vec::new());
-        }
-        let total =
-            u32::from(priv_obj.func_count()?).saturating_add(u32::from(priv_obj.var_count()?));
-        let map = self.project.address_map();
-        let mut result = Vec::new();
-
-        for i in 0..total {
-            let ptr_va = ftd_array_va.wrapping_add(i.saturating_mul(4));
-            let Ok(ptr_data) = map.slice_from_va(ptr_va, 4) else {
-                continue;
-            };
-            let Some(ptr_bytes) = ptr_data.get(..4).and_then(|s| <[u8; 4]>::try_from(s).ok())
-            else {
-                continue;
-            };
-            let desc_va = u32::from_le_bytes(ptr_bytes);
-            if desc_va == 0 {
-                continue;
-            }
-            let Ok(desc_data) = map.slice_from_va(desc_va, 0x40) else {
-                continue;
-            };
-            if let Ok(ftd) = FuncTypDesc::parse_extended(desc_data) {
-                result.push((i as usize, ftd));
-            }
-        }
-        Ok(result)
+    /// Builds a map of method index to FuncTypDesc from the
+    /// PrivateObjectDescriptor.
+    fn build_func_type_desc_map(&self) -> Result<HashMap<usize, FuncTypDesc<'a>>, Error> {
+        Ok(self
+            .func_type_descs()?
+            .map(|(i, ftd)| (i as usize, ftd))
+            .collect())
     }
 
     /// Parses the form binary data for this object (forms with GUI data only).
@@ -858,9 +1036,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     /// When `form_data` is provided, the authoritative `cType` byte from
     /// the form binary drives [`FormControlType`] resolution (e.g.,
     /// `Timer` → slot 0 = `"Timer"`, not the default `"Click"`).
-    /// Without it, falls back to GUID-based class-name lookup, which
-    /// is unreliable for malware samples (8/12 controls misidentified
-    /// in the vb_inject sample).
+    /// Without it, falls back to GUID-based class-name lookup.
     ///
     /// Returns an empty `Vec` for objects with no controls (modules,
     /// classes without GUI). The order of the returned bindings is:
@@ -940,7 +1116,11 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                 }
                 let event_name = ctrl_type
                     .and_then(|ct| eventname::event_name(slot, ct))
-                    .or_else(|| eventname::standard_event_name(slot));
+                    .or_else(|| {
+                        ctrl.class_name()
+                            .and_then(|class| eventname::event_name_for_class(class, slot))
+                    })
+                    .or_else(|| self.extender_event_name(ctrl.guid(), slot));
                 bindings.push(EventBinding {
                     control_index: ctrl_index,
                     control_name: ctrl.name(),
@@ -954,21 +1134,10 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         Ok(bindings)
     }
 
-    /// Reserved signature for future form-designer-data extraction.
+    /// Parses the form designer data for this object.
     ///
-    /// Today this is an alias for [`form_data_from_gui_entry`](Self::form_data_from_gui_entry)
-    /// and exposes the same [`FormDataParser`]. The reserved name lets
-    /// downstream code wire up a "form designer" pane unconditionally
-    /// without breaking when the underlying extraction grows richer (e.g.,
-    /// resolving embedded resources, decoding more property types, or
-    /// surfacing the menu-section tree alongside the control tree).
-    ///
-    /// # Stability
-    ///
-    /// Returns the same [`FormDataParser`] as `form_data_from_gui_entry`
-    /// today. Future versions may extend the parser with additional
-    /// accessors but will not change the method signature or `Option<...>`
-    /// shape.
+    /// Same as [`form_data_from_gui_entry`](Self::form_data_from_gui_entry):
+    /// returns its [`FormDataParser`].
     #[inline]
     pub fn form_designer_data(&self, gui_entry: &GuiTableEntry<'a>) -> Option<FormDataParser<'a>> {
         self.form_data_from_gui_entry(gui_entry)
@@ -1035,8 +1204,10 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     /// Returns an iterator over [`FuncTypDesc`] entries.
     ///
     /// Walks the pointer array at [`PrivateObjectDescriptor::func_type_descs_va`],
-    /// yielding `(index, FuncTypDesc)` pairs. Returns an empty iterator if
-    /// no private object descriptor is present.
+    /// which runs parallel to the method table ([`method_count`](Self::method_count)
+    /// entries), yielding `(method index, FuncTypDesc)` pairs and skipping
+    /// the null entries of methods without a public prototype. Returns an
+    /// empty iterator if no private object descriptor is present.
     ///
     /// # Errors
     ///
@@ -1049,9 +1220,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                 if va == 0 {
                     (0, 0)
                 } else {
-                    let total =
-                        u32::from(p.func_count()?).saturating_add(u32::from(p.var_count()?));
-                    (va, total)
+                    (va, u32::from(self.method_count()?))
                 }
             }
             None => (0, 0),
@@ -1073,12 +1242,12 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     /// # Errors
     ///
     /// Returns an error if the private object descriptor's `var_stubs_va`
-    /// or `var_count` cannot be read.
+    /// or `var_stub_count` cannot be read.
     pub fn var_stubs(&self) -> Result<VarStubIter<'a>, Error> {
         let (stubs_va, count) = match self.private_object.as_ref() {
             Some(p) => {
                 let va = p.var_stubs_va()?;
-                let cnt = p.var_count()?;
+                let cnt = p.var_stub_count()?;
                 if va != 0 && cnt > 0 {
                     (va, cnt)
                 } else {
@@ -1129,7 +1298,7 @@ impl<'a, 'p> Iterator for FuncTypDescIter<'a, 'p> {
 
             // Read extended data (0x40 bytes to cover arg types at +0x20)
             let desc_data = self.map.slice_from_va(desc_va, 0x40).ok()?;
-            if let Ok(ftd) = FuncTypDesc::parse_extended(desc_data) {
+            if let Ok(ftd) = FuncTypDesc::parse(desc_data) {
                 return Some((i, ftd));
             }
         }
@@ -1147,16 +1316,28 @@ pub struct CodeEntry {
     pub va: u32,
     /// What kind of code entry this is.
     pub kind: CodeEntryKind,
-    /// Method table index (if from dispatch table).
+    /// Method table index: of the method for a method table entry, of the
+    /// procedure the stub enters for an event handler; `None` for a
+    /// [`CodeEntryKind::NativeThunk`] and for an event handler whose stub
+    /// does not decode.
     pub method_index: Option<u16>,
     /// Human-readable name (method name or "ControlName_EventName").
     pub name: Option<String>,
     /// Constant pool base VA (`ObjectInfo.lpConstants`).
     /// Present for [`CodeEntryKind::PCode`] entries.
     pub data_const_va: Option<u32>,
-    /// VA of the P-Code call stub (`mov edx, <RTMI>; call ProcCallEngine`).
-    /// Present for [`CodeEntryKind::PCode`] entries.
+    /// The x86 stub that enters the code: for a [`CodeEntryKind::PCode`]
+    /// method of a class, form or UserControl, its method link stub
+    /// (`xor eax, eax; mov edx, <ProcDscInfo>; push <jmp [MethCallEngine]>; ret`);
+    /// for a [`CodeEntryKind::NativeThunk`] that is a jump, the jump.
+    /// `None` for a standard module's procedures, which have no method
+    /// links, and for event handlers, whose `va` is the stub.
     pub stub_va: Option<u32>,
+    /// VA of the procedure's `ProcDscInfo`: present for
+    /// [`CodeEntryKind::PCode`] entries, for an event handler whose stub
+    /// decodes, and for a method link stub of a procedure not in the method
+    /// table.
+    pub proc_dsc_va: Option<u32>,
     /// Size of the P-Code byte stream in bytes.
     /// Present for [`CodeEntryKind::PCode`] entries.
     pub pcode_size: Option<u16>,
@@ -1165,13 +1346,16 @@ pub struct CodeEntry {
 /// Classification of a code entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeEntryKind {
-    /// P-Code procedure (bytecode).
+    /// P-Code procedure (bytecode); the entry's `va` is its first P-Code byte.
     PCode,
-    /// Native compiled method (x86 in PE .text section).
+    /// A method table slot taken to be native code. No fixture yields one.
     Native,
-    /// Native method discovered via method link JMP thunk.
+    /// A method link (vtable) entry that does not enter a listed method: in
+    /// the P-Code fixtures a member variable accessor (`data` `Item.Name`,
+    /// `events` `Listener.m_Source`), x86 code that jumps into the runtime.
     NativeThunk,
-    /// Event handler connected to a control's event sink vtable.
+    /// The event stub in a control's event sink vtable, which enters the
+    /// handler procedure through `MethCallEngine`.
     EventHandler,
 }
 
@@ -1199,11 +1383,10 @@ pub struct EventBinding<'a> {
     pub control_name: Cow<'a, str>,
     /// Authoritative control type, if it can be resolved.
     ///
-    /// Resolution prefers form binary data (`cType` byte) over GUID
-    /// fuzzy matching (which is unreliable for malware samples).
-    /// `None` when neither source resolves the type - in that case
-    /// [`event_name`](Self::event_name) falls back to the standard
-    /// 24-event template.
+    /// Resolution prefers form binary data (`cType` byte) over the class the
+    /// control's GUID names. `None` when neither source resolves the type -
+    /// in that case [`event_name`](Self::event_name) comes from the events
+    /// of the class the GUID names, if any.
     pub control_type: Option<FormControlType>,
     /// Zero-based slot in the control's event sink vtable.
     pub event_slot: u16,
@@ -1240,14 +1423,19 @@ impl<'a> EventBinding<'a> {
 
 /// Iterator over all method table entries in a VB6 object, classified by type.
 ///
-/// Each yielded [`MethodEntry`] is classified as null, P-Code, native, or
-/// runtime based on the VA at that slot.
+/// Created by [`VbObject::methods`]. Each yielded [`MethodEntry`] is
+/// classified as null, `Declare`, P-Code, native, or runtime based on the
+/// VA at that slot and the slot's position.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct MethodIterator<'a, 'p> {
     /// Address map for VA resolution.
     map: &'p AddressMap<'a>,
     /// Base VA of the method dispatch table.
     methods_va: u32,
+    /// VA of the owning object's `ObjectInfo`.
+    object_info_va: u32,
+    /// Number of leading `Declare` slots (standard modules only).
+    declares: u16,
     /// Current zero-based slot position.
     index: u16,
     /// Total number of slots in the method table.
@@ -1263,80 +1451,36 @@ impl<'a, 'p> Iterator for MethodIterator<'a, 'p> {
         }
         let i = self.index;
         self.index = self.index.saturating_add(1);
-        Some(MethodEntry::classify(self.map, self.methods_va, i))
+        if i < self.declares {
+            return Some(Ok(MethodEntry::Declare));
+        }
+        Some(MethodEntry::classify(
+            self.map,
+            self.methods_va,
+            i,
+            self.object_info_va,
+        ))
     }
 }
 
 /// Iterator over P-Code methods in a VB6 object, skipping non-P-Code entries.
 ///
-/// Walks the same method table as [`MethodIterator`] but silently skips
-/// null, native, and runtime slots, yielding only [`PCodeMethod`] values.
+/// Created by [`VbObject::pcode_methods`]: the [`MethodEntry::PCode`]
+/// entries of a [`MethodIterator`], and its errors.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct PCodeMethodIterator<'a, 'p> {
-    /// Address map for VA resolution.
-    map: &'p AddressMap<'a>,
-    /// Base VA of the method dispatch table.
-    methods_va: u32,
-    /// Current zero-based slot position.
-    index: u16,
-    /// Total number of slots in the method table.
-    total: u16,
+    /// The method table walk.
+    inner: MethodIterator<'a, 'p>,
 }
 
 impl<'a, 'p> Iterator for PCodeMethodIterator<'a, 'p> {
     type Item = Result<PCodeMethod<'a>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.total {
-            let i = self.index;
-            self.index = self.index.saturating_add(1);
-
-            // Read the 4-byte VA for this slot
-            let entry_va = self.methods_va.wrapping_add(u32::from(i).saturating_mul(4));
-            let entry_data = match self.map.slice_from_va(entry_va, 4) {
-                Ok(d) => d,
-                Err(e) => return Some(Err(e)),
-            };
-            let method_va = match read_u32_le(entry_data, 0) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(e)),
-            };
-
-            // Skip null and out-of-image entries
-            if method_va == 0 || !self.map.is_va_in_image(method_va) {
-                continue;
-            }
-
-            // Check for P-Code stub patterns or direct ProcDscInfo pointer
-            let stub_data = match self.map.slice_from_va(method_va, 12) {
-                Ok(d) => d,
-                Err(e) => return Some(Err(e)),
-            };
-            let is_stub = stub_data.first().copied() == Some(0xBA)
-                || (stub_data.first().copied() == Some(0x33)
-                    && stub_data.get(1).copied() == Some(0xC0)
-                    && stub_data.get(2).copied() == Some(0xBA));
-            if !is_stub {
-                // Check for direct ProcDscInfo pointer
-                let Some(pt_bytes) = stub_data.get(..4).and_then(|s| <[u8; 4]>::try_from(s).ok())
-                else {
-                    continue;
-                };
-                let Some(ps_bytes) = stub_data
-                    .get(8..10)
-                    .and_then(|s| <[u8; 2]>::try_from(s).ok())
-                else {
-                    continue;
-                };
-                let maybe_pt = u32::from_le_bytes(pt_bytes);
-                let maybe_ps = u16::from_le_bytes(ps_bytes);
-                if !self.map.is_va_in_image(maybe_pt) || maybe_ps == 0 || maybe_ps >= 0x8000 {
-                    continue; // Not P-Code
-                }
-            }
-
-            return Some(PCodeMethod::parse(self.map, self.methods_va, i));
-        }
-        None
+        self.inner.find_map(|entry| match entry {
+            Ok(MethodEntry::PCode(method)) => Some(Ok(method)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
     }
 }

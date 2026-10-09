@@ -10,8 +10,10 @@
 //!
 //! # Layout verified against
 //!
-//! - MSVBVM60.DLL `sub_66030AC0` (COM registration orchestrator)
-//! - MSVBVM60.DLL `sub_660BC263` (per-object CLSID/ProgID registration)
+//! - MSVBVM60 6.00.8176 `0x66028400` (COM registration orchestrator; reads
+//!   the header and copies each record's fields; `0x66030AC0` in 6.00.9848)
+//! - MSVBVM60 6.00.8176 `0x660BC893` (per-object CLSID/ProgID registration;
+//!   `0x660BC263` in 6.00.9848)
 
 use std::str;
 
@@ -22,7 +24,10 @@ use crate::{
     vb::control::Guid,
 };
 
-/// COM registration data header (0x30 bytes minimum, followed by strings).
+/// COM registration data header (0x2A bytes of fields, followed by strings).
+///
+/// The first string starts at +0x30 in every fixture; bytes 0x2A to 0x2F
+/// are padding and not always zero (`controls`, `vtable` carry stray text).
 ///
 /// # Header Layout
 ///
@@ -51,7 +56,7 @@ impl<'a> ComRegData<'a> {
     ///
     /// Consumers that pre-slice COM registration data before calling
     /// [`parse`](Self::parse) should use this value instead of hard-coding
-    /// a larger guess. It is currently equal to [`HEADER_SIZE`](Self::HEADER_SIZE).
+    /// a larger guess. It equals [`HEADER_SIZE`](Self::HEADER_SIZE).
     pub const MIN_BUFFER_SIZE: usize = Self::HEADER_SIZE;
 
     /// Parses the COM registration data header.
@@ -74,8 +79,8 @@ impl<'a> ComRegData<'a> {
 
     /// Self-relative offset to the first per-object registration record.
     ///
-    /// Returns 0 if there are no COM objects to register (common for EXE
-    /// files; ActiveX DLLs/OCXs will have non-zero offsets).
+    /// Returns 0 if there are no records. A Standard EXE has one record per
+    /// UserControl (`dispid`, `forms`) and none for its classes and forms.
     #[inline]
     pub fn first_object_offset(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x00)
@@ -87,7 +92,10 @@ impl<'a> ComRegData<'a> {
         read_u32_le(self.bytes, 0x04)
     }
 
-    /// Self-relative offset to the help directory string (0 = none).
+    /// Self-relative offset to the help directory string.
+    ///
+    /// Non-zero and pointing to an empty string when the project sets none
+    /// (all fixtures).
     ///
     /// Used by the compiler for the `\HELPDIR = ...` registry entry.
     #[inline]
@@ -116,7 +124,7 @@ impl<'a> ComRegData<'a> {
 
     /// TypeLib registration flags at offset 0x24.
     ///
-    /// Passed through to TypeLib registration APIs in `sub_66030AC0`. Maps to
+    /// Read by the orchestrator (MSVBVM60 6.00.8176 `0x66028509`). Maps to
     /// `TLIBATTR.wLibFlags` semantics from COM:
     ///
     /// | Value | COM constant | Meaning |
@@ -260,15 +268,22 @@ impl<'a> ComRegData<'a> {
 
     /// Returns an iterator over per-object COM registration records.
     ///
+    /// The records form a linked list; the walk yields at most as many
+    /// records as the file holds from the blob on, so a list that loops
+    /// back on itself ends.
+    ///
     /// # Errors
     ///
     /// Returns an error if the first-object offset header field cannot be
     /// read from the backing buffer.
     pub fn objects(&self, map: &'a AddressMap<'a>) -> Result<ComRegObjectIter<'a>, Error> {
+        let remaining =
+            map.slice_from_va(self.base_va, 0).map_or(0, <[u8]>::len) / ComRegObject::SIZE;
         Ok(ComRegObjectIter {
             map,
             base_va: self.base_va,
             next_offset: self.first_object_offset()?,
+            remaining,
         })
     }
 }
@@ -287,7 +302,7 @@ impl<'a> ComRegData<'a> {
 /// | 0x04 | 4 | `bszObjectName` (self-relative offset to class name for ProgID) |
 /// | 0x08 | 4 | `bszDescription` (self-relative offset to display name; 0 = use ProgID) |
 /// | 0x0C | 4 | `dwRegFlag` (non-zero = register InprocServer32/LocalServer32) |
-/// | 0x10 | 4 | Reserved |
+/// | 0x10 | 4 | Not read by the registration code; the object's index in the object table in both fixtures with a record |
 /// | 0x14 | 16 | `uuidObject` (CLSID of this COM class) |
 /// | 0x24 | 4 | `dwDefaultIfaceCount` (number of default interface GUIDs) |
 /// | 0x28 | 4 | `bDefaultIfaceGuids` (self-relative offset to GUID array) |
@@ -310,11 +325,10 @@ pub struct ComRegObject<'a> {
 impl<'a> ComRegObject<'a> {
     /// Record size in bytes (0x40).
     ///
-    /// The runtime reads all fields through `+0x3E` (wExtendedFlags).
-    /// For non-ActiveX objects, fields like `dwMiscStatus` at +0x34 may
-    /// contain residual string data from the linker, but the struct size
-    /// is fixed at 0x40. The +0x40 `bDesignerData` field is conditional
-    /// (present only when `wExtendedFlags & 1`).
+    /// The runtime reads all fields through `+0x3E` (wExtendedFlags),
+    /// except `+0x10`. The +0x40 `bDesignerData` field is read only when
+    /// `wExtendedFlags & 1`. In the fixtures 8 zero bytes follow the
+    /// record before its name string.
     pub const SIZE: usize = 0x40;
 
     /// Parses a per-object registration record.
@@ -389,10 +403,18 @@ impl<'a> ComRegObject<'a> {
         str::from_utf8(name).ok()
     }
 
-    /// Registration flag at offset 0x0C.
+    /// Registration flag at offset 0x0C: how a class is created, from its
+    /// `Instancing`.
     ///
-    /// Non-zero = create `InprocServer32`/`LocalServer32` subkey.
-    /// Zero = delete the server subkey (unregistration).
+    /// | Value | Instancing |
+    /// |-------|------------|
+    /// | 0 | `PublicNotCreatable`: no server subkey is registered |
+    /// | 1 | `SingleUse`, `GlobalSingleUse` |
+    /// | 2 | `MultiUse`, `GlobalMultiUse`; also every UserControl, UserDocument and PropertyPage |
+    ///
+    /// The global variants differ in the object type
+    /// ([`ObjectTypeFlags::GLOBAL_NAMESPACE`](crate::vb::flags::ObjectTypeFlags::GLOBAL_NAMESPACE));
+    /// a `Private` class has no record (`tests/fixtures/server`).
     #[inline]
     pub fn reg_flag(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x0C)
@@ -441,20 +463,24 @@ impl<'a> ComRegObject<'a> {
     /// Object registration flags at offset 0x38.
     ///
     /// Controls which registry keys are written during COM registration
-    /// (`sub_660BC263` in MSVBVM60.DLL). The runtime reads both the low and
-    /// high bytes of this u16:
+    /// (MSVBVM60 6.00.8176 `0x660BC893`, which tests the low byte and the
+    /// high byte of this u16 separately):
     ///
-    /// | Bit | Mask | Registry action |
-    /// |-----|------|----------------|
-    /// | 0 | `0x0001` | Skip registration (return immediately) |
-    /// | 1 | `0x0002` | Register `IPersistPropertyBag` CATID |
-    /// | 2 | `0x0004` | Register safe-for-scripting CATID |
-    /// | 5 | `0x0020` | Control - `Control` subkey, `ToolboxBitmap32` |
-    /// | 7 | `0x0080` | DocObject - `DocObject`, `DefaultIcon`, `InprocHandler32`, `BrowserFlags`, `EditFlags` |
+    /// | Mask | Registry action |
+    /// |------|----------------|
+    /// | `0x0001` | Skip registration (return immediately) |
+    /// | `0x0002` | Register CATID `{34748A51-BA67-11D0-9488-00A0C91110ED}` |
+    /// | `0x0004` | Register CATID `{34748A50-BA67-11D0-9488-00A0C91110ED}` |
+    /// | `0x2000` | Control - `Control` subkey, `ToolboxBitmap32`, CATID `{40FC6ED4-2438-11CF-A3DB-080036F12502}` |
+    /// | `0x8000` | DocObject - `DocObject`, `DefaultIcon`, `InprocHandler32`, `BrowserFlags`, `EditFlags` |
     ///
     /// Composite masks used by the runtime:
-    /// - `0x00B2` (bits 1,4,5,7): Automatable - `ProgID`, `TypeLib`, `VERSION`, interface registration
-    /// - `0x00A0` (bits 5,7): Control or DocObject - `MiscStatus`, `MiscStatus\1`
+    /// - `0xB200`: Automatable - `ProgID`, `TypeLib`, `VERSION`, interface registration
+    /// - `0xA000`: Control or DocObject - `MiscStatus`, `MiscStatus\1`
+    /// - `0xA010`, `0x1200`: further CATID registrations
+    ///
+    /// The UserControls in the `dispid` and `forms` fixtures (private to a
+    /// Standard EXE) carry `0x2001`: Control, registration skipped.
     #[inline]
     pub fn object_flags(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x38)
@@ -478,28 +504,43 @@ impl<'a> ComRegObject<'a> {
 
     /// Extended flags at offset 0x3E.
     ///
-    /// Bit 0 = has designer data at +0x40 (only if `VBHeader+0x22 >= 8`).
+    /// Bit 0 = has designer data at +0x40. The runtime reads this field
+    /// only if `VBHeader+0x22 >= 8` (MSVBVM60 6.00.8176 `0x6602861E`).
     #[inline]
     pub fn extended_flags(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x3E)
     }
 
-    /// Returns `true` if this is marked as a Control (flag bit 5).
+    /// Returns `true` if the Control bit `0x2000` of
+    /// [`object_flags`](Self::object_flags) is set.
+    ///
+    /// The runtime tests it on the high byte (`test ah, 0x20`, MSVBVM60
+    /// 6.00.8176 `0x660BCA8A`). Set for the UserControls of the `dispid`
+    /// and `forms` fixtures (flags `0x2001`).
     #[inline]
     pub fn is_control(&self) -> Result<bool, Error> {
-        Ok(self.object_flags()? & 0x0020 != 0)
+        Ok(self.object_flags()? & 0x2000 != 0)
     }
 
-    /// Returns `true` if this is a DocObject (flag bit 7).
+    /// Returns `true` if the DocObject bit `0x8000` of
+    /// [`object_flags`](Self::object_flags) is set.
+    ///
+    /// The runtime tests it on the high byte (`test byte [ebx+0x5D], 0x80`,
+    /// 6.00.8176 `0x660BCB01`).
     #[inline]
     pub fn is_doc_object(&self) -> Result<bool, Error> {
-        Ok(self.object_flags()? & 0x0080 != 0)
+        Ok(self.object_flags()? & 0x8000 != 0)
     }
 
-    /// Returns `true` if this object registers a ProgID and interfaces (flags & 0xB2).
+    /// Returns `true` if any bit of the Automatable mask `0xB200` of
+    /// [`object_flags`](Self::object_flags) is set.
+    ///
+    /// The runtime tests it on the high byte (`test byte [ebx+0x5D], 0xB2`,
+    /// 6.00.8176 `0x660BC9B9`) before writing the `ProgID`, `TypeLib` and
+    /// `VERSION` keys. Set for the fixtures' UserControls (`0x2001`).
     #[inline]
     pub fn is_automatable(&self) -> Result<bool, Error> {
-        Ok(self.object_flags()? & 0x00B2 != 0)
+        Ok(self.object_flags()? & 0xB200 != 0)
     }
 
     /// Reads default interface GUIDs from the GUID array.
@@ -553,15 +594,18 @@ pub struct ComRegObjectIter<'a> {
     map: &'a AddressMap<'a>,
     base_va: u32,
     next_offset: u32,
+    /// Records the walk may still yield.
+    remaining: usize,
 }
 
 impl<'a> Iterator for ComRegObjectIter<'a> {
     type Item = ComRegObject<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_offset == 0 {
+        if self.next_offset == 0 || self.remaining == 0 {
             return None;
         }
+        self.remaining = self.remaining.saturating_sub(1);
         let va = self.base_va.wrapping_add(self.next_offset);
         let data = self.map.slice_from_va(va, ComRegObject::SIZE).ok()?;
         let obj = ComRegObject::parse(data, self.base_va, va).ok()?;
@@ -592,6 +636,25 @@ mod tests {
         assert_eq!(reg.major_version().unwrap(), 1);
         assert_eq!(reg.minor_version().unwrap(), 0);
         assert!(reg.project_guid().is_some());
+    }
+
+    #[test]
+    fn test_object_flags_use_the_high_byte() {
+        let flags = |value: u16| {
+            let mut data = vec![0u8; ComRegObject::SIZE];
+            data[0x38..0x3A].copy_from_slice(&value.to_le_bytes());
+            let obj = ComRegObject::parse(&data, 0, 0).unwrap();
+            (
+                obj.is_control().unwrap(),
+                obj.is_doc_object().unwrap(),
+                obj.is_automatable().unwrap(),
+            )
+        };
+        // The fixtures' UserControls: Control, registration skipped.
+        assert_eq!(flags(0x2001), (true, false, true));
+        assert_eq!(flags(0x8000), (false, true, true));
+        // Control: the low-byte bits of the same masks mean none of these.
+        assert_eq!(flags(0x00B2 | 0x0020 | 0x0080), (false, false, false));
     }
 
     #[test]

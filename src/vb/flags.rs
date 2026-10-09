@@ -7,22 +7,24 @@ use std::fmt;
 /// The **low byte** encodes the base object type via bit patterns.
 /// Higher bytes contain linker/compiler modifiers.
 ///
-/// # Low Byte Patterns (verified across 104 samples + ComCt332.ocx)
+/// # Low Byte Patterns
 ///
 /// | Low byte | Meaning |
 /// |----------|---------|
 /// | `0x01` | Standard module (.bas) |
-/// | `0x03` | Class module (.cls) or COM class |
+/// | `0x03` | Class module (.cls), COM class or UserControl (.ctl) |
 /// | `0x83` | Form (.frm) or UserDocument (.dob) |
 ///
 /// # Full u32 Examples
 ///
 /// | Raw value | Meaning |
 /// |-----------|---------|
-/// | `0x00018001` | Standard module (.bas) |
-/// | `0x00118003` | Class module (.cls) |
-/// | `0x00118803` | Class with ActiveX flag (in OCX) |
-/// | `0x00018083` | Form (.frm) |
+/// | `0x00018001` | Standard module (.bas) (fixtures) |
+/// | `0x00118003` | Class module (.cls) (fixtures) |
+/// | `0x00118803` | Class public outside its project (`Instancing` other than `Private`) |
+/// | `0x00138803` | Class in the global namespace (`GlobalSingleUse`, `GlobalMultiUse`) |
+/// | `0x00018083` | Form (.frm) (fixtures) |
+/// | `0x001DA003` | UserControl (.ctl) in a Standard EXE (fixtures `dispid`, `forms`) |
 /// | `0x001DE803` | UserControl (CoolBar in ComCt332.ocx) |
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ObjectTypeFlags(pub u32);
@@ -34,13 +36,34 @@ impl ObjectTypeFlags {
     pub const HAS_COM_INTERFACE: u32 = 0x02;
     /// Object is visual / has a form designer (bit 7).
     pub const IS_VISUAL: u32 = 0x80;
-    /// ActiveX control/server flag (bit 11, 0x800).
+    /// The object is public outside its project (bit 11, 0x800): a class
+    /// whose `Instancing` is not `Private` (`VB_Exposed`), a public
+    /// UserControl or UserDocument (`tests/fixtures/server`, `ocx`,
+    /// `docs`).
     pub const ACTIVEX: u32 = 0x800;
+    /// The class's members are in the global namespace (bit 17, 0x20000):
+    /// `Instancing` `GlobalSingleUse` or `GlobalMultiUse`
+    /// (`VB_GlobalNameSpace`, `tests/fixtures/server`).
+    pub const GLOBAL_NAMESPACE: u32 = 0x2_0000;
 
     /// Tests whether the given flag bit(s) are set.
     #[inline]
     pub fn has(self, flag: u32) -> bool {
         self.0 & flag != 0
+    }
+
+    /// Returns `true` if the object is public outside its project
+    /// ([`ACTIVEX`](Self::ACTIVEX)).
+    #[inline]
+    pub fn is_exposed(self) -> bool {
+        self.has(Self::ACTIVEX)
+    }
+
+    /// Returns `true` if the class's members are in the global namespace
+    /// ([`GLOBAL_NAMESPACE`](Self::GLOBAL_NAMESPACE)).
+    #[inline]
+    pub fn is_global_namespace(self) -> bool {
+        self.has(Self::GLOBAL_NAMESPACE)
     }
 
     /// Returns `true` if the optional info structure is present.
@@ -75,8 +98,10 @@ impl ObjectTypeFlags {
 
     /// Returns a human-readable kind string for this object type.
     ///
-    /// Cannot distinguish UserControl from Class or UserDocument from Form
-    /// using flags alone - those require project-level context.
+    /// Tests only the low byte, so a UserControl reports `"Class"` and a
+    /// UserDocument `"Form"`. The full value does differ for UserControls
+    /// (`0x001DA003` against a class's `0x00118003` in the fixtures), but
+    /// the meaning of the extra bits is not verified.
     pub fn kind_name(self) -> &'static str {
         if self.is_form() {
             "Form"
@@ -102,7 +127,10 @@ impl fmt::Display for ObjectTypeFlags {
 
 /// Threading mode flags from `VbHeader.dwThreadFlags`.
 ///
-/// These control the threading model of the VB6 application.
+/// These control the threading model of the VB6 application. Every
+/// fixture (Standard EXE, `Unattended=0`, `Retained=0`) has `0x08`. The
+/// runtime tests `0x08` in `ThunRTMain`'s initialization (MSVBVM60
+/// 6.00.8176 `0x66069E68`); the names of the other bits are not verified.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ThreadFlags(pub u32);
 
@@ -180,11 +208,14 @@ impl fmt::Display for ThreadFlags {
 /// Each bit indicates that the project uses a specific intrinsic VB6 control.
 /// Bits 0-11 map directly to `FormControlType` cType values 0-11.
 /// Bits 12-15 and 20-21 are always set (compiler/runtime internal).
+/// Fixtures: `0x0030F000` with no intrinsic control, `0x0030F014`
+/// (`controls`: TextBox, CommandButton), `0x0030F016` (`forms`: Label,
+/// TextBox, CommandButton).
 ///
 /// A second u32 at `VBHeader.mdl_int_ctls2` (+0x38) covers higher control
-/// type IDs (>= 32). Common value: `0xFFFFFF00` (bits 8-31 always set).
+/// type IDs (>= 32). `0xFFFFFF00` in every fixture.
 ///
-/// # Bit mapping (confirmed via 100-sample cross-reference)
+/// # Bit mapping
 ///
 /// | Bit | Control type |
 /// |-----|-------------|

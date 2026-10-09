@@ -4,8 +4,8 @@
 # Columns:
 #   name               - Export name (or rtcXxx for ordinal-only rtc* functions)
 #   ordinal            - Export ordinal (0 = named export, looked up by name)
-#   calling_convention - fastcall|stdcall|cdecl|special
-#   return_type        - void|int16|uint16|int32|uint32|int64|uint8|float|double|bool|Bstr|BstrPtr|VariantPtr|SafeArrayPtr|SafeArrayPtrPtr|IUnknownPtr|IUnknownPtrPtr|IDispatchPtr|IDispatchPtrPtr|Hresult|GuidPtr|VoidPtr|Int32Ptr|Int16Ptr|UInt8Ptr|Int64Ptr
+#   calling_convention - fastcall|stdcall|cdecl|special|unknown
+#   return_type        - unknown|void|int16|uint16|int32|uint32|int64|uint8|float|double|bool|Bstr|BstrPtr|VariantPtr|SafeArrayPtr|SafeArrayPtrPtr|IUnknownPtr|IUnknownPtrPtr|IDispatchPtr|IDispatchPtrPtr|Hresult|GuidPtr|VoidPtr|Int32Ptr|Int16Ptr|UInt8Ptr|Int64Ptr
 #   variadic           - 0|1 (1 = cdecl varargs)
 #   params             - Semicolon-separated: Type name (e.g. BstrPtr pbstr;Bstr src)
 #   category           - free|string|variant|convert|object|array|foreach|late|error|currency|fpu|file|misc|crt|fdiv|evtsink|entry|mem|internal
@@ -117,7 +117,7 @@ rtcTrimBstr,519,stdcall,Bstr,0,Bstr bstrSrc,string,retn 0x4; VB Trim$(); delegat
 rtcTrimVar,520,stdcall,VariantPtr,0,VariantPtr presult;VariantPtr psrc,string,VB6 Trim$()
 rtcUpperCaseBstr,527,stdcall,Bstr,0,Bstr bstrSrc,string,retn 0x4; VB UCase$(); delegates to internal case converter
 rtcUpperCaseVar,528,stdcall,VariantPtr,0,VariantPtr retval;VariantPtr pSrcVar,string,retn 0x8; Variant wrapper; calls rtcUpperCaseBstr internally
-rtcVarFromFormatVar,660,stdcall,VariantPtr,0,VariantPtr presult;VariantPtr psrc;VariantPtr format,string,VB6 Format$()
+rtcVarFromFormatVar,660,stdcall,VariantPtr,0,VariantPtr presult;VariantPtr pexpr;VariantPtr pformat;int32 firstDayOfWeek;int32 firstWeekOfYear,string,VB6 Format(); retn 0x14; tests/fixtures/data passes 0x14 bytes (the two day/week options as Longs)
 #
 # === TYPE CONVERSION ===
 #
@@ -276,7 +276,7 @@ __vbaVerifyVarObj,604,stdcall,VariantPtr,0,VariantPtr pvar,variant,validates VT_
 #
 # === ARRAY OPERATIONS ===
 #
-__vbaAryConstruct,165,stdcall,void,0,SafeArrayPtr ppAry;VoidPtr pDescriptor,array,Thin wrapper: calls sub_660482ba(ppAry; pDescriptor; 0) then error handler. Creates array from descriptor with no extra bounds. retn 0x8.
+__vbaAryConstruct,165,stdcall,void,0,SafeArrayPtr ppAry;VoidPtr pDescriptor,array,Thin wrapper: calls the array constructor at 0x660482BA (ppAry; pDescriptor; 0) then error handler. Creates array from descriptor with no extra bounds. retn 0x8.
 __vbaAryConstruct2,164,stdcall,void,0,SafeArrayPtr ppAry;VoidPtr pDescriptor;VoidPtr pBounds,array,Like AryConstruct but with explicit bounds pointer (3rd param). If descriptor has FADF_AUTO (0x20) bit; dereferences pBounds. retn 0xc.
 __vbaAryCopy,166,stdcall,void,0,SafeArrayPtr ppDst;SafeArrayPtr ppSrc,array,Erases dst if different from src; then copies src array to dst via SafeArrayCopy. retn 0x8.
 __vbaAryDestruct,167,stdcall,void,0,uint16 arrayDesc;SafeArrayPtrPtr ppArray,array,calls __vbaErase then SafeArrayDestroyData
@@ -481,8 +481,10 @@ MethCallEngine,199,special,void,0,VoidPtr param,entry,Custom CC: sub [esp+4];eax
 ProcCallEngine,186,special,void,0,,entry,Custom CC: edx=RTMI ptr; return addr on stack; sets up P-Code frame; dispatches opcodes via jump table at 0x6610aa24
 ThunRTMain,100,stdcall,void,0,VoidPtr pVbHeader,entry,runtime initialization; noreturn
 UserDllMain,105,stdcall,int32,0,VoidPtr ppProject;VoidPtr pProjectData;VoidPtr hInstance;uint32 fdwReason;VoidPtr lpvReserved,entry,VB6 user DLL entry; handles DLL_PROCESS_ATTACH(1); DLL_PROCESS_DETACH(0); DLL_THREAD_ATTACH(2); retn 0x14
-VBDllGetClassObject,104,stdcall,int32,0,VoidPtr ppProject;VoidPtr pVBHeader;VoidPtr rclsid;VoidPtr riid;VoidPtr ppv;VoidPtr pUnkOuter;VoidPtr ppClassFactory,entry,User-project class factory creation; compares IIDs; creates basic_class object; retn 0x18
-VBDllUnRegisterServer,101,stdcall,int32,0,VoidPtr pVBHeader;VoidPtr rclsid,entry,Unregisters VB project classes; retn varies
+VBDllCanUnloadNow,102,stdcall,Hresult,0,VoidPtr stubArg,entry,0x6605CC5B (6.00.8176); retn 4; the one value its DllCanUnloadNow stub (58 68 imm32 50 E9) pushes; returns S_OK (0) or S_FALSE (1)
+VBDllGetClassObject,104,stdcall,Hresult,0,VoidPtr phModule;VoidPtr stubArg2;VoidPtr pVBHeader;GuidPtr rclsid;GuidPtr riid;VoidPtr ppv,entry,0x6604D2E7 (6.00.8176); retn 0x18; the DllGetClassObject stub (58 68 imm32 68 imm32 68 imm32 50 E9) pushes the first three under the caller's rclsid/riid/ppv; reads *phModule and the VBHeader; compares riid with IID_IClassFactory
+VBDllRegisterServer,103,stdcall,Hresult,0,VoidPtr phModule;VoidPtr stubArg2;VoidPtr pVBHeader,entry,0x660CAAE0 (6.00.8176); retn 0xC; the three values its DllRegisterServer stub pushes; GetModuleFileNameA(*phModule) and VBHeader +0x3C and +0x22; E_UNEXPECTED (0x8000FFFF) or E_FAIL (0x80004005) on failure
+VBDllUnRegisterServer,101,stdcall,Hresult,0,VoidPtr phModule;VoidPtr stubArg2;VoidPtr pVBHeader,entry,0x6605CF04 (6.00.8176); retn 0xC on every path; the three values its DllUnregisterServer stub pushes; reads *phModule and VBHeader +0x22 and +0x54; E_UNEXPECTED (0x8000FFFF) on failure
 #
 # === MEMORY ACCESS (GetMem/PutMem/SetMem) ===
 #
@@ -583,7 +585,7 @@ rtcCreateObject2,716,stdcall,void,0,VariantPtr result;Bstr progId;Bstr serverNam
 rtcCurrentDir,647,stdcall,void,0,VariantPtr result;VariantPtr drive,misc,retn 0x8; CurDir variant version; returns VT_BSTR in VARIANT
 rtcCurrentDirBstr,646,stdcall,Bstr,0,VariantPtr drive,misc,retn 0x4; CurDir$ string version
 rtcCVErrFromVar,643,stdcall,void,0,VariantPtr result;VariantPtr errVar,misc,retn 0x8; converts error number to VT_ERROR variant (0x800A0000 | errnum)
-rtcDateAdd,661,stdcall,void,0,VariantPtr result;Bstr interval;double number;VariantPtr date;int16 firstDayOfWeek,misc,retn 0x14; DateAdd(); adds time interval to date
+rtcDateAdd,661,stdcall,void,0,VariantPtr result;Bstr interval;double number;VariantPtr date,misc,retn 0x14; DateAdd(); tests/fixtures/data passes the result pointer (top); the interval BSTR; the Double; the date Variant
 rtcDateDiff,662,stdcall,void,0,VariantPtr result;Bstr interval;VariantPtr date1;VariantPtr date2;int16 firstDayOfWeek;int16 firstWeekOfYear,misc,retn 0x18; DateDiff(); computes interval difference
 rtcDateFromVar,641,stdcall,double,0,VariantPtr var,misc,retn 0x4; CDate(); wraps __vbaDateVar; returns DATE double via FPU
 rtcDatePart,663,stdcall,void,0,VariantPtr result;Bstr interval;VariantPtr date;int16 firstDayOfWeek;int16 firstWeekOfYear,misc,retn 0x14; DatePart(); extracts year/month/day/etc.
@@ -650,7 +652,7 @@ rtcPPMT,675,stdcall,double,0,double rate;double per;double nper;double pv;Varian
 rtcPV,677,stdcall,double,0,double rate;double nper;double pmt;VariantPtr pvarFv;VariantPtr pvarType,misc,push ebp; present value; optional VARIANT Missing; retn 0x20
 rtcQBColor,589,stdcall,int32,0,int16 color,misc,no frame ptr; table lookup (16-entry QBColor table); retn 0x4
 rtcRandomize,594,stdcall,void,0,VariantPtr pvarSeed,misc,no frame ptr; optional VARIANT seed; calls Randomize helper; retn 0x4
-rtcRandomNext,593,stdcall,void,0,VariantPtr pvarSeed,misc,no frame ptr; optional VARIANT seed; calls Rnd helper with float; retn 0x4
+rtcRandomNext,593,stdcall,float,0,VariantPtr pvarSeed,misc,VB Rnd(); optional VARIANT seed; returns the Single in ST0 (tests/fixtures/data stores it with FStFPR4); retn 0x4
 rtcRate,680,stdcall,double,0,double nper;double pmt;double pv;VariantPtr pvarFv;VariantPtr pvarType;VariantPtr pvarGuess,misc,push ebp; Newton-Raphson iteration (max 40); FPU return; retn 0x24
 rtcRgb,588,stdcall,int32,0,int16 red;int16 green;int16 blue,misc,no frame ptr; clamps 0-255; packs BGR into int32; retn 0xc
 rtcSaveSetting,690,stdcall,void,0,Bstr bstrAppName;Bstr bstrSection;Bstr bstrKey;Bstr bstrValue,misc,push ebp; registry write to HKCU; retn 0x10
@@ -670,3 +672,39 @@ rtcTan,584,stdcall,double,0,double value,misc,retn 0x8; VB Tan(); validates rang
 rtcTypeName,591,stdcall,Bstr,0,VariantPtr pVar,misc,retn 0x4; VB TypeName(); inspects VT; IDispatch/IUnknown; returns type string
 rtcVarType,563,stdcall,int32,0,VariantPtr pVar,misc,retn 0x4; VB VarType(); returns VT code as zero-extended uint16
 rtcWeekdayName,706,stdcall,Bstr,0,int32 nWeekday;int16 bAbbreviate;int32 nFirstDayOfWeek,misc,retn 0xc; VB WeekdayName(); uses calendar-aware lookup
+#
+# === EXPORTS WHOSE SIGNATURE IS NOT ANALYZED ===
+#
+# Named so an ordinal import resolves; convention and types unknown.
+#
+VarPtr,644,stdcall,int32,0,VoidPtr p,misc,mov eax [esp+4]; retn 4; VB VarPtr() returns its ByRef argument's address (8176 0x660eb536)
+__vbaVarLateMemCallSt,114,unknown,unknown,0,,unanalyzed,
+__vbaVarZero,147,unknown,unknown,0,,unanalyzed,
+CopyRecord,190,unknown,unknown,0,,unanalyzed,
+TipCreateInstanceProject2,230,unknown,unknown,0,,unanalyzed,
+__vbaLateIdNamedCall,286,unknown,unknown,0,,unanalyzed,
+__vbaLateIdNamedCallLd,287,unknown,unknown,0,,unanalyzed,
+__vbaLateIdNamedCallSt,288,unknown,unknown,0,,unanalyzed,
+__vbaLateIdNamedStAd,289,unknown,unknown,0,,unanalyzed,
+__vbaLateMemCallSt,294,unknown,unknown,0,,unanalyzed,
+__vbaLateMemNamedCall,295,unknown,unknown,0,,unanalyzed,
+__vbaLateMemNamedCallLd,296,unknown,unknown,0,,unanalyzed,
+__vbaLateMemNamedCallSt,297,unknown,unknown,0,,unanalyzed,
+__vbaLateMemNamedStAd,322,unknown,unknown,0,,unanalyzed,
+EVENT_SINK_GetIDsOfNames,403,unknown,unknown,0,,unanalyzed,
+Zombie_AddRef,431,unknown,unknown,0,,unanalyzed,
+Zombie_Release,432,unknown,unknown,0,,unanalyzed,
+rtDecFromVar,564,stdcall,Hresult,0,VariantPtr pSrc;VariantPtr pResult,convert,CDec(); tests/fixtures/data calls it through ImpAdCallHresult with 8 bytes: the source Variant on top; the result temp below
+rtBstrFromErrVar,634,unknown,unknown,0,,unanalyzed,
+rtBoolFromErrVar,635,unknown,unknown,0,,unanalyzed,
+rtCyFromErrVar,636,unknown,unknown,0,,unanalyzed,
+rtI2FromErrVar,637,unknown,unknown,0,,unanalyzed,
+rtI4FromErrVar,638,unknown,unknown,0,,unanalyzed,
+rtR4FromErrVar,639,unknown,unknown,0,,unanalyzed,
+rtR8FromErrVar,640,unknown,unknown,0,,unanalyzed,
+rtUI1FromErrVar,686,unknown,unknown,0,,unanalyzed,
+TipInvokeMethod2,999,unknown,unknown,0,,unanalyzed,
+TipInvokeMethod,1016,unknown,unknown,0,,unanalyzed,
+IID_IVbaHost,1024,unknown,unknown,0,,unanalyzed,
+EbGetObjConnectionCounts,1025,unknown,unknown,0,,unanalyzed,
+EbGetVBAObject,2010,unknown,unknown,0,,unanalyzed,

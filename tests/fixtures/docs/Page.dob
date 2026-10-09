@@ -1,0 +1,70 @@
+VERSION 5.00
+Begin VB.UserDocument Page 
+   ClientHeight    =   2000
+   ClientLeft      =   0
+   ClientTop       =   0
+   ClientWidth     =   3000
+   HScrollSmallChange=   225
+   ScaleHeight     =   2000
+   ScaleWidth      =   3000
+   VScrollSmallChange=   225
+   Begin VB.TextBox Body 
+      Height          =   375
+      Left            =   120
+      TabIndex        =   0
+      Text            =   "Body"
+      Top             =   120
+      Width           =   2175
+   End
+   Begin VB.CommandButton Save 
+      Caption         =   "Save"
+      Height          =   375
+      Left            =   120
+      TabIndex        =   1
+      Top             =   600
+      Width           =   1215
+   End
+End
+Attribute VB_Name = "Page"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = True
+Attribute VB_PredeclaredId = False
+Attribute VB_Exposed = True
+Option Explicit
+
+' A UserDocument: a public property pair and method, handlers for its own
+' events and its controls' events, calls on its built-in members.
+
+Private m_Title As String
+Private m_Saves As Long
+
+Public Property Get Title() As String
+    Title = m_Title
+End Property
+
+Public Property Let Title(ByVal t As String)
+    m_Title = t
+    PropertyChanged "Title"
+End Property
+
+Public Function Saves() As Long
+    Saves = m_Saves
+End Function
+
+Private Sub UserDocument_Initialize()
+    m_Title = "Untitled"
+End Sub
+
+Private Sub UserDocument_Show()
+    Body.Width = UserDocument.ScaleWidth - 240
+    UserDocument.Refresh
+End Sub
+
+Private Sub Save_Click()
+    m_Saves = m_Saves + 1
+    Title = Body.Text
+End Sub
+
+Private Sub Body_Change()
+    PropertyChanged "Body"
+End Sub

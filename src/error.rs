@@ -66,8 +66,9 @@ pub enum Error {
     // -- Entry point errors --
     /// The PE entry point does not start with `push imm32` (`0x68`).
     ///
-    /// Every VB6 executable begins with `push offset VBHeader; call ThunRTMain`.
-    /// If the first byte is not `0x68`, this is not a VB6 binary.
+    /// Every VB6 executable (EXE) begins with
+    /// `push offset VBHeader; call ThunRTMain`. A VB6 DLL or OCX does not, so
+    /// this alone does not rule VB6 out: the export stubs are tried next.
     EntryPointNotPush {
         /// The actual first byte at the entry point.
         byte: u8,
@@ -76,10 +77,10 @@ pub enum Error {
     /// The container is a valid PE but doesn't look like a VB6 binary.
     ///
     /// Neither the entry point (EXE pattern: `push imm32; call ThunRTMain`)
-    /// nor the export table (DLL pattern: `pop eax; push imm32; push eax;
-    /// ...`) contained a recognizable VB6 header pointer, **and** no
-    /// secondary scan turned up the `"VB5!"` magic. Almost certainly not
-    /// a VB6 file at all (e.g., a Delphi/MFC/CRT-only PE).
+    /// nor the export table (DLL pattern: `pop eax; push imm32; ...`)
+    /// pushes the VA of a `"VB5!"` magic. Almost certainly not a VB6 file
+    /// at all (e.g., a Delphi/MFC/CRT-only PE, or a packer stub that
+    /// starts `push imm32; ret`).
     ///
     /// Consumers tagging files as "VB6 or not" should treat this as the
     /// quiet-path negative - log nothing or only at debug level.
@@ -177,6 +178,13 @@ pub enum Error {
         /// The byte count read from the instruction stream.
         size: u16,
     },
+
+    /// A string is not a GUID in registry form
+    /// (`{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`).
+    InvalidGuid {
+        /// The text that failed to parse.
+        text: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -243,6 +251,7 @@ impl fmt::Display for Error {
             Error::InvalidVariableLengthSize { opcode_name, size } => {
                 write!(f, "{opcode_name}: invalid variable-length size {size}")
             }
+            Error::InvalidGuid { text } => write!(f, "not a GUID in registry form: {text:?}"),
         }
     }
 }

@@ -5,16 +5,13 @@
 //! build-time generated tables from `data/vb6_control_properties.csv`.
 //!
 //! The serialization format is determined by the descriptor flags in
-//! MSVBVM60.DLL, traced through the compiler's `WritePropertyStream`
-//! function (VB6.EXE `sub_457E57`).
+//! MSVBVM60.DLL, which the compiler's property writer follows.
 
 use std::fmt;
 
 use crate::{
-    VbProject,
-    util::{read_i16_le, read_u16_le, read_u32_le},
+    util::{read_i16_le, read_i32_le, read_u16_le, read_u32_le},
     vb::formdata::FormControlType,
-    vb::guitable::GuiObjectType,
 };
 
 /// Magic value at the start of every StdDataFormat persistence blob.
@@ -81,11 +78,10 @@ impl fmt::Display for DataFormatType {
 /// by calling `IPersistStream::Save` (IID `{00000109-...}`) on the
 /// StdDataFormat COM object from MSSTDFMT.DLL.
 ///
-/// # Binary Layout (reverse engineered from MSSTDFMT.DLL v6.01.9839)
+/// # Binary Layout
 ///
-/// The persistence format was traced through the COM delegation chain:
-/// `IPersistStream::Save` thunk → `StdDataFormat_PersistSave_Wrapper`
-/// → main vtable dispatch → `StdDataFormat_SaveToStream` (0x24dd240c).
+/// The layout is that of the object's `IPersistStream::Save` in
+/// MSSTDFMT.DLL 6.01.9839 (its save routine at 0x24DD240C).
 ///
 /// ```text
 /// HEADER (0x28 = 40 bytes):
@@ -154,25 +150,25 @@ pub enum PropType {
     /// Variable-length UTF-16 string (Tag/Connect encoding): `[u16_le char_count][char_count * 2 bytes UTF-16LE]`.
     ///
     /// Used by properties with serialization type 0x0D (Tag, Connect, DatabaseName,
-    /// RecordSource). Written by compiler `sub_427270` which calls
-    /// `SysStringLen` then writes `char_count(2) + data(char_count * 2)`.
-    /// No null terminator.
+    /// RecordSource): the compiler writes the BSTR's length
+    /// (`SysStringLen`), then its characters. No null terminator.
     TagStr,
-    /// 16-byte ControlSize: 8 x i16 (ClientLeft/Top/Width/Height + unused).
+    /// 16-byte client rectangle: four `i32` (ClientLeft, ClientTop,
+    /// ClientWidth, ClientHeight), [`ClientRect`].
     Size16,
     /// 11-byte font descriptor.
     Font,
     /// Picture: 4-byte size then data. `0xFFFFFFFF` = default.
     Picture,
-    /// Two consecutive Long values (8 bytes): Left + Top callback pair.
-    ///
-    /// When a child control's Left property has the callback bit (B2 bit 1)
-    /// set, the compiler writes 4 bytes of Left value followed by 4 bytes
-    /// of Top value from the callback. This encodes position as 8 bytes.
-    LongPair,
+    /// A control's bounds, [`ControlBounds`]: four `i16`, or `0x8000` and
+    /// four `i32` (8 or 18 bytes).
+    Bounds,
+    /// `ScaleMode` with the scale and drawing state stored with it,
+    /// [`ScaleState`]: 4 or 20 bytes.
+    Scale,
     /// StdDataFormat COM object serialized via IPersistStream::Save.
     ///
-    /// The compiler (VB6.EXE `WritePropertyStream` case 0x16) calls
+    /// The compiler (serialization type 0x16) calls
     /// `IPersistStream::Save(stream, FALSE)` on the StdDataFormat object
     /// from MSSTDFMT.DLL. The persistence format is:
     ///
@@ -183,8 +179,7 @@ pub enum PropType {
     /// - Trailer: `first_day_of_week(4)` (if version >= 0x60001) +
     ///   `first_week_of_year(4)` (if version >= 0x60002)
     ///
-    /// Reverse engineered from `StdDataFormat_SaveToStream` and
-    /// `StdDataFormat_LoadFromStream` in MSSTDFMT.DLL v6.01.9839.
+    /// The layout is MSSTDFMT.DLL 6.01.9839's save and load of the object.
     DataFormat,
     /// Flag-only: opcode is emitted with NO value data following.
     ///
@@ -192,10 +187,9 @@ pub enum PropType {
     /// FontStrikethru, FontUnderline) where the descriptor flags have
     /// bits 16-17 both clear. The opcode marks the property as non-default,
     /// but the actual value is embedded in the Font blob (PropType::Font).
-    /// Discovered via compiler tracing: `sub_457E57` in VB6.EXE checks
-    /// `(flags & 0x10000) != 0 || (flags & 0x20000) != 0` before retrieving
-    /// and writing a value. When both bits are clear, only the opcode byte
-    /// is written to the stream.
+    /// The compiler writes a value only when
+    /// `(flags & 0x10000) != 0 || (flags & 0x20000) != 0`; when both bits
+    /// are clear, only the opcode byte is written to the stream.
     Flag,
 }
 
@@ -205,7 +199,8 @@ impl PropType {
         match self {
             Self::Flag => Some(0),
             Self::Byte => Some(1),
-            Self::LongPair => Some(8), // Left + Top callback
+            Self::Bounds => None, // 8 or 18 bytes
+            Self::Scale => None,  // 4 or 20 bytes
             Self::Int16 => Some(2),
             Self::Long => Some(4),
             Self::Size16 => Some(16),
@@ -241,46 +236,73 @@ pub fn property_descriptor(
     generated::lookup_property(ctype.to_u8(), opcode)
 }
 
-/// Control position pair (Left + Top) from callback data.
+/// A control's bounds (Left, Top, Width, Height), the composite its Left
+/// property serializes when its descriptor has 4 callback bytes.
 ///
-/// When a child control's Left property has the callback bit (B2 bit 1)
-/// set in the descriptor flags, the compiler writes 4 bytes of Left
-/// followed by 4 bytes of Top from the `vtable+0x34` callback.
+/// # Binary Layout
 ///
-/// # Binary Layout (8 bytes)
+/// Four `i16` twips values, or, when a value does not fit (`geometry` `Far`:
+/// Left 40000), the escape `0x8000` followed by four `i32`:
 ///
 /// ```text
-/// +0x00  u32  left   Twips coordinate
-/// +0x04  u32  top    Twips coordinate
+/// +0x00  i16  left     | +0x00  u16  0x8000
+/// +0x02  i16  top      | +0x02  i32  left
+/// +0x04  i16  width    | +0x06  i32  top
+/// +0x06  i16  height   | +0x0A  i32  width
+///                      | +0x0E  i32  height
 /// ```
+///
+/// `tests/fixtures/geometry`: `Hidden` (-1200, -600, 1215, 495) in 8
+/// bytes, `Far` (40000, 36000, 33000, 495) in 18.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ControlPosition {
-    /// Left coordinate in twips.
-    pub left: u32,
-    /// Top coordinate in twips.
-    pub top: u32,
+pub struct ControlBounds {
+    /// Left edge in twips.
+    pub left: i32,
+    /// Top edge in twips.
+    pub top: i32,
+    /// Width in twips.
+    pub width: i32,
+    /// Height in twips.
+    pub height: i32,
 }
 
-impl ControlPosition {
-    /// Parses a position pair from raw bytes.
+impl ControlBounds {
+    /// The first word that announces four 32-bit values.
+    const WIDE: u16 = 0x8000;
+
+    /// Parses the bounds from raw bytes.
     /// Returns the parsed value and bytes consumed, or `None` if too short.
     pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
-        if data.len() < 8 {
-            return None;
+        if read_u16_le(data, 0).ok()? == Self::WIDE {
+            return Some((
+                Self {
+                    left: read_i32_le(data, 2).ok()?,
+                    top: read_i32_le(data, 6).ok()?,
+                    width: read_i32_le(data, 10).ok()?,
+                    height: read_i32_le(data, 14).ok()?,
+                },
+                18,
+            ));
         }
         Some((
             Self {
-                left: read_u32_le(data, 0).ok()?,
-                top: read_u32_le(data, 4).ok()?,
+                left: i32::from(read_i16_le(data, 0).ok()?),
+                top: i32::from(read_i16_le(data, 2).ok()?),
+                width: i32::from(read_i16_le(data, 4).ok()?),
+                height: i32::from(read_i16_le(data, 6).ok()?),
             },
             8,
         ))
     }
 }
 
-impl fmt::Display for ControlPosition {
+impl fmt::Display for ControlBounds {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{},{}", self.left, self.top)
+        write!(
+            f,
+            "{},{},{},{}",
+            self.left, self.top, self.width, self.height
+        )
     }
 }
 
@@ -292,21 +314,21 @@ impl fmt::Display for ControlPosition {
 /// # Binary Layout (16 bytes)
 ///
 /// ```text
-/// +0x00  u32  left    Client area left in twips
-/// +0x04  u32  top     Client area top in twips (from callback)
-/// +0x08  u32  width   Client area width in twips (from callback)
-/// +0x0C  u32  height  Client area height in twips (from callback)
+/// +0x00  i32  left    Client area left in twips
+/// +0x04  i32  top     Client area top in twips (from callback)
+/// +0x08  i32  width   Client area width in twips (from callback)
+/// +0x0C  i32  height  Client area height in twips (from callback)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientRect {
     /// Client area left in twips.
-    pub left: u32,
+    pub left: i32,
     /// Client area top in twips.
-    pub top: u32,
+    pub top: i32,
     /// Client area width in twips.
-    pub width: u32,
+    pub width: i32,
     /// Client area height in twips.
-    pub height: u32,
+    pub height: i32,
 }
 
 impl ClientRect {
@@ -318,10 +340,10 @@ impl ClientRect {
         }
         Some((
             Self {
-                left: read_u32_le(data, 0).ok()?,
-                top: read_u32_le(data, 4).ok()?,
-                width: read_u32_le(data, 8).ok()?,
-                height: read_u32_le(data, 12).ok()?,
+                left: read_i32_le(data, 0).ok()?,
+                top: read_i32_le(data, 4).ok()?,
+                width: read_i32_le(data, 8).ok()?,
+                height: read_i32_le(data, 12).ok()?,
             },
             16,
         ))
@@ -335,6 +357,106 @@ impl fmt::Display for ClientRect {
             "{},{},{},{}",
             self.left, self.top, self.width, self.height
         )
+    }
+}
+
+/// The `ScaleMode` property of a form, MDIForm, UserControl, UserDocument,
+/// PropertyPage or PictureBox, with the coordinate scale and the drawing
+/// flags the record stores with it.
+///
+/// ```text
+/// u8      mode       ScaleMode (0 user, 1 twips, 2 points, 3 pixels,
+///                    4 characters, 5 inches, 6 millimetres, 7 centimetres)
+/// u8      0
+/// mode 0: 4 x f32    ScaleLeft, ScaleTop, twips per unit across and down
+/// u8      flags      0x20 AutoRedraw, 0x02 FontTransparent, 0x01 set for a
+///                    user or pixel scale; 0x40 is set in every record
+/// u8      0
+/// ```
+///
+/// `AutoRedraw` and `FontTransparent` are stored only here: their own
+/// table entries carry no data. A user scale is stored as its origin and
+/// the size of one unit in twips, not as `ScaleWidth` and `ScaleHeight`
+/// (`ScaleWidth = 1000` across a 540-twip client area is 0.54).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScaleState {
+    /// The `ScaleMode` value.
+    pub mode: u8,
+    /// The user scale, when `mode` is 0.
+    pub user_scale: Option<UserScale>,
+    /// The flags byte.
+    pub flags: u8,
+}
+
+/// A user-defined coordinate scale (`ScaleMode = 0`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UserScale {
+    /// `ScaleLeft`: the x coordinate of the client area's left edge.
+    pub left: f32,
+    /// `ScaleTop`: the y coordinate of the client area's top edge.
+    pub top: f32,
+    /// Twips per horizontal unit: the client width over `ScaleWidth`.
+    pub twips_per_unit_x: f32,
+    /// Twips per vertical unit: the client height over `ScaleHeight`.
+    pub twips_per_unit_y: f32,
+}
+
+impl ScaleState {
+    /// The flag bit for `AutoRedraw`.
+    pub const AUTO_REDRAW: u8 = 0x20;
+    /// The flag bit for `FontTransparent`.
+    pub const FONT_TRANSPARENT: u8 = 0x02;
+
+    /// Parses the state from raw bytes.
+    /// Returns the parsed value and bytes consumed, or `None` if too short.
+    pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
+        let mode = *data.first()?;
+        let (user_scale, flags_at) = if mode == 0 {
+            let single = |at: usize| read_u32_le(data, at).ok().map(f32::from_bits);
+            let scale = UserScale {
+                left: single(2)?,
+                top: single(6)?,
+                twips_per_unit_x: single(10)?,
+                twips_per_unit_y: single(14)?,
+            };
+            (Some(scale), 18)
+        } else {
+            (None, 2)
+        };
+        let flags = *data.get(flags_at)?;
+        data.get(flags_at.checked_add(1)?)?;
+        Some((
+            Self {
+                mode,
+                user_scale,
+                flags,
+            },
+            flags_at.checked_add(2)?,
+        ))
+    }
+
+    /// Returns `AutoRedraw`.
+    pub fn auto_redraw(&self) -> bool {
+        self.flags & Self::AUTO_REDRAW != 0
+    }
+
+    /// Returns `FontTransparent`.
+    pub fn font_transparent(&self) -> bool {
+        self.flags & Self::FONT_TRANSPARENT != 0
+    }
+}
+
+impl fmt::Display for ScaleState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.mode)?;
+        if let Some(scale) = self.user_scale {
+            write!(
+                f,
+                " ({}, {}, {}x{} twips)",
+                scale.left, scale.top, scale.twips_per_unit_x, scale.twips_per_unit_y
+            )?;
+        }
+        write!(f, " flags=0x{:02X}", self.flags)
     }
 }
 
@@ -617,7 +739,7 @@ fn parse_ascii_str(data: &[u8]) -> Option<(String, usize)> {
 /// Parses a VB6 UTF-16LE string from a property stream.
 ///
 /// Format: `[u16_le char_count][char_count * 2 bytes UTF-16LE]`.
-/// Written by compiler `sub_427270`. No null terminator.
+/// No null terminator.
 /// Used by ser_type 13 (Tag, Connect, DatabaseName, RecordSource).
 fn parse_utf16_str(data: &[u8]) -> Option<(String, usize)> {
     if data.len() < 2 {
@@ -648,8 +770,11 @@ pub enum PropertyValue {
     Byte(u8),
     /// 16-bit signed integer.
     Int16(i16),
-    /// 32-bit integer.
-    Long(u32),
+    /// 32-bit signed integer (a Long, or a coordinate in twips).
+    Long(i32),
+    /// Single-precision float (serialization type 7: `FontSize`,
+    /// `ScaleLeft`, `CurrentX`, a UserDocument's `HScrollSmallChange`).
+    Single(f32),
     /// OLE color value.
     Color(u32),
     /// ASCII string.
@@ -657,9 +782,11 @@ pub enum PropertyValue {
     /// UTF-16 string (Tag, Connect, DatabaseName, etc.).
     TagStr(String),
     /// Position pair: Left + Top from callback.
-    Position(ControlPosition),
+    Bounds(ControlBounds),
     /// Client rectangle from callback.
     ClientRect(ClientRect),
+    /// `ScaleMode` with the scale and drawing state stored with it.
+    Scale(ScaleState),
     /// Font descriptor.
     Font(FontDescriptor),
     /// Embedded picture/icon data.
@@ -673,19 +800,21 @@ impl PropertyValue {
     ///
     /// These strings are part of the public API contract and are suitable
     /// for database storage: `"Flag"`, `"Byte"`, `"Int16"`, `"Long"`,
-    /// `"Color"`, `"Str"`, `"TagStr"`, `"Position"`, `"ClientRect"`,
-    /// `"Font"`, `"Picture"`, and `"DataFormat"`.
+    /// `"Single"`, `"Color"`, `"Str"`, `"TagStr"`, `"Bounds"`,
+    /// `"ClientRect"`, `"Font"`, `"Picture"`, and `"DataFormat"`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Flag => "Flag",
             Self::Byte(_) => "Byte",
             Self::Int16(_) => "Int16",
             Self::Long(_) => "Long",
+            Self::Single(_) => "Single",
             Self::Color(_) => "Color",
             Self::Str(_) => "Str",
             Self::TagStr(_) => "TagStr",
-            Self::Position(_) => "Position",
+            Self::Bounds(_) => "Bounds",
             Self::ClientRect(_) => "ClientRect",
+            Self::Scale(_) => "Scale",
             Self::Font(_) => "Font",
             Self::Picture(_) => "Picture",
             Self::DataFormat(_) => "DataFormat",
@@ -724,6 +853,7 @@ impl fmt::Display for PropertyValue {
             Self::Byte(v) => write!(f, "{v}"),
             Self::Int16(v) => write!(f, "{v}"),
             Self::Long(v) => write!(f, "{v}"),
+            Self::Single(v) => write!(f, "{v}"),
             Self::Color(v) => write!(f, "#{v:06X}"),
             Self::Str(s) | Self::TagStr(s) => {
                 write!(f, "\"")?;
@@ -736,8 +866,9 @@ impl fmt::Display for PropertyValue {
                 }
                 write!(f, "\"")
             }
-            Self::Position(p) => write!(f, "{p}"),
+            Self::Bounds(p) => write!(f, "{p}"),
             Self::ClientRect(r) => write!(f, "{r}"),
+            Self::Scale(scale) => write!(f, "{scale}"),
             Self::Font(font) => write!(f, "{font}"),
             Self::Picture(pic) => write!(f, "{pic}"),
             Self::DataFormat(df) => write!(f, "{df}"),
@@ -748,8 +879,12 @@ impl fmt::Display for PropertyValue {
 /// A single decoded property from a form binary stream.
 #[derive(Debug, Clone)]
 pub struct Property {
-    /// Property name (e.g., "Caption", "BackColor").
+    /// Property name (e.g., "Caption", "BackColor"); `"?"` for an index
+    /// the control's table does not describe.
     pub name: &'static str,
+    /// The property's index in its control type's table: the byte that
+    /// names it in the stream.
+    pub index: u8,
     /// Decoded value.
     pub value: PropertyValue,
     /// Byte offset of this property's value within the property stream.
@@ -777,6 +912,19 @@ impl<'a> PropertyIter<'a> {
         }
     }
 
+    /// Returns the offset in the stream of the next byte to decode: once
+    /// the iterator has ended, that of the `0xFF` terminator when it ended
+    /// there.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Returns `true` if the iterator stopped at the stream's `0xFF`
+    /// terminator rather than at a property it could not decode.
+    pub fn at_terminator(&self) -> bool {
+        self.data.get(self.pos) == Some(&0xFF)
+    }
+
     /// Decodes a single property value based on ser_type and callback_bytes.
     /// Returns `None` if the stream is truncated.
     fn decode_value(&mut self, ser_type: u8, callback_bytes: i8) -> Option<PropertyValue> {
@@ -802,7 +950,7 @@ impl<'a> PropertyIter<'a> {
 
             // Long
             3 => {
-                let v = read_u32_le(d, p).ok()?;
+                let v = read_i32_le(d, p).ok()?;
                 self.pos = self.pos.checked_add(4)?;
                 Some(PropertyValue::Long(v))
             }
@@ -821,33 +969,42 @@ impl<'a> PropertyIter<'a> {
                 Some(PropertyValue::Color(v))
             }
 
-            // Enum/Byte + optional callback trailing data
+            // ScaleMode and its scale state
+            6 if callback_bytes == 3 => {
+                let (scale, consumed) = ScaleState::parse(rest)?;
+                self.pos = self.pos.checked_add(consumed)?;
+                Some(PropertyValue::Scale(scale))
+            }
+
+            // Enum
             6 => {
                 let v = *rest.first()?;
                 self.pos = self.pos.checked_add(1)?;
-                if callback_bytes > 0 {
-                    let skip = callback_bytes as usize;
-                    let new_pos = self.pos.checked_add(skip)?;
-                    if new_pos <= d.len() {
-                        self.pos = new_pos;
-                    }
-                }
                 Some(PropertyValue::Byte(v))
             }
 
-            // Single/Currency/Twips Y/H (4 bytes, displayed as Long)
-            7 | 10 | 11 => {
-                let v = read_u32_le(d, p).ok()?;
+            // Single (`docs` Page: `HScrollSmallChange` 225 is 0x43610000)
+            7 => {
+                let v = f32::from_bits(read_u32_le(d, p).ok()?);
+                self.pos = self.pos.checked_add(4)?;
+                Some(PropertyValue::Single(v))
+            }
+
+            // Twips Y/H, a 4-byte integer (`geometry`: a Line's Y1 240.25 is
+            // stored as 240, a Timer's Top 3480)
+            10 | 11 => {
+                let v = read_i32_le(d, p).ok()?;
                 self.pos = self.pos.checked_add(4)?;
                 Some(PropertyValue::Long(v))
             }
 
-            // Twips X/W (4 bytes + optional callback for Position/ClientRect)
+            // Twips X/W, a 4-byte integer, or with a callback a control's
+            // bounds / a form's client rectangle
             8 | 9 => match callback_bytes {
                 4 => {
-                    let (pos, consumed) = ControlPosition::parse(rest)?;
+                    let (bounds, consumed) = ControlBounds::parse(rest)?;
                     self.pos = self.pos.checked_add(consumed)?;
-                    Some(PropertyValue::Position(pos))
+                    Some(PropertyValue::Bounds(bounds))
                 }
                 12 => {
                     let (rect, consumed) = ClientRect::parse(rest)?;
@@ -855,7 +1012,7 @@ impl<'a> PropertyIter<'a> {
                     Some(PropertyValue::ClientRect(rect))
                 }
                 _ => {
-                    let v = read_u32_le(d, p).ok()?;
+                    let v = read_i32_le(d, p).ok()?;
                     self.pos = self.pos.checked_add(4)?;
                     Some(PropertyValue::Long(v))
                 }
@@ -914,6 +1071,7 @@ impl<'a> Iterator for PropertyIter<'a> {
             if desc.prop_type == PropType::Flag {
                 return Some(Property {
                     name: desc.name,
+                    index: opcode,
                     value: PropertyValue::Flag,
                     offset: opcode_offset,
                 });
@@ -922,6 +1080,7 @@ impl<'a> Iterator for PropertyIter<'a> {
             let value = self.decode_value(desc.ser_type, desc.callback_bytes)?;
             return Some(Property {
                 name: desc.name,
+                index: opcode,
                 value,
                 offset: value_offset,
             });
@@ -932,72 +1091,14 @@ impl<'a> Iterator for PropertyIter<'a> {
         if let Some(&next) = self.data.get(self.pos)
             && (next == 0xFF || property_info(self.ctype, next).is_some())
         {
-            let unknown_name: &'static str = Box::leak(format!("?0x{opcode:02X}").into_boxed_str());
             return Some(Property {
-                name: unknown_name,
+                name: "?",
+                index: opcode,
                 value: PropertyValue::Flag,
                 offset: opcode_offset,
             });
         }
         None
-    }
-}
-
-/// Determines the correct [`FormControlType`] for a form-level property stream.
-///
-/// The GUI entry type doesn't always match the actual form content in OCX files
-/// (e.g., PropertyPage form data stored under UserControl GUI entries). This
-/// function examines the stream content and project metadata to resolve the
-/// correct type deterministically.
-pub fn decode_form_type(
-    gui_type: GuiObjectType,
-    form_props: &[u8],
-    project: &VbProject<'_>,
-) -> FormControlType {
-    match gui_type {
-        GuiObjectType::PropertyPage => FormControlType::PropertyPage,
-        GuiObjectType::UserControl => {
-            // Check if this is actually a PropertyPage by matching the form
-            // Name against project objects. The compiler writes using the
-            // object's own TypeInfo, which may differ from the GUI entry.
-            if form_props.len() > 3 && form_props.first() == Some(&0x00) {
-                let Ok(nlen) = read_u16_le(form_props, 1) else {
-                    return FormControlType::UserControl;
-                };
-                let nlen = nlen as usize;
-                let Some(name_end) = 3usize.checked_add(nlen) else {
-                    return FormControlType::UserControl;
-                };
-                if let Some(form_name) = form_props.get(3..name_end) {
-                    let Ok(objects) = project.objects() else {
-                        return FormControlType::UserControl;
-                    };
-                    for other_obj in objects {
-                        if let Ok(other_obj) = other_obj
-                            && let Ok(n) = other_obj.name_bytes()
-                            && n == form_name
-                        {
-                            let Ok(otype) = other_obj.descriptor().object_type_raw() else {
-                                break;
-                            };
-                            // Designer objects (flag 0x02) that aren't UserControl
-                            // (flag 0x20) are PropertyPages
-                            if otype & 0x02 != 0 && otype & 0x20 == 0 {
-                                return FormControlType::PropertyPage;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            FormControlType::UserControl
-        }
-        // Form and MDIForm gui types. UserDocument also uses Form gui type
-        // in practice - the Form table handles it correctly since the property
-        // streams overlap at common indices. The UserDocument table has additional
-        // document-specific properties at indices 76+ (ScrollBars, Viewport, etc.)
-        // that are only emitted for real UserDocument streams.
-        _ => FormControlType::Form,
     }
 }
 

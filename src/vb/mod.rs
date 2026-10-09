@@ -56,6 +56,7 @@ pub mod constantpool;
 pub mod constants;
 pub mod control;
 pub mod controlprop;
+pub mod designer;
 pub mod eventname;
 pub mod events;
 pub mod exports;

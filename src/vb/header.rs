@@ -4,11 +4,14 @@
 //! located via the `push <imm32>` instruction at the PE entry point and
 //! always starts with the `"VB5!"` magic signature.
 //!
-//! Size: `0x68` bytes parsed (104 bytes). The compiler (`sub_4598E5` in
-//! VB6.EXE v6.00.8176) actually writes `0x78` bytes (120), but the runtime
-//! never reads past offset `0x54` (`lpComRegisterData`). The fields at
-//! `0x58`–`0x64` (bSZ string offsets) and `0x68`–`0x77` (reserved) are
-//! dead data from the runtime's perspective - used only by the IDE/compiler.
+//! Size: `0x68` bytes parsed (104 bytes). The compiler writes a `0x78`-byte
+//! fixed part: `0x68` to `0x77` are zero in every fixture, and the strings
+//! the `bSZ*` fields at `0x58` to `0x64` point to start at `0x78`, right
+//! after it. The `bSZ*` fields are byte offsets from the start of the
+//! VBHeader, not VAs. The runtime reads at least one of them: MSVBVM60
+//! 6.00.8176 at `0x660B1B11` adds `bSZProjectExeName` (+0x5C) to the
+//! VBHeader address and passes the string as the caption of an error
+//! `MessageBoxA`.
 
 use crate::{
     error::Error,
@@ -39,14 +42,14 @@ use crate::{
 /// | 0x40 | 4 | `dwThreadCount` |
 /// | 0x44 | 2 | `wFormCount` |
 /// | 0x46 | 2 | `wExternalCount` |
-/// | 0x48 | 4 | `dwThunkCount` |
+/// | 0x48 | 4 | `dwThunkCount` (the runtime reads the low 16 bits) |
 /// | 0x4C | 4 | `lpGuiTable` |
-/// | 0x50 | 4 | `lpExternalTable` |
+/// | 0x50 | 4 | `lpExternalTable` (OCX/UserControl component entries) |
 /// | 0x54 | 4 | `lpComRegisterData` |
-/// | 0x58 | 4 | `bSZProjectDescription` |
-/// | 0x5C | 4 | `bSZProjectExeName` |
-/// | 0x60 | 4 | `bSZProjectHelpFile` |
-/// | 0x64 | 4 | `bSZProjectName` |
+/// | 0x58 | 4 | `bSZProjectDescription` (offset from VBHeader start) |
+/// | 0x5C | 4 | `bSZProjectExeName` (offset from VBHeader start) |
+/// | 0x60 | 4 | `bSZProjectHelpFile` (offset from VBHeader start) |
+/// | 0x64 | 4 | `bSZProjectName` (offset from VBHeader start) |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VbHeader<'a> {
     bytes: &'a [u8],
@@ -118,18 +121,27 @@ impl<'a> VbHeader<'a> {
     }
 
     /// Language extension DLL name at offset 0x06 (14-byte null-padded ANSI).
+    ///
+    /// `"*"` when the project uses no language DLL (all fixtures).
     #[inline]
     pub fn lang_dll(&self) -> Result<&'a [u8], Error> {
         read_fixed_cstr(self.bytes, 0x06, 14)
     }
 
     /// Secondary language DLL name at offset 0x14 (14-byte null-padded ANSI).
+    ///
+    /// `"~"` in all fixtures.
     #[inline]
     pub fn sec_lang_dll(&self) -> Result<&'a [u8], Error> {
         read_fixed_cstr(self.bytes, 0x14, 14)
     }
 
     /// Internal runtime revision at offset 0x22.
+    ///
+    /// The runtime passes it to its COM registration code, which reads
+    /// [`ComRegObject::extended_flags`](super::comreg::ComRegObject::extended_flags)
+    /// only when it is at least 8 (MSVBVM60 6.00.8176 `0x6606A47E`,
+    /// `0x6602861E`).
     #[inline]
     pub fn runtime_revision(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x22)
@@ -147,9 +159,12 @@ impl<'a> VbHeader<'a> {
         read_u32_le(self.bytes, 0x28)
     }
 
-    /// Virtual address of Sub Main procedure at offset 0x2C.
+    /// Virtual address of the `Sub Main` entry at offset 0x2C.
     ///
-    /// Zero if the project does not have a `Sub Main` entry point.
+    /// Zero if the project does not start from `Sub Main`. In a P-Code
+    /// binary it is a 12-byte native stub, `mov edx, <ProcDscInfo VA>;
+    /// mov ecx, <ProcCallEngine import thunk>; jmp ecx`; in a native binary
+    /// it is the procedure itself.
     #[inline]
     pub fn sub_main_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x2C)
@@ -179,6 +194,7 @@ impl<'a> VbHeader<'a> {
     /// Threading mode flags at offset 0x3C.
     ///
     /// See [`ThreadFlags`](super::flags::ThreadFlags) for flag values.
+    /// `0x08` in every fixture (Standard EXEs).
     #[inline]
     pub fn thread_flags(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x3C)
@@ -203,6 +219,10 @@ impl<'a> VbHeader<'a> {
     }
 
     /// Thunk count at offset 0x48.
+    ///
+    /// The runtime reads only the low 16 bits (MSVBVM60 6.00.8176
+    /// `0x6606A588`) and allocates two tables of `count * 4` bytes from it
+    /// (`0x66028836`). 233 in every fixture.
     #[inline]
     pub fn thunk_count(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x48)
@@ -221,9 +241,13 @@ impl<'a> VbHeader<'a> {
 
     /// Virtual address of the external components table at offset 0x50.
     ///
-    /// Points to an array of 8-byte entries, one per external component.
-    /// Use [`VbProject::externals()`](crate::VbProject::externals) to iterate.
-    /// Count is [`external_count`](Self::external_count).
+    /// Points to variable-length component entries (OCX controls and the
+    /// project's own UserControls), each starting with its size in bytes.
+    /// Use [`VbProject::components()`](crate::VbProject::components) to
+    /// iterate. Count is [`external_count`](Self::external_count). This is
+    /// not the table of `Declare`d functions, which
+    /// [`ProjectData::external_table_va`](super::projectdata::ProjectData::external_table_va)
+    /// points to.
     #[inline]
     pub fn external_table_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x50)
@@ -239,25 +263,35 @@ impl<'a> VbHeader<'a> {
         read_u32_le(self.bytes, 0x54)
     }
 
-    /// Project description string offset at offset 0x58.
+    /// Offset of the project description string, from the VBHeader start,
+    /// at offset 0x58.
+    ///
+    /// In the fixtures, whose `.vbp` sets no `Description` or `Title`, the
+    /// string is the EXE base name (`"calls"` for `calls.exe`).
     #[inline]
     pub fn project_description_offset(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x58)
     }
 
-    /// Project EXE name string offset at offset 0x5C.
+    /// Offset of the EXE base name string (no extension), from the VBHeader
+    /// start, at offset 0x5C.
+    ///
+    /// The runtime uses this string as the caption of an error message box
+    /// (MSVBVM60 6.00.8176 `0x660B1B11`).
     #[inline]
     pub fn project_exe_name_offset(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x5C)
     }
 
-    /// Project help file path string offset at offset 0x60.
+    /// Offset of the help file path string, from the VBHeader start, at
+    /// offset 0x60 (an empty string when the project sets none).
     #[inline]
     pub fn project_help_file_offset(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x60)
     }
 
-    /// Project name string offset at offset 0x64.
+    /// Offset of the project name string (the `.vbp` `Name`), from the
+    /// VBHeader start, at offset 0x64.
     #[inline]
     pub fn project_name_offset(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x64)

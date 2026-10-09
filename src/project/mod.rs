@@ -10,12 +10,12 @@
 //! let data = std::fs::read("sample.exe")?;
 //! let project = VbProject::from_bytes(&data)?;
 //!
-//! for obj in project.objects() {
+//! for obj in project.objects()? {
 //!     let obj = obj?;
 //!     println!("Object: {:?}", obj.name()?);
-//!     for method in obj.pcode_methods() {
+//!     for method in obj.pcode_methods()? {
 //!         let method = method?;
-//!         for insn in method.instructions() {
+//!         for insn in method.instructions()? {
 //!             println!("  {}", insn?);
 //!         }
 //!     }
@@ -31,12 +31,12 @@ mod vbproject;
 
 // Re-export all public types at the module level.
 pub use methodentry::MethodEntry;
-pub use methodlink::{MethodLink, MethodLinkIterator};
-pub use pcodemethod::{PCodeMethod, StatementMarker};
+pub use methodlink::{MethodLink, MethodLinkIterator, MethodLinkKind};
+pub use pcodemethod::{ErrorHandling, PCodeMethod, StatementMarker};
 pub use vbcontrol::{ControlEntryIterator, VbControl};
 pub use vbobject::{
-    CodeEntry, CodeEntryKind, EventBinding, FuncTypDescIter, MethodIterator, MethodNameResult,
-    PCodeMethodIterator, VbObject, format_signature,
+    CodeEntry, CodeEntryKind, EventBinding, FuncTypDescIter, Instancing, MethodIterator,
+    MethodNameResult, PCodeMethodIterator, VbObject, format_signature,
 };
 pub use vbproject::{
     CodeEntrypoint, CompilationMode, DiagnosticKind, DiagnosticSeverity, EntrypointKind,

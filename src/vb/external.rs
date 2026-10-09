@@ -1,50 +1,63 @@
 //! External table and import descriptor structures.
 //!
-//! VB6 P-Code executables resolve external DLL/API calls at runtime through
+//! VB6 executables resolve `Declare`d DLL functions at runtime through
 //! `DllFunctionCall` (export of MSVBVM60.DLL) rather than through the
-//! conventional PE import table. The external table describes these references.
-//!
-//! # Structure Hierarchy
+//! conventional PE import table. Two tables describe external references:
 //!
 //! ```text
-//! VbHeader.lpExternalTable / ProjectData.lpExternalTable
-//!   └── ExternalTableEntry[]   (one per external component)
-//!         └── ExternalComponentInfo
-//!               ├── lpLibraryName  -> DLL name string
-//!               └── lpFunctionName -> API function name string
+//! ProjectData +0x234 (table VA), +0x238 (count)
+//!   └── ExternalTableEntry[]   (8 bytes each)
+//!         ├── type 7: ExternalDeclareInfo  (the DllFunctionCall descriptor)
+//!         │     ├── lpLibraryName  -> DLL name string
+//!         │     └── lpFunctionName -> API function name string
+//!         └── type 6: ExternalTypelibInfo  (lpGuid -> 16-byte GUID)
+//!
+//! VbHeader +0x50 (table VA), +0x46 (count)
+//!   └── ExternalComponentEntry   (variable length, self-relative offsets)
 //! ```
 //!
 //! # API Call Mechanism
 //!
-//! When P-Code executes an `ImpAdCall*` opcode:
+//! When P-Code calls a `Declare`d function with an `ImpAdCall*` opcode:
 //! 1. The opcode references a constant pool entry
-//! 2. The pool entry is a native stub: `push offset CallApiStruct; jmp DllFunctionCall`
-//! 3. The [`CallApiStub`] contains pointers to the DLL name and function name
-//! 4. `DllFunctionCall` resolves via `LoadLibrary`/`GetProcAddress` at runtime
+//! 2. The pool entry is the VA of a native stub that jumps to the address
+//!    cached by an earlier call, or pushes the descriptor and calls
+//!    `DllFunctionCall` (see [`resolve_api_stub`])
+//! 3. The descriptor ([`CallApiStub`], the same bytes as the external
+//!    table's [`ExternalDeclareInfo`]) points to the DLL name and function name
+//! 4. `DllFunctionCall` resolves via `LoadLibraryA`/`GetProcAddress` and
+//!    caches the module handle and address
+//!
+//! `ImpAdCall*` pool entries also point to other native entry points, such
+//! as a module procedure's thunk (`mov edx, <ProcDscInfo>; mov ecx,
+//! <ProcCallEngine>; jmp ecx`, `tests/fixtures/hello`).
 
 use std::{borrow::Cow, fmt, str};
 
 use crate::{
     addressmap::AddressMap,
     error::Error,
-    util::{read_cstr, read_u16_le, read_u32_le},
+    util::{read_cstr, read_i32_le, read_u16_le, read_u32_le},
     vb::control::Guid,
 };
 
 /// View over a CallAPI stub structure (the `DllFunctionCall` descriptor).
 ///
-/// This is the structure the compiler-emitted native stub pushes before
-/// `jmp DllFunctionCall` - both for `ImpAdCall*` constant-pool API calls and
-/// for `Declare` imports (via [`ExternalDeclareInfo::native_stub_va`]). The
-/// VB6 runtime reads it in `DllFunctionCall` → `sub_660315de` to resolve the
-/// import lazily via `LoadLibraryA` + `GetProcAddress`.
+/// This is the structure the compiler-emitted native stub of a `Declare`d
+/// function pushes before calling `DllFunctionCall`; the external table's
+/// `Declare` entry points to the same bytes (in the fixtures the
+/// [`ExternalTableEntry::external_object_va`] of each `Declare` equals the
+/// VA its stub pushes; see [`ExternalDeclareInfo`]). The VB6 runtime reads it
+/// in the `DllFunctionCall` worker to resolve the import lazily via
+/// `LoadLibraryA` + `GetProcAddress`.
 ///
 /// # Layout
 ///
-/// Verified against MSVBVM60.DLL `sub_660315de` (the `DllFunctionCall` worker):
-/// it dereferences `+0x00` for `LoadLibraryA`, `+0x04` for `GetProcAddress`
-/// by name, `+0x08` for `GetProcAddress` by ordinal (when the by-ordinal flag
-/// is set), and `+0x0C` as a writable resolve cache.
+/// Verified against the `DllFunctionCall` worker (MSVBVM60 6.00.8176
+/// 0x6602675a, 6.00.9848 0x660315de): it dereferences `+0x00` for
+/// `LoadLibraryA`, `+0x04` for `GetProcAddress` by name, `+0x08` for
+/// `GetProcAddress` by ordinal (when the by-ordinal flag is set), and `+0x0C`
+/// as a writable resolve cache.
 ///
 /// | Offset | Size | Field | Runtime use |
 /// |--------|------|-------|-------------|
@@ -135,8 +148,9 @@ impl<'a> CallApiStub<'a> {
 
     /// Resolution flags at offset 0x0A.
     ///
-    /// See [`FLAG_BY_ORDINAL`](Self::FLAG_BY_ORDINAL). Other bits are reserved
-    /// and not yet characterized.
+    /// See [`FLAG_BY_ORDINAL`](Self::FLAG_BY_ORDINAL), the only bit the
+    /// `DllFunctionCall` worker tests. Every `Declare` of the fixtures (by
+    /// name) has 0x0004 here; that bit's meaning is unknown.
     ///
     /// # Errors
     ///
@@ -211,12 +225,26 @@ impl<'a> CallApiStub<'a> {
 
 /// Resolves an API call stub from the constant pool.
 ///
-/// In the constant pool, API call entries are native code stubs with
-/// the pattern:
+/// Two stub shapes are accepted. The first is a `push` of the descriptor
+/// followed by a jump (none of the fixtures has this form):
 ///
 /// ```x86asm
 /// push offset CallApiStruct    ; 0x68 <imm32>
 /// jmp  DllFunctionCall          ; 0xE9 <rel32>  (or 0xFF 0x25 for indirect)
+/// ```
+///
+/// The stubs of the P-Code fixtures (`exprs`, `types`, `vtable`) first try
+/// the address an earlier call cached at the descriptor's cache + 8, then
+/// push the descriptor and call the `jmp [__imp_DllFunctionCall]` thunk:
+///
+/// ```x86asm
+/// mov  eax, [cache]             ; 0xA1 <imm32>
+/// or   eax, eax                 ; 0x0B 0xC0
+/// jz   +2                       ; 0x74 0x02
+/// jmp  eax                      ; 0xFF 0xE0
+/// push offset CallApiStruct    ; 0x68 <imm32>
+/// mov  eax, <thunk>             ; 0xB8 <imm32>
+/// call eax                      ; 0xFF 0xD0
 /// ```
 ///
 /// This function reads the stub at the given VA, extracts the
@@ -229,14 +257,18 @@ impl<'a> CallApiStub<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error if the VA cannot be resolved or the stub does not
-/// start with `push imm32` (`0x68`).
+/// Returns an error if the VA cannot be resolved or the stub is neither form.
 pub fn resolve_api_stub<'a>(map: &AddressMap<'a>, stub_va: u32) -> Result<CallApiStub<'a>, Error> {
-    // Read enough bytes for push imm32 (5 bytes)
-    let stub_data = map.slice_from_va(stub_va, 5)?;
+    /// The cache check before the `push`, without the cache's address.
+    const CACHED_TAIL: [u8; 6] = [0x0B, 0xC0, 0x74, 0x02, 0xFF, 0xE0];
 
-    let first = *stub_data.first().ok_or(Error::TooShort {
-        expected: 5,
+    let stub_data = map.slice_from_va(stub_va, 5)?;
+    let push_at = match (stub_data.first(), stub_data.get(5..11)) {
+        (Some(0xA1), Some(tail)) if tail == CACHED_TAIL => 11,
+        _ => 0,
+    };
+    let first = *stub_data.get(push_at).ok_or(Error::TooShort {
+        expected: push_at.saturating_add(5),
         actual: stub_data.len(),
         context: "resolve_api_stub",
     })?;
@@ -244,7 +276,7 @@ pub fn resolve_api_stub<'a>(map: &AddressMap<'a>, stub_va: u32) -> Result<CallAp
         return Err(Error::EntryPointNotPush { byte: first });
     }
 
-    let call_api_va = read_u32_le(stub_data, 1)?;
+    let call_api_va = read_u32_le(stub_data, push_at.saturating_add(1))?;
     // Prefer the full descriptor (name VAs + ordinal + flags + cache), but fall
     // back to the 8-byte minimum when the struct sits at the end of a section
     // and the trailing fields aren't backed by file data.
@@ -254,10 +286,11 @@ pub fn resolve_api_stub<'a>(map: &AddressMap<'a>, stub_va: u32) -> Result<CallAp
     CallApiStub::parse(call_api_data)
 }
 
-/// Type byte enumeration for VB6 function prototype descriptors.
+/// A VB6 type byte in the encoding of [`VbBaseType`], with modifier bits
+/// (`ByRef`, `Array`, `Optional`) OR'd with the base type.
 ///
-/// Used in FuncTypDesc to describe parameter and return types.
-/// Modifiers (`ByRef`, `Array`, `Optional`) are OR'd with the base type.
+/// This is not the encoding of a FuncTypDesc's type list, which has its own
+/// codes ([`ArgType`](crate::vb::functype::ArgType)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbType(
     /// Raw type byte, possibly OR'd with modifier flags (ByRef, Array, Optional).
@@ -309,20 +342,22 @@ impl VbType {
     pub const EXTERNAL_COM: u8 = 0x1D;
     /// IDispatch pointer to an internal VB object.
     ///
-    /// Used for ByVal String and ByVal Object parameters (passed as 4-byte
-    /// dispatch pointers on the stack). As a return type, maps to hidden
-    /// HRESULT checking (runtime marshalling code 0x19 in `sub_6600fbff`).
-    /// As a parameter type, `ResolveDispatchToFuncTypDesc` forces this
-    /// type when resolving variables through the secondary name table.
+    /// Not observed in the fixtures. (The runtime's type-byte decoder maps
+    /// code 0x1E to `VT_HRESULT` (0x19), but it decodes the
+    /// [`ArgType`](crate::vb::functype::ArgType) encoding, where 0x1E is the
+    /// `this` entry, not this one.)
     pub const DISPATCH_PTR: u8 = 0x1E;
 
     /// Array modifier (OR'd with base type, bit 5).
     ///
-    /// Verified via MSVBVM60.DLL `sub_6600fbff`: `*arg1 & 0x20` checks array flag.
+    /// Unverified. The runtime's type-byte decoder (MSVBVM60 6.00.8176
+    /// 0x66018ed8, 6.00.9848 0x6600fbff) maps bit 0x20 to `VT_BYREF` and bit
+    /// 0x40 to `VT_ARRAY`, but it decodes the
+    /// [`ArgType`](crate::vb::functype::ArgType) encoding, not this one.
     pub const ARRAY: u8 = 0x20;
     /// ByRef modifier (OR'd with base type, bit 6).
     ///
-    /// Verified via MSVBVM60.DLL `sub_6600fbff`: `*arg1 & 0x40` checks ByRef flag.
+    /// Unverified: see [`ARRAY`](Self::ARRAY).
     pub const BYREF: u8 = 0x40;
     /// Optional parameter modifier (OR'd with base type, bit 7).
     pub const OPTIONAL: u8 = 0x80;
@@ -530,7 +565,8 @@ impl fmt::Display for VbBaseType {
 /// by `FuncTypDesc.optional_defaults_va`). Mirrors the `VARENUM` values
 /// from the Windows SDK.
 ///
-/// Size mapping verified against `VarTypeToSize` (0x660F5FF0) in MSVBVM60.DLL.
+/// Size mapping verified against `VarTypeToSize` (MSVBVM60 6.00.8176
+/// 0x660f2747, 6.00.9848 0x660F5FF0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum VarType {
@@ -609,7 +645,7 @@ impl VarType {
 
     /// Returns the byte size of this type's data portion in a default value entry.
     ///
-    /// Mirrors `VarTypeToSize` (0x660F5FF0) in MSVBVM60.DLL.
+    /// Mirrors `VarTypeToSize` (MSVBVM60 6.00.8176 0x660f2747).
     /// Returns 0 for variable-size types (BSTR, Variant) and unknown types.
     pub fn data_size(self) -> usize {
         match self {
@@ -658,26 +694,27 @@ impl fmt::Display for VarType {
     }
 }
 
-/// View over an external component table entry (8 bytes).
-///
 /// Classification of an external table entry.
 ///
 /// The `fExternalType` field determines what kind of external reference
 /// the entry represents and how `lpExternalObject` should be interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalKind {
-    /// COM type library reference (`fExternalType == 0x06`).
+    /// GUID reference (`fExternalType == 0x06`).
     ///
-    /// The `lpExternalObject` VA points to a 16-byte GUID (the typelib's
-    /// CLSID/LIBID). These are references to OCX or ActiveX type libraries
-    /// registered on the system.
+    /// The `lpExternalObject` VA points to an [`ExternalTypelibInfo`] whose
+    /// first dword is the VA of a 16-byte GUID. In the fixtures the two
+    /// projects with a UserControl (`forms`, `dispid`) each have one such
+    /// entry, with the GUID `{FCFB3D23-A0FA-1068-A738-08002B3371B5}`; no
+    /// fixture references an OCX.
     TypeLib,
 
     /// Declare function import (`fExternalType == 0x07`).
     ///
-    /// The `lpExternalObject` VA points to a structure whose first two
-    /// DWORDs are VAs to null-terminated strings: the DLL library name
-    /// and the exported function name (e.g., `kernel32` + `CreateFileA`).
+    /// The `lpExternalObject` VA points to an [`ExternalDeclareInfo`] whose
+    /// first two DWORDs are VAs to null-terminated strings: the DLL library
+    /// name and the exported function name (e.g., `kernel32` +
+    /// `GetTickCount`).
     DeclareFunction,
 
     /// Unknown or unrecognized external type.
@@ -719,8 +756,10 @@ impl fmt::Display for ExternalKind {
 /// View over an external component table entry (8 bytes).
 ///
 /// The external table is referenced by `ProjectData.external_table_va()?`
-/// with `ProjectData.external_count()?` entries. Each entry describes an
-/// external COM component (OCX, DLL, typelib) used by the project.
+/// with `ProjectData.external_count()?` entries. Each entry is a DLL
+/// function a `Declare` imports or a GUID reference. `Declare`s of the same
+/// entry point share one entry: `vtable` has 13 `Declare`s, 12 of them
+/// aliases of `GetTickCount`, and 2 entries.
 ///
 /// Use [`kind()`](Self::kind) to determine what the entry represents and
 /// how to interpret `external_object_va()`.
@@ -796,9 +835,12 @@ impl<'a> ExternalTableEntry<'a> {
 
     /// Parses this entry as a TypeLib reference.
     ///
-    /// Returns `None` if the type is not [`ExternalKind::TypeLib`]
-    /// or the VA cannot be resolved.
+    /// Returns `None` if the type is not [`ExternalKind::TypeLib`] (`exprs`
+    /// entry 0, the `Declare` of `lstrlenA`) or the VA cannot be resolved.
     pub fn as_typelib(&self, map: &AddressMap<'a>) -> Option<ExternalTypelibInfo<'a>> {
+        if !matches!(self.kind().ok()?, ExternalKind::TypeLib) {
+            return None;
+        }
         let va = self.external_object_va().ok()?;
         let data = map.slice_from_va(va, ExternalTypelibInfo::SIZE).ok()?;
         ExternalTypelibInfo::parse(data).ok()
@@ -808,6 +850,10 @@ impl<'a> ExternalTableEntry<'a> {
 /// External Declare function descriptor (0x10 bytes).
 ///
 /// Describes a `Declare Function`/`Declare Sub` import from a native DLL.
+/// It is the `DllFunctionCall` descriptor itself: the same bytes the
+/// function's native stub pushes (`types`: the `Sleep` entry's descriptor
+/// is 0x00401990, and its stub at 0x004019A8 pushes 0x00401990), with the
+/// [`CallApiStub`] layout; `CallApiStub::from` views it as one.
 ///
 /// # Layout
 ///
@@ -815,11 +861,21 @@ impl<'a> ExternalTableEntry<'a> {
 /// |--------|------|-------|
 /// | 0x00 | 4 | `lpLibraryName` (VA to DLL name string) |
 /// | 0x04 | 4 | `lpFunctionName` (VA to API function name string) |
-/// | 0x08 | 4 | `dwFlags` (always 0x00040000 - calling convention) |
-/// | 0x0C | 4 | `lpNativeStub` (VA to 12-byte native call stub in .data) |
+/// | 0x08 | 2 | [`ordinal`](Self::ordinal) (0 in every fixture `Declare`) |
+/// | 0x0A | 2 | [`flags`](Self::flags) (0x0004 in every fixture `Declare`) |
+/// | 0x0C | 4 | `lpResolveCache` (VA in the zero-filled `.data`: +0x04 module handle, +0x08 function address, written by `DllFunctionCall`) |
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalDeclareInfo<'a> {
     bytes: &'a [u8],
+}
+
+impl<'a> From<ExternalDeclareInfo<'a>> for CallApiStub<'a> {
+    /// Views a `Declare`'s descriptor as the [`CallApiStub`] it is.
+    fn from(declare: ExternalDeclareInfo<'a>) -> Self {
+        Self {
+            bytes: declare.bytes,
+        }
+    }
 }
 
 impl<'a> ExternalDeclareInfo<'a> {
@@ -848,33 +904,42 @@ impl<'a> ExternalDeclareInfo<'a> {
         read_u32_le(self.bytes, 0x04)
     }
 
-    /// Calling convention/flags at offset 0x08 (always 0x00040000).
-    #[inline]
-    pub fn flags(&self) -> Result<u32, Error> {
-        read_u32_le(self.bytes, 0x08)
-    }
-
-    /// VA of the native call stub in the .data section at offset 0x0C.
-    #[inline]
-    pub fn native_stub_va(&self) -> Result<u32, Error> {
-        read_u32_le(self.bytes, 0x0C)
-    }
-
-    /// Resolves the `DllFunctionCall` descriptor behind this declare's native stub.
+    /// Import ordinal at offset 0x08 (see [`CallApiStub::ordinal`]).
     ///
-    /// The stub at [`native_stub_va`](Self::native_stub_va) is a
-    /// `push <descriptor>; jmp DllFunctionCall` thunk - the same shape used by
-    /// `ImpAdCall*` constant-pool entries. Resolving it exposes the
-    /// [`CallApiStub::ordinal`] and [`CallApiStub::is_by_ordinal`] fields, so a
-    /// `Declare ... Alias "#123"` ordinal import can be distinguished from a
-    /// by-name import. Returns `None` if the VA can't be resolved or the stub
-    /// doesn't begin with `push imm32`.
-    pub fn api_stub(&self, map: &AddressMap<'a>) -> Option<CallApiStub<'a>> {
-        let va = self.native_stub_va().ok()?;
-        if va == 0 {
-            return None;
-        }
-        resolve_api_stub(map, va).ok()
+    /// Meaningful when [`is_by_ordinal`](Self::is_by_ordinal) is `true`; 0
+    /// for every `Declare` of the fixtures, all by name.
+    #[inline]
+    pub fn ordinal(&self) -> Result<u16, Error> {
+        read_u16_le(self.bytes, 0x08)
+    }
+
+    /// Resolution flags at offset 0x0A (see [`CallApiStub::flags`]).
+    ///
+    /// 0x0004 for every `Declare` of the fixtures.
+    #[inline]
+    pub fn flags(&self) -> Result<u16, Error> {
+        read_u16_le(self.bytes, 0x0A)
+    }
+
+    /// Returns `true` if the function resolves by ordinal
+    /// ([`CallApiStub::FLAG_BY_ORDINAL`] set in [`flags`](Self::flags)),
+    /// the API name then being absent from the binary.
+    #[inline]
+    pub fn is_by_ordinal(&self) -> bool {
+        CallApiStub::from(*self).is_by_ordinal()
+    }
+
+    /// VA of the resolve cache at offset 0x0C.
+    ///
+    /// Not a stub: it points into the zero-filled `.data` section, where
+    /// `DllFunctionCall` stores the module handle (+0x04, MSVBVM60 6.00.8176
+    /// `0x66026791`) and the function address (+0x08, `0x660267C6`) on the
+    /// first call. The function's stub jumps through cache + 8 once it is
+    /// set (`types`: `Sleep`'s cache 0x0040432C, its stub reads
+    /// `[0x00404334]`).
+    #[inline]
+    pub fn resolve_cache_va(&self) -> Result<u32, Error> {
+        read_u32_le(self.bytes, 0x0C)
     }
 
     /// Resolves the DLL library name string.
@@ -902,15 +967,16 @@ impl<'a> ExternalDeclareInfo<'a> {
 
 /// External TypeLib reference descriptor.
 ///
-/// Describes a referenced COM type library. The GUID is accessed
-/// indirectly through a VA pointer.
+/// The target of an [`ExternalKind::TypeLib`] entry. The GUID is accessed
+/// indirectly through a VA pointer; in the fixtures it is
+/// `{FCFB3D23-A0FA-1068-A738-08002B3371B5}`, not an OCX's type library.
 ///
 /// # Layout
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 4 | `lpTypelibGuid` (VA to 16-byte typelib GUID) |
-/// | 0x04 | 4 | `lpRuntimeData` (VA to .data section runtime cache) |
+/// | 0x00 | 4 | `lpTypelibGuid` (VA to 16-byte GUID) |
+/// | 0x04 | 4 | `lpRuntimeData` (VA in the zero-filled `.data` section) |
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalTypelibInfo<'a> {
     bytes: &'a [u8],
@@ -947,40 +1013,70 @@ impl<'a> ExternalTypelibInfo<'a> {
     }
 }
 
-/// View over a variable-length external component entry.
+/// View over a variable-length external component entry: one ActiveX
+/// control class the project hosts on a form or UserControl.
 ///
-/// Used by `VBHeader.external_table_va` (+0x50) for OCX/ActiveX control
-/// references. Each entry uses self-relative offsets like ComRegData.
-/// The runtime parses these in `sub_6603C89A` during `LoadExternalsAndGUIObjects`.
+/// Used by `VBHeader.external_table_va` (+0x50). Each entry uses
+/// self-relative offsets like ComRegData. The runtime (MSVBVM60 6.00.8176
+/// 0x6602db62, 6.00.9848 0x6603C89A) copies `dwEntrySize` bytes and turns
+/// the offsets at +0x04..+0x30 into pointers.
+///
+/// Measured on `tests/fixtures/{activex,forms,dispid,ocx}`: an entry per
+/// hosted class, a third-party control (`activex`: `MSWINSCK.OCX` Winsock,
+/// `MSINET.OCX` Inet, `COMDLG32.OCX` CommonDialog) or one of the project's
+/// own UserControls (`forms` Gauge, `dispid` Dial, `ocx` Knob, with an
+/// empty OCX filename).
 ///
 /// # Header Layout (0x34 bytes, 13 dwords)
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
 /// | 0x00 | 4 | `dwEntrySize` - total entry size (self-relative advance to next) |
-/// | 0x04 | 4 | `bComponentInfo` - self-rel offset to component info block |
-/// | 0x08 | 4 | `bField08` - self-rel offset (interface data 1) |
-/// | 0x0C | 4 | `bField0C` - self-rel offset (interface data 2) |
-/// | 0x10 | 4 | `bField10` - self-rel offset (interface data 3) |
-/// | 0x14 | 4 | `bField14` - self-rel offset (interface data 4) |
-/// | 0x18 | 4 | `bEventHandlers` - self-rel offset to event handler array |
-/// | 0x1C | 4 | `bField1C` - self-rel offset (interface data 5) |
-/// | 0x20 | 4 | `dwInfoBlockSize` - component info block size (direct value) |
-/// | 0x24 | 4 | `bField24` - self-rel offset (0 = not present) |
-/// | 0x28 | 4 | `bOcxFilename` - self-rel offset to OCX filename string |
-/// | 0x2C | 4 | `bProgId` - self-rel offset to ProgID string (e.g., "TabDlg.SSTab") |
-/// | 0x30 | 4 | `bClassName` - self-rel offset to class name (e.g., "SSTab") |
+/// | 0x04 | 4 | `bComponentInfo` - self-rel offset to the component info block (0x38) |
+/// | 0x08 | 4 | self-rel offset to the coordinate conversions of event parameters ([`event_conversions`](Self::event_conversions)), 0 when there are none |
+/// | 0x0C | 4 | self-rel offset to one `u16` per event indexing those conversions, 0 when there are none |
+/// | 0x10 | 4 | self-rel offset to a bitmap of one bit per event (`cFuncs / 8 + 1` bytes, which VB6.EXE allocates zeroed at 0x48ed5b), 0 when the control declares no event; every bit is 0 in every fixture, and zeroing it changes neither hosting nor event dispatch (a control with its DISPIDs corrupted stops calling its handlers); the bytes after it are allocation slack |
+/// | 0x14 | 4 | self-rel offset to the DISPIDs of the control's events ([`event_dispids`](Self::event_dispids)), 0 when it declares none |
+/// | 0x18 | 4 | self-rel offset to the bindable-property records ([`bindable_properties`](Self::bindable_properties)), 0 when it has none |
+/// | 0x1C | 4 | `bLicenseKey` - self-rel offset to the control's licence key, UTF-16 ([`license_key`](Self::license_key)) |
+/// | 0x20 | 4 | the licence key's length in bytes (0x48: 36 UTF-16 characters), -1 when there is none; the runtime makes the key a BSTR with `SysAllocStringByteLen` (MSVBVM60 6.00.8176, 0x6602dd71) |
+/// | 0x24 | 4 | self-rel offset (0 in every fixture) |
+/// | 0x28 | 4 | `bOcxFilename` - self-rel offset to the OCX filename (empty for the project's own UserControl) |
+/// | 0x2C | 4 | `bProgId` - self-rel offset to the ProgID (e.g., `"MSWinsockLib.Winsock"`) |
+/// | 0x30 | 4 | `bClassName` - self-rel offset to the class name (e.g., `"Winsock"`) |
 ///
 /// # Component Info Block (at `bComponentInfo`)
 ///
-/// Variable-length block with at least 0x93 bytes:
-/// - +0x86 (u8): flags - bit 7 = uses special load path in runtime
-/// - +0x92 (u16): event handler count
+/// | Offset | Size | Field |
+/// |--------|------|-------|
+/// | 0x00 | 16 | the control's CLSID ([`clsid`](Self::clsid)) |
+/// | 0x10 | 16 | its events (source) interface IID ([`events_iid`](Self::events_iid)) |
+/// | 0x20 | 16 | its default interface IID ([`default_iid`](Self::default_iid)) |
+/// | 0x30 | 32 | two GUIDs the compiler generates per build |
+/// | 0x60 | 16 | the events IID a hosted instance's ControlInfo names ([`instance_events_iid`](Self::instance_events_iid)) |
+/// | 0x70 | 16 | the same for an instance in a control array ([`array_events_iid`](Self::array_events_iid)) |
+/// | 0x84 | 2 | the control's extender capabilities, derived from its `MiscStatus` ([`extender_flags`](Self::extender_flags)) |
+/// | 0x86 | 2 | more control flags ([`control_flags`](Self::control_flags)) |
+/// | 0x8E | 2 | number of events the control declares ([`declared_event_count`](Self::declared_event_count)) |
+/// | 0x92 | 2 | number of bindable-property records ([`bindable_count`](Self::bindable_count)) |
 ///
-/// # Event Handler Array (at `bEventHandlers`)
+/// The instance events IIDs are generated per build: a hosted control's
+/// event sink (its ControlInfo `+0x08`) is not its own events interface but
+/// an extended one, whose first 9 slots are `VBControlExtenderEvents`
+/// (`GotFocus` ... `Validate`) and whose slots from 9 on are the control's
+/// own events in its events interface's order (`activex` Winsock: `Error` 9,
+/// `DataArrival` 10, `Connect` 11, `ConnectionRequest` 12, `Close` 13; `ocx`
+/// Knob: `Turned` 9, `Reset` 10, its declaration order), slot `9 + k`
+/// being the event whose DISPID is [`event_dispids`](Self::event_dispids)`[k]`.
+/// The entry holds no event names: those are in the control's type library.
 ///
-/// Array of 0x18-byte entries, one per event. Event handler name strings
-/// follow immediately after the array.
+/// # Bindable Property Records (at +0x18)
+///
+/// The runtime reads [`bindable_count`](Self::bindable_count) records of 0x18
+/// bytes and points each one's `+0x10` at a name, the names following the
+/// records one after another (MSVBVM60 6.00.8176, 0x6602dc2c); see
+/// [`BindableProperty`]. A control has them when its type library marks
+/// properties bindable (`activex` MaskEdBox: 5).
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalComponentEntry<'a> {
     bytes: &'a [u8],
@@ -990,8 +1086,8 @@ impl<'a> ExternalComponentEntry<'a> {
     /// Minimum header size in bytes.
     pub const HEADER_SIZE: usize = 0x34;
 
-    /// Size of each event handler array entry.
-    pub const EVENT_ENTRY_SIZE: usize = 0x18;
+    /// Size of a [`BindableProperty`] record.
+    pub const BINDABLE_RECORD_SIZE: usize = 0x18;
 
     /// Parses an external component entry from the given byte slice.
     ///
@@ -1063,9 +1159,87 @@ impl<'a> ExternalComponentEntry<'a> {
         self.resolve_string(0x30)
     }
 
-    /// Component info block flags byte at component_info+0x86.
-    ///
-    /// Bit 7 = uses special load path in `LoadExternalsAndGUIObjects`.
+    /// Returns the 16-byte GUID at `offset` in the component info block.
+    fn info_guid(&self, offset: usize) -> Option<Guid> {
+        let info = usize::try_from(read_u32_le(self.bytes, 0x04).ok()?).ok()?;
+        if info == 0 {
+            return None;
+        }
+        let start = info.checked_add(offset)?;
+        Guid::from_bytes(self.bytes.get(start..)?)
+    }
+
+    /// Returns the control's CLSID (component info +0x00).
+    pub fn clsid(&self) -> Option<Guid> {
+        self.info_guid(0x00)
+    }
+
+    /// Returns the IID of the control's events (source) interface
+    /// (component info +0x10): for a project's own UserControl, the
+    /// object's events IID.
+    pub fn events_iid(&self) -> Option<Guid> {
+        self.info_guid(0x10)
+    }
+
+    /// Returns the IID of the control's default interface (component info
+    /// +0x20).
+    pub fn default_iid(&self) -> Option<Guid> {
+        self.info_guid(0x20)
+    }
+
+    /// Returns the events IID a hosted instance of the control names in its
+    /// ControlInfo (component info +0x60): the extended events interface
+    /// whose slots 0-8 are `VBControlExtenderEvents` and whose slots from 9
+    /// on are the control's own events.
+    pub fn instance_events_iid(&self) -> Option<Guid> {
+        self.info_guid(0x60)
+    }
+
+    /// Returns the events IID an instance in a control array names in its
+    /// ControlInfo (component info +0x70; `activex` `Peers`, `ocx` `Knob2`).
+    pub fn array_events_iid(&self) -> Option<Guid> {
+        self.info_guid(0x70)
+    }
+
+    /// Returns the number of events the control declares (the u16 at
+    /// component info +0x8E): `activex` Winsock 7, Inet 1, CommonDialog 0;
+    /// `forms` Gauge 1, `ocx` Knob 2.
+    pub fn declared_event_count(&self) -> u16 {
+        self.info_u16(0x8E).unwrap_or(0)
+    }
+
+    /// Returns the licence key's length in bytes, the value at +0x20
+    /// (`activex` Winsock: 0x48, 36 UTF-16 characters); `None` when it is
+    /// -1 (a project's own UserControl).
+    pub fn license_key_length(&self) -> Option<u32> {
+        read_u32_le(self.bytes, 0x20)
+            .ok()
+            .filter(|&length| length != u32::MAX)
+    }
+
+    /// Returns the control's design-time licence key: UTF-16 with no
+    /// terminator, [`license_key_length`](Self::license_key_length) bytes at
+    /// the self-relative offset at +0x1C. The key of `HKCR\Licenses` the
+    /// control's class factory checks (`activex` Winsock:
+    /// `"2c49f800-c2dd-11cf-9ad6-0080c7e7b78d"`). `None` when there is none
+    /// (a project's own UserControl).
+    pub fn license_key(&self) -> Option<String> {
+        let offset = self.offset_at(0x1C)?;
+        let length = usize::try_from(self.license_key_length()?).ok()?;
+        let end = offset.checked_add(length)?;
+        let tail = self.bytes.get(offset..end)?;
+        let units: Vec<u16> = tail
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        (!units.is_empty()).then(|| String::from_utf16_lossy(&units))
+    }
+
+    /// Component info block byte at component_info+0x86 (the low byte of
+    /// [`control_flags`](Self::control_flags)).
     pub fn component_flags(&self) -> Option<u8> {
         let off = read_u32_le(self.bytes, 0x04).ok()? as usize;
         let end = off.checked_add(0x87)?;
@@ -1076,73 +1250,163 @@ impl<'a> ExternalComponentEntry<'a> {
         self.bytes.get(flags_off).copied()
     }
 
-    /// Number of event handlers from component_info+0x92.
-    pub fn event_count(&self) -> u16 {
-        let Ok(off_raw) = read_u32_le(self.bytes, 0x04) else {
-            return 0;
-        };
-        let off = off_raw as usize;
-        let Some(end) = off.checked_add(0x94) else {
-            return 0;
-        };
-        if off == 0 || end > self.bytes.len() {
-            return 0;
+    /// Returns the u16 at `offset` in the component info block.
+    fn info_u16(&self, offset: usize) -> Option<u16> {
+        let info = usize::try_from(read_u32_le(self.bytes, 0x04).ok()?).ok()?;
+        if info == 0 {
+            return None;
         }
-        let Some(field_off) = off.checked_add(0x92) else {
-            return 0;
-        };
-        read_u16_le(self.bytes, field_off).unwrap_or(0)
+        read_u16_le(self.bytes, info.checked_add(offset)?).ok()
     }
 
-    /// Component info block size (direct value at +0x20).
-    #[inline]
-    pub fn info_block_size(&self) -> Result<u32, Error> {
-        read_u32_le(self.bytes, 0x20)
+    /// Returns the self-relative offset at header `field`, `None` when 0.
+    fn offset_at(&self, field: usize) -> Option<usize> {
+        let offset = usize::try_from(read_u32_le(self.bytes, field).ok()?).ok()?;
+        (offset != 0).then_some(offset)
     }
 
-    /// Returns event handler names for this component.
+    /// Returns the DISPIDs of the control's own events, in its events
+    /// interface's order (the `i32` array at the self-relative offset at
+    /// +0x14, [`declared_event_count`](Self::declared_event_count) entries).
     ///
-    /// Each event is a null-terminated ASCII string. The names follow
-    /// the 0x18-byte event array entries sequentially.
-    pub fn event_names(&self) -> Vec<&'a str> {
-        let Ok(evt_off_raw) = read_u32_le(self.bytes, 0x18) else {
+    /// A hosted instance's event sink slot `9 + k` is the event with
+    /// DISPID `event_dispids()[k]` (`activex` Winsock: 6, 0, 1, 2, 5, 3, 4,
+    /// its `Error`, `DataArrival`, `Connect`, `ConnectionRequest`, `Close`,
+    /// `SendProgress`, `SendComplete`; `ocx` Knob: 1, 2). Empty when the
+    /// control declares no event.
+    pub fn event_dispids(&self) -> Vec<i32> {
+        let Some(start) = self.offset_at(0x14) else {
             return Vec::new();
         };
-        let evt_off = evt_off_raw as usize;
-        if evt_off == 0 {
-            return Vec::new();
-        }
-        let count = self.event_count() as usize;
-        if count == 0 {
-            return Vec::new();
-        }
-        // Names start after the array entries
-        let Some(array_bytes) = count.checked_mul(Self::EVENT_ENTRY_SIZE) else {
+        (0..usize::from(self.declared_event_count()))
+            .map_while(|k| {
+                let offset = k.checked_mul(4)?.checked_add(start)?;
+                read_i32_le(self.bytes, offset).ok()
+            })
+            .collect()
+    }
+
+    /// Returns, per declared event (in [`event_dispids`](Self::event_dispids)
+    /// order), the parameters the runtime converts before calling the
+    /// host's handler: the `u16` at index `k` of the array at +0x0C is a
+    /// dword index into the list at +0x08, whose entries run to a 0 kind
+    /// (MSVBVM60 6.00.8176, 0x66024f4e; VB6.EXE builds it at 0x48ec9e).
+    /// `activex` ProgressBar: its first three events (MouseDown, MouseMove,
+    /// MouseUp) convert parameter 2 (`x`, `OLE_XPOS_PIXELS`) and 3 (`y`,
+    /// `OLE_YPOS_PIXELS`). Empty for a control without such parameters.
+    /// See [`ConversionKind`].
+    pub fn event_conversions(&self) -> Vec<Vec<ParamConversion>> {
+        let (Some(list), Some(indices)) = (self.offset_at(0x08), self.offset_at(0x0C)) else {
             return Vec::new();
         };
-        let Some(names_start) = evt_off.checked_add(array_bytes) else {
+        (0..usize::from(self.declared_event_count()))
+            .map(|k| {
+                let Some(first) = k
+                    .checked_mul(2)
+                    .and_then(|offset| offset.checked_add(indices))
+                    .and_then(|offset| read_u16_le(self.bytes, offset).ok())
+                    .filter(|&first| first != 0)
+                else {
+                    return Vec::new();
+                };
+                (usize::from(first)..)
+                    .map_while(|entry| {
+                        let at = entry.checked_mul(4)?.checked_add(list)?;
+                        let raw = read_u32_le(self.bytes, at).ok()?;
+                        let [low, high, by_ref, kind] = raw.to_le_bytes();
+                        (kind != 0).then_some(ParamConversion {
+                            param: u16::from_le_bytes([low, high]),
+                            by_ref: by_ref != 0,
+                            kind: ConversionKind::from_raw(kind),
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Returns the control's extender capability flags, the `u16` at
+    /// component info +0x84, which VB6 derives from the control's
+    /// `MiscStatus` and from which the runtime decides the extender
+    /// properties it offers (MSVBVM60 6.00.8176, 0x660b5f41).
+    ///
+    /// Measured by changing one UserControl property at a time
+    /// (`tests/fixtures/extender`, base 0x1766 for `MiscStatus` 0x20191):
+    /// `OLEMISC_INVISIBLEATRUNTIME` gives 0x0B60 (0x0800 set; 0x0002,
+    /// 0x0004, 0x0400 and 0x1000 cleared), `CanGetFocus = False` clears
+    /// 0x0404, `OLEMISC_ALIGNABLE` sets 0x0080, `OLEMISC_ACTSLIKEBUTTON` sets
+    /// 0x2000, `OLEMISC_ACTSLIKELABEL` sets 0x4000 and clears 0x0400,
+    /// `OLEMISC_SIMPLEFRAME` sets 0x8000; a control with bindable properties
+    /// sets 0x0010 (`activex` MaskEdBox).
+    pub fn extender_flags(&self) -> u16 {
+        self.info_u16(0x84).unwrap_or(0)
+    }
+
+    /// Returns the control flags, the `u16` at component info +0x86: 0x2057
+    /// for most controls (the project's UserControls, Winsock, Inet,
+    /// CommonDialog, MSComm, SysInfo, MMControl), 0x3057 for MaskEdBox,
+    /// RichTextBox, SSTab and the Common Controls, 0x2055 for ImageList
+    /// (`tests/fixtures/{activex,extender}` and 16 more classes measured).
+    ///
+    /// Bits whose cause is measured in VB6.EXE: 0x0100, a property typed
+    /// `OLE_OPTEXCLUSIVE` (0x4da547); 0x0800, a `DataSource` property (typed
+    /// `DataSource` or `ICursor`, 0x48f9c7). Bits whose effect is measured
+    /// in the runtime (MSVBVM60 6.00.8176): 0x0080 registers the class
+    /// through a separate path (0x6602b84c) and keeps two extender members
+    /// (0x660b5f8e); 0x1000 keeps one more extender member (0x660b5fd6).
+    /// What sets 0x0080 and 0x1000 is not measured: 0x0080 is clear in
+    /// every class measured, 0x1000 does not follow the type library.
+    pub fn control_flags(&self) -> u16 {
+        self.info_u16(0x86).unwrap_or(0)
+    }
+
+    /// Returns the number of [`bindable_properties`](Self::bindable_properties),
+    /// the u16 at component info +0x92.
+    pub fn bindable_count(&self) -> u16 {
+        self.info_u16(0x92).unwrap_or(0)
+    }
+
+    /// Returns the control's data-bindable properties: the 0x18-byte
+    /// records at the self-relative offset at +0x18, their names following
+    /// them one after another (`activex` MaskEdBox: `Text`, `BackColor`,
+    /// `ForeColor`, `Enabled`, `BorderStyle`; a control with none has no
+    /// records).
+    pub fn bindable_properties(&self) -> Vec<BindableProperty<'a>> {
+        let Some(start) = self.offset_at(0x18) else {
             return Vec::new();
         };
-        if names_start >= self.bytes.len() {
+        let count = usize::from(self.bindable_count());
+        let Some(mut name_at) = count
+            .checked_mul(Self::BINDABLE_RECORD_SIZE)
+            .and_then(|size| size.checked_add(start))
+        else {
             return Vec::new();
-        }
-        let mut names = Vec::with_capacity(count);
-        let mut pos = names_start;
-        for _ in 0..count {
-            let Ok(name) = read_cstr(self.bytes, pos) else {
+        };
+        let mut properties = Vec::with_capacity(count);
+        for k in 0..count {
+            let Some(record) = k
+                .checked_mul(Self::BINDABLE_RECORD_SIZE)
+                .and_then(|offset| offset.checked_add(start))
+            else {
                 break;
             };
-            let s = str::from_utf8(name).unwrap_or("?");
-            names.push(s);
-            let Some(next) = pos.checked_add(name.len()).and_then(|p| p.checked_add(1)) else {
+            let (Ok(dispid), Ok(flags), Ok(vartype), Ok(name)) = (
+                read_i32_le(self.bytes, record),
+                read_u32_le(self.bytes, record.saturating_add(0x04)),
+                read_u16_le(self.bytes, record.saturating_add(0x0C)),
+                read_cstr(self.bytes, name_at),
+            ) else {
                 break;
             };
-            pos = next;
-            if pos >= self.bytes.len() {
-                break;
-            }
+            properties.push(BindableProperty {
+                dispid,
+                flags,
+                vartype,
+                name: str::from_utf8(name).unwrap_or("?"),
+            });
+            name_at = name_at.saturating_add(name.len()).saturating_add(1);
         }
-        names
+        properties
     }
 
     /// Resolves a self-relative offset to a null-terminated string.
@@ -1163,12 +1427,125 @@ impl fmt::Display for ExternalComponentEntry<'_> {
         let filename = self.ocx_filename();
         let class = self.class_name();
         write!(f, "{filename}!{class}")?;
-        let ec = self.event_count();
-        if ec > 0 {
-            write!(f, " ({ec} events)")?;
+        let events = self.declared_event_count();
+        if events > 0 {
+            write!(f, " ({events} events)")?;
         }
         Ok(())
     }
+}
+
+/// A parameter of a hosted control's event that the runtime converts before
+/// calling the host's handler ([`ExternalComponentEntry::event_conversions`]):
+/// a dword of the list at the component's +0x08 (`u16` parameter index, a
+/// by-reference byte, a [`ConversionKind`] byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamConversion {
+    /// The parameter's index, 0 for the first.
+    pub param: u16,
+    /// `true` if the parameter is passed by reference.
+    pub by_ref: bool,
+    /// What the runtime does with it.
+    pub kind: ConversionKind,
+}
+
+/// The conversion of a [`ParamConversion`], the compiler's kind byte
+/// (VB6.EXE's table at 0x59eb64; `tests/fixtures/extender` `Coords`, one
+/// event per type).
+///
+/// A by-value `Variant` parameter (kind 1) reaches the handler as the
+/// VARIANT itself. A by-value stdole coordinate (kinds 2-9) is converted to
+/// a Single in the container's scale, and the host's handler declares it
+/// `Single`; `OLE_*_CONTAINER` types and by-reference parameters are not
+/// converted and keep their declared types.
+///
+/// The runtime (MSVBVM60 6.00.8176 0x66024f83, 6.00.9848 alike) tests kind
+/// 1 first, then calls entry `kind` of its converter table, whose
+/// converters fill entries 1-8 and leave 9 null: each kind runs the
+/// converter one place before its own. Measured with a host on a 15 twips
+/// per pixel display: 100 HIMETRIC becomes 56.69 for kinds 2-4 but 1500 for
+/// `OLE_YSIZE_HIMETRIC` (a pixel converter), 100 pixels becomes 1500 for
+/// kinds 6-8, and an event with a by-value `OLE_YSIZE_PIXELS` parameter
+/// crashes the host. No converter offsets a position by the container's
+/// ScaleLeft / ScaleTop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversionKind {
+    /// 1: a by-value `Variant`, passed as the VARIANT.
+    Variant,
+    /// 2: `OLE_XPOS_HIMETRIC`.
+    XPosHimetric,
+    /// 3: `OLE_YPOS_HIMETRIC`.
+    YPosHimetric,
+    /// 4: `OLE_XSIZE_HIMETRIC`.
+    XSizeHimetric,
+    /// 5: `OLE_YSIZE_HIMETRIC`.
+    YSizeHimetric,
+    /// 6: `OLE_XPOS_PIXELS`.
+    XPosPixels,
+    /// 7: `OLE_YPOS_PIXELS`.
+    YPosPixels,
+    /// 8: `OLE_XSIZE_PIXELS`.
+    XSizePixels,
+    /// 9: `OLE_YSIZE_PIXELS`.
+    YSizePixels,
+    /// Any other byte.
+    Other(u8),
+}
+
+impl ConversionKind {
+    /// Decodes the kind byte.
+    pub fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::Variant,
+            2 => Self::XPosHimetric,
+            3 => Self::YPosHimetric,
+            4 => Self::XSizeHimetric,
+            5 => Self::YSizeHimetric,
+            6 => Self::XPosPixels,
+            7 => Self::YPosPixels,
+            8 => Self::XSizePixels,
+            9 => Self::YSizePixels,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Returns the stdole type the kind stands for (`"OLE_XPOS_PIXELS"`),
+    /// `None` for [`Variant`](Self::Variant) and [`Other`](Self::Other).
+    pub fn stdole_type(self) -> Option<&'static str> {
+        match self {
+            Self::XPosHimetric => Some("OLE_XPOS_HIMETRIC"),
+            Self::YPosHimetric => Some("OLE_YPOS_HIMETRIC"),
+            Self::XSizeHimetric => Some("OLE_XSIZE_HIMETRIC"),
+            Self::YSizeHimetric => Some("OLE_YSIZE_HIMETRIC"),
+            Self::XPosPixels => Some("OLE_XPOS_PIXELS"),
+            Self::YPosPixels => Some("OLE_YPOS_PIXELS"),
+            Self::XSizePixels => Some("OLE_XSIZE_PIXELS"),
+            Self::YSizePixels => Some("OLE_YSIZE_PIXELS"),
+            Self::Variant | Self::Other(_) => None,
+        }
+    }
+}
+
+/// A data-bindable property of a hosted control
+/// ([`ExternalComponentEntry::bindable_properties`]): a 0x18-byte record and
+/// its name.
+///
+/// ```text
+/// +0x00  i32  dispid   the property's DISPID (MaskEdBox Text 22, BackColor -501)
+/// +0x04  u32  flags    6 for the default-bound property, 0 for the others
+/// +0x0C  u16  vartype  its VARTYPE (8 BSTR, 0x0B Boolean, 0x1D OLE_COLOR)
+/// +0x10  u32  name     filled in by the runtime (MSVBVM60 6.00.8176, 0x6602dc47)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindableProperty<'a> {
+    /// The property's DISPID.
+    pub dispid: i32,
+    /// The record's flags: 6 for the property bound by default.
+    pub flags: u32,
+    /// The property's VARTYPE.
+    pub vartype: u16,
+    /// The property's name.
+    pub name: &'a str,
 }
 
 /// Iterator over variable-length external component entries.

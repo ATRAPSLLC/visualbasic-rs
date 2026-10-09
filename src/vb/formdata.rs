@@ -8,14 +8,24 @@
 //!
 //! ```text
 //! [FormDataHeader]              - magic 0xCCFF, GUIDs, dimensions
-//! [form property stream]        - opcode+value pairs, terminated by 0xFF
-//! [hierarchy markers + child control records]
-//!   0x01 [first child record]   - NEW marker
-//!   0x03 [sibling record]       - SIB marker
-//!   0x02                        - END marker
-//! [0x05 menu section]           - optional
-//! [0x04 form end]
+//! [designer record]             - control id 0, name, cType, properties, 0xFF
+//! [controls]                    - optional
+//!   0x01 [record]               - opens a level with its first record
+//!   0x03 [record]               - the next record at the level
+//!   0x02                        - closes the level
+//! [menus]                       - optional
+//!   0x05 [record]               - opens the menu list with its first record
+//!   0x02 [record]               - each further menu record
+//!   0x03                        - closes a level
+//! 0x04                          - form end
 //! ```
+//!
+//! A control record is followed by `0x01` when it contains controls (a
+//! Frame, a PictureBox). A menu record with items carries its table entry
+//! 7 ([`FormControlRecord::has_submenu`]) and its items follow it, each
+//! after `0x02`, until the `0x03` that closes its level; the last `0x03`
+//! closes the menu list. A tree `Top1 { A1, A2 { B1 } }, Top2` is
+//! `05 Top1 02 A1 02 A2 02 B1 03 03 02 Top2 03 04` (`tests/fixtures/props`).
 //!
 //! # Control Type Authority
 //!
@@ -23,8 +33,6 @@
 //! type identifier. The GUID in [`ControlInfo`](crate::vb::control::ControlInfo)
 //! may contain IID variants that produce incorrect fuzzy matches (verified:
 //! 8 of 12 controls misidentified by GUID in the vb_inject malware sample).
-//!
-//! See `data/vb6_form_format.md` for the complete format specification.
 
 use std::{borrow::Cow, fmt};
 
@@ -46,8 +54,8 @@ pub const FORM_DATA_VERSION: u16 = 0x0031;
 /// This is the **authoritative** control type identifier, more reliable
 /// than GUID-based identification (which fails for malware samples).
 ///
-/// The type codes are indices into the VB6 compiler's control lookup
-/// table at `data_456C50` (from `sub_40F1AF` in VB6.EXE).
+/// The type codes are indices into the VB6 compiler's table of intrinsic
+/// controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormControlType {
     /// PictureBox control (type 0).
@@ -276,13 +284,15 @@ impl fmt::Display for FormControlType {
 pub enum FormMarker {
     /// `0x01`: First child in a container group.
     NewChild,
-    /// `0x02`: End of current child group.
+    /// `0x02`: End of current child group; in the menu section, the
+    /// marker before each menu record after the first.
     EndChildren,
-    /// `0x03`: Next sibling at same level.
+    /// `0x03`: Next sibling at same level; in the menu section, the end of
+    /// a menu level.
     Sibling,
     /// `0x04`: End of entire form data.
     FormEnd,
-    /// `0x05`: Menu section begins.
+    /// `0x05`: Menu section begins, with its first record.
     MenuStart,
 }
 
@@ -308,10 +318,10 @@ impl FormMarker {
 /// |--------|------|-------|
 /// | 0x00 | 2 | Magic (0xCCFF) |
 /// | 0x02 | 2 | Version (0x0031) |
-/// | 0x04 | 1 | Site count / flags |
-/// | 0x05 | 16 | Form's own GUI GUID |
-/// | 0x15 | 16 | Secondary GUID |
-/// | 0x25 | 16 | Default control GUID |
+/// | 0x04 | 1 | Number of named controls: the highest control index (Board 4, Gauge 1, Form1 2, Host 1, Dial 0 in `tests/fixtures`) |
+/// | 0x05 | 16 | Form's own GUI GUID (the GUI table entry's) |
+/// | 0x15 | 16 | The object's own full interface IID: built-in designer interface, 256 control getters, then the object's members |
+/// | 0x25 | 16 | The designer's events IID (`FormEvents` `{33AD4F3A-...}`, `UserControlEvents` `{33AD5012-...}`) |
 /// | 0x35 | 36 | Reserved (zeros) |
 /// | 0x59 | 4 | Form width (twips) |
 /// | 0x5D | 4 | Form height (twips) |
@@ -368,7 +378,13 @@ impl<'a> FormDataHeader<'a> {
         Guid::from_bytes(self.bytes.get(0x05..0x15)?)
     }
 
-    /// Secondary GUID at offset 0x15 (16 bytes).
+    /// The object's own interface IID at offset 0x15 (16 bytes).
+    ///
+    /// The interface whose vtable is the built-in designer interface
+    /// (`_Form`, 0x2F8 bytes; `_UserControl`, 0x3A4), 256 control getters,
+    /// then the object's own members. `VCallHresult` names it for members of
+    /// that vtable (`Me.Caption`, `f.Show`): `{80E4A9D0-...}` (Board) and
+    /// `{0D54F9E0-...}` (Gauge) in `tests/fixtures/forms`.
     pub fn secondary_guid(&self) -> Option<Guid> {
         let data = self.bytes.get(0x15..0x25)?;
         if data.iter().all(|&b| b == 0) {
@@ -377,7 +393,10 @@ impl<'a> FormDataHeader<'a> {
         Guid::from_bytes(data)
     }
 
-    /// Default control GUID at offset 0x25 (16 bytes).
+    /// The designer's events IID at offset 0x25 (16 bytes): `FormEvents`
+    /// `{33AD4F3A-...}` for a form, `UserControlEvents` `{33AD5012-...}` for
+    /// a UserControl, the GUID the object's own ControlInfo (index 0xFFFF)
+    /// also names.
     pub fn default_control_guid(&self) -> Option<Guid> {
         Guid::from_bytes(self.bytes.get(0x25..0x35)?)
     }
@@ -535,6 +554,14 @@ impl<'a> FormControlRecord<'a> {
         })
     }
 
+    /// Returns `true` if this is a menu record with a submenu: its
+    /// properties include table entry 7, which the compiler writes on
+    /// exactly the menus that have items, and the item records follow it
+    /// in the menu section.
+    pub fn has_submenu(&self) -> bool {
+        self.ctype == FormControlType::Menu && self.properties().any(|p| p.index == 7)
+    }
+
     /// Control ID (links to [`ControlInfo::index`](crate::vb::control::ControlInfo::index)).
     #[inline]
     pub fn cid(&self) -> u8 {
@@ -630,8 +657,25 @@ pub struct FormDataParser<'a> {
     controls: Vec<FormControlRecord<'a>>,
     /// Raw form data bytes.
     data: &'a [u8],
-    /// Form-level property stream (between header and first child marker).
+    /// The designer object's name, from its own record.
+    form_name: &'a [u8],
+    /// The designer's control type, from its own record.
+    form_type: FormControlType,
+    /// Form-level property stream (after the object's own record header, up
+    /// to the first child marker).
     form_properties: &'a [u8],
+}
+
+/// The designer object's own record, decoded to its terminator.
+struct FormRecord<'a> {
+    /// The designer's name.
+    name: &'a [u8],
+    /// The designer's control type.
+    ctype: FormControlType,
+    /// Its property stream, without the terminator.
+    properties: &'a [u8],
+    /// The offset of the first hierarchy marker after the terminator.
+    markers: usize,
 }
 
 impl<'a> FormDataParser<'a> {
@@ -642,15 +686,68 @@ impl<'a> FormDataParser<'a> {
     /// and can be reconstructed from the marker sequence.
     pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
         let header = FormDataHeader::parse(data)?;
-        let form_properties = Self::extract_form_properties(data);
-        let controls = Self::parse_controls(data)?;
+        let (form_name, form_type, form_properties, markers) = match Self::split_form(data) {
+            Some(form) => (form.name, form.ctype, form.properties, Some(form.markers)),
+            None => {
+                let (name, ctype, properties) =
+                    Self::split_form_record(Self::extract_form_properties(data));
+                (name, ctype, properties, None)
+            }
+        };
+        let controls = Self::parse_controls(data, markers);
 
         Ok(Self {
             header,
             controls,
             data,
+            form_name,
+            form_type,
             form_properties,
         })
+    }
+
+    /// Splits the designer object's own record (see
+    /// [`split_form_record`](Self::split_form_record)) and decodes its
+    /// properties to their `0xFF` terminator. `None` if the record does not have that shape or a property does
+    /// not decode.
+    fn split_form(data: &'a [u8]) -> Option<FormRecord<'a>> {
+        let record = data.get(FormDataHeader::MIN_SIZE..)?;
+        let (name, ctype, properties) = Self::split_form_record(record);
+        if matches!(ctype, FormControlType::Unknown(_)) {
+            return None;
+        }
+        let mut iter = PropertyIter::new(properties, ctype);
+        iter.by_ref().for_each(drop);
+        if !iter.at_terminator() {
+            return None;
+        }
+        let end = iter.position();
+        let start = data.len().checked_sub(properties.len())?;
+        Some(FormRecord {
+            name,
+            ctype,
+            properties: properties.get(..end)?,
+            markers: start.checked_add(end)?.checked_add(1)?,
+        })
+    }
+
+    /// Splits the designer object's own record, which has a control
+    /// record's layout without the size: control id 0, the name (`u16`
+    /// length, the bytes, a NUL), the cType byte, then the properties. A
+    /// record that does not have that shape is left whole, with an unknown
+    /// type.
+    fn split_form_record(record: &'a [u8]) -> (&'a [u8], FormControlType, &'a [u8]) {
+        let split = || {
+            let (&0, rest) = record.split_first()? else {
+                return None;
+            };
+            let length = usize::from(read_u16_le(rest, 0).ok()?);
+            let name = rest.get(2..length.checked_add(2)?)?;
+            let after = rest.get(length.checked_add(3)?..)?;
+            let (&ctype, properties) = after.split_first()?;
+            Some((name, FormControlType::from_u8(ctype), properties))
+        };
+        split().unwrap_or((&[], FormControlType::Unknown(0), record))
     }
 
     /// Returns the form data header.
@@ -671,22 +768,33 @@ impl<'a> FormDataParser<'a> {
         self.data
     }
 
-    /// Returns the form-level property stream bytes.
-    ///
-    /// This is the property stream between the header and the first child
-    /// marker (or form end). Contains the form's own properties like Name,
-    /// Caption, BackColor, Font, Icon, etc.
+    /// Returns the designer object's name as a lossy UTF-8 string, from its
+    /// own record (empty if the record could not be read).
+    pub fn form_name(&self) -> Cow<'a, str> {
+        String::from_utf8_lossy(self.form_name)
+    }
+
+    /// Returns the designer's control type from its own record's cType
+    /// byte: [`FormControlType::Form`] (13, also an MDI child form),
+    /// `MDIForm` (20), `UserControl` (40), `PropertyPage` (41),
+    /// `UserDocument` (42) (`tests/fixtures/{forms,mdi,ocx,docs}`).
+    #[inline]
+    pub fn form_type(&self) -> FormControlType {
+        self.form_type
+    }
+
+    /// Returns the form-level property stream bytes: the designer object's
+    /// own properties (Caption, BackColor, Font, Icon, ...) after its name
+    /// and type, up to the first child marker (or form end).
     #[inline]
     pub fn form_properties(&self) -> &'a [u8] {
         self.form_properties
     }
 
-    /// Decodes the form-level property stream into an iterator of named values.
-    ///
-    /// `form_type` should be determined by [`decode_form_type`](crate::vb::property::decode_form_type) to handle
-    /// OCX files where GUI entry types don't match actual form content.
-    pub fn form_properties_decoded(&self, form_type: FormControlType) -> PropertyIter<'a> {
-        PropertyIter::new(self.form_properties, form_type)
+    /// Decodes the form-level property stream with the property table of
+    /// the designer's own type ([`form_type`](Self::form_type)).
+    pub fn form_properties_decoded(&self) -> PropertyIter<'a> {
+        PropertyIter::new(self.form_properties, self.form_type)
     }
 
     /// Finds a control record by cId.
@@ -736,127 +844,137 @@ impl<'a> FormDataParser<'a> {
         data.get(start..end).unwrap_or(&[])
     }
 
-    /// Walks the form data after the header, finding child control records.
-    fn parse_controls(data: &'a [u8]) -> Result<Vec<FormControlRecord<'a>>, Error> {
+    /// Walks the hierarchy markers and records after the designer's own
+    /// record: from `markers` (the offset of the first marker), or, when
+    /// the designer's properties did not decode to their terminator, from
+    /// the first `0xFF` followed by a plausible marker and record.
+    ///
+    /// Controls: `0x01` opens a level with its first record, `0x03` is the
+    /// next record at the level, `0x02` closes the level. Menus, after the
+    /// controls: `0x05` opens the menu list with its first record, `0x02`
+    /// precedes each further record, and `0x03` closes a level; a menu
+    /// record with a submenu ([`FormControlRecord::has_submenu`]) opens the
+    /// level its items follow in. `0x04` ends the form.
+    fn parse_controls(data: &'a [u8], markers: Option<usize>) -> Vec<FormControlRecord<'a>> {
         let mut controls = Vec::new();
-
-        // Find the first valid child marker by scanning for 0xFF followed
-        // by a NEW (0x01) or FORM_END (0x04) marker, then validating
-        // the record structure (reasonable size field).
-        let mut pos = FormDataHeader::MIN_SIZE;
-        let start = loop {
-            if pos.saturating_add(6) >= data.len() {
-                return Ok(controls); // no children found
+        let Some(mut pos) = markers.or_else(|| Self::scan_for_markers(data)) else {
+            return controls;
+        };
+        let mut depth: u16 = 0;
+        let mut parent_stack: Vec<usize> = Vec::new();
+        // Inside the menu section: the open submenus, innermost last.
+        let mut menus: Option<Vec<usize>> = None;
+        while let Some(&byte) = data.get(pos) {
+            pos = pos.saturating_add(1);
+            let in_menus = menus.is_some();
+            let (depth_of_record, parent) = match (in_menus, byte) {
+                (_, 0x04) => break,
+                (false, 0x02) => {
+                    depth = depth.saturating_sub(1);
+                    parent_stack.truncate(usize::from(depth));
+                    continue;
+                }
+                (true, 0x03) => {
+                    let open = menus.as_mut().and_then(Vec::pop);
+                    if open.is_none() {
+                        menus = None;
+                    }
+                    continue;
+                }
+                (false, 0x01) => {
+                    let level = usize::from(depth);
+                    (
+                        depth,
+                        level
+                            .checked_sub(1)
+                            .and_then(|l| parent_stack.get(l).copied()),
+                    )
+                }
+                (false, 0x03) => {
+                    let record_depth = depth.saturating_sub(1);
+                    let level = usize::from(record_depth);
+                    (
+                        record_depth,
+                        level
+                            .checked_sub(1)
+                            .and_then(|l| parent_stack.get(l).copied()),
+                    )
+                }
+                (false, 0x05) => {
+                    menus = Some(Vec::new());
+                    (0, None)
+                }
+                (true, 0x02) => {
+                    let open = menus.as_deref().unwrap_or_default();
+                    (
+                        u16::try_from(open.len()).unwrap_or(u16::MAX),
+                        open.last().copied(),
+                    )
+                }
+                _ => break,
+            };
+            let Some((mut record, end)) = Self::read_record(data, pos) else {
+                break;
+            };
+            pos = end;
+            record.depth = depth_of_record;
+            record.parent_index = parent;
+            let index = controls.len();
+            if let Some(open) = menus.as_mut() {
+                if record.has_submenu() {
+                    open.push(index);
+                }
+            } else {
+                let level = usize::from(depth_of_record);
+                parent_stack.truncate(level);
+                parent_stack.push(index);
+                if byte == 0x01 {
+                    depth = depth.saturating_add(1);
+                }
             }
+            controls.push(record);
+        }
+        controls
+    }
+
+    /// Reads the record whose size field is at `pos`: the record, with its
+    /// offsets in the blob set, and the offset after it.
+    fn read_record(data: &'a [u8], pos: usize) -> Option<(FormControlRecord<'a>, usize)> {
+        let size = usize::try_from(read_u32_le(data, pos).ok()? & 0x7FFF_FFFF).ok()?;
+        let end = pos.checked_add(size).filter(|&end| end <= data.len())?;
+        if size < 8 {
+            return None;
+        }
+        let mut record = FormControlRecord::parse(data.get(pos..)?).ok()?;
+        let at = u32::try_from(pos).ok()?;
+        record.offset_in_blob = at;
+        record.properties_offset_in_blob = record.properties_offset_in_blob.checked_add(at)?;
+        Some((record, end))
+    }
+
+    /// Finds the first marker after the designer's record by scanning for
+    /// `0xFF` followed by `0x01` or `0x05` and a record of plausible size
+    /// (8 to 5000 bytes), or by `0x04` (no controls).
+    fn scan_for_markers(data: &[u8]) -> Option<usize> {
+        let mut pos = FormDataHeader::MIN_SIZE;
+        while pos.saturating_add(6) < data.len() {
             let cur = data.get(pos).copied().unwrap_or(0);
             let next = data.get(pos.saturating_add(1)).copied().unwrap_or(0);
-            if cur == 0xFF && next == 0x01 {
-                // Validate: a NEW marker should be followed by a record
-                // with a reasonable size (8..5000 bytes)
+            if cur == 0xFF && matches!(next, 0x01 | 0x05) {
                 let size = read_u32_le(data, pos.saturating_add(2))
-                    .map(|v| v & 0x7FFFFFFF)
+                    .map(|v| v & 0x7FFF_FFFF)
                     .unwrap_or(0);
                 let end_check = (size as usize).saturating_add(pos.saturating_add(2));
                 if (8..5000).contains(&size) && end_check <= data.len() {
-                    break pos.saturating_add(1); // skip the 0xFF, start at marker
+                    return Some(pos.saturating_add(1));
                 }
             }
             if cur == 0xFF && next == 0x04 {
-                return Ok(controls); // form end, no children
+                return None;
             }
             pos = pos.saturating_add(1);
-        };
-
-        // Now walk the marker sequence, tracking nesting depth
-        pos = start;
-        let mut depth: u16 = 0;
-        let mut parent_stack: Vec<usize> = Vec::new();
-        while pos < data.len() {
-            let cur_byte = match data.get(pos).copied() {
-                Some(b) => b,
-                None => break,
-            };
-            let marker = match FormMarker::from_byte(cur_byte) {
-                Some(m) => m,
-                None => break,
-            };
-            pos = pos.saturating_add(1); // skip marker byte
-
-            match marker {
-                FormMarker::FormEnd => break,
-                FormMarker::NewChild => {
-                    if pos.saturating_add(4) > data.len() {
-                        break;
-                    }
-                    let size = read_u32_le(data, pos).map(|v| v & 0x7FFFFFFF).unwrap_or(0);
-                    let size_usize = size as usize;
-                    let end = match pos.checked_add(size_usize) {
-                        Some(e) if e <= data.len() => e,
-                        _ => break,
-                    };
-                    if size < 8 {
-                        break;
-                    }
-                    if let Some(slice) = data.get(pos..)
-                        && let Ok(mut record) = FormControlRecord::parse(slice)
-                    {
-                        record.depth = depth;
-                        let level = depth as usize;
-                        record.parent_index = level
-                            .checked_sub(1)
-                            .and_then(|parent_level| parent_stack.get(parent_level).copied());
-                        record.offset_in_blob = pos as u32;
-                        record.properties_offset_in_blob =
-                            record.properties_offset_in_blob.wrapping_add(pos as u32);
-                        let record_index = controls.len();
-                        parent_stack.truncate(level);
-                        parent_stack.push(record_index);
-                        controls.push(record);
-                    }
-                    pos = end;
-                    // NEW marker opens a new nesting level for subsequent children
-                    depth = depth.saturating_add(1);
-                }
-                FormMarker::Sibling | FormMarker::MenuStart => {
-                    if pos.saturating_add(4) > data.len() {
-                        break;
-                    }
-                    let size = read_u32_le(data, pos).map(|v| v & 0x7FFFFFFF).unwrap_or(0);
-                    let size_usize = size as usize;
-                    let end = match pos.checked_add(size_usize) {
-                        Some(e) if e <= data.len() => e,
-                        _ => break,
-                    };
-                    if size < 8 {
-                        break;
-                    }
-                    if let Some(slice) = data.get(pos..)
-                        && let Ok(mut record) = FormControlRecord::parse(slice)
-                    {
-                        let record_depth = depth.saturating_sub(1);
-                        record.depth = record_depth;
-                        let level = record_depth as usize;
-                        record.parent_index = level
-                            .checked_sub(1)
-                            .and_then(|parent_level| parent_stack.get(parent_level).copied());
-                        record.offset_in_blob = pos as u32;
-                        record.properties_offset_in_blob =
-                            record.properties_offset_in_blob.wrapping_add(pos as u32);
-                        let record_index = controls.len();
-                        parent_stack.truncate(level);
-                        parent_stack.push(record_index);
-                        controls.push(record);
-                    }
-                    pos = end;
-                }
-                FormMarker::EndChildren => {
-                    depth = depth.saturating_sub(1);
-                    parent_stack.truncate(depth as usize);
-                }
-            }
         }
-
-        Ok(controls)
+        None
     }
 }
 

@@ -50,11 +50,15 @@ for obj in project.objects()? {
 - **PE entry point** detection (EXE push-stub and DLL export patterns)
 - **VBHeader**, **ProjectData**, **ObjectTable** and the full structure chain
 - **PublicObjectDescriptor**, **ObjectInfo**, **OptionalObjectInfo**, **PrivateObjectDescriptor**
-- **P-Code bytecode**: opcode tables, operand decoding, streaming instruction iterator
+- **P-Code bytecode**: opcode tables, operand decoding, streaming instruction
+  iterator; each opcode's effect on the evaluation and x87 stacks and on Pr,
+  the object register, read from the runtime's handlers
 - **Controls**: ControlInfo, event sink vtables, event handler thunks
 - **COM metadata**: GUIDs, TypeLib registration, external component tables
 - **Form binary data**: control trees, property streams, font/picture resources
-- **MSVBVM60.DLL exports**: 169 runtime function signatures with parameter types
+- **MSVBVM60.DLL exports**: every export by name and ordinal, with signatures
+  for most, so the runtime functions P-Code imports by ordinal are named
+- **Imports**: the PE import table by import address table slot
 
 ## High-level walkers
 
@@ -72,6 +76,56 @@ each substructure by hand:
   `Mixed` binaries (combines the project flag with a per-object scan).
 - [`VbProject::diagnostics()`] - eager parse-health probe surfacing
   missing optional structures and known-anomaly patterns.
+
+## Analysing P-Code
+
+The `pcode` module documents the interpreter (dispatch, the two stacks, Pr,
+the frame, calling conventions) and describes each instruction's runtime
+effect, as the handlers of `MSVBVM60.DLL` implement it:
+
+```rust,no_run
+use visualbasic::{
+    VbProject,
+    pcode::{calltarget::CallResolver, decoder::Instruction, stacksim::ProcedureStack},
+    project::MethodEntry,
+};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let bytes = std::fs::read("sample.exe")?;
+let project = VbProject::from_bytes(&bytes)?;
+let calls = CallResolver::new(&project)?;
+for (object_index, object) in project.objects()?.enumerate() {
+    let object_index = u16::try_from(object_index)?;
+    for entry in object?.methods()? {
+        let Ok(MethodEntry::PCode(method)) = entry else { continue };
+        let code: Vec<Instruction> = method.instructions()?.collect::<Result<_, _>>()?;
+        // Each instruction's effect: values popped (last operand first, from
+        // both stacks), the value pushed, the receiver, Pr's source.
+        for insn in &code {
+            let effect = insn.stack_effect(calls.resolve(object_index, insn).as_ref());
+            println!("{insn}  {effect:?}");
+        }
+        // The stacks over the procedure's control flow, every value
+        // resolved to the width its producer pushed.
+        let stack = ProcedureStack::simulate(&code, method.pcode_bytes(), &|insn, pr| {
+            calls.resolve_with_pr(object_index, insn, pr)
+        });
+        for (index, cut) in stack.cuts() {
+            println!("path cut at {:04x}: {cut:?}", code[index].offset);
+        }
+    }
+}
+# Ok(())
+# }
+```
+
+- [`CallResolver`] gives each call's callee (a project procedure, a
+  `Declare` function, an imported runtime function, an external interface by
+  IID and vtable offset, a late-bound member) and signature.
+- [`FrameResolver`] names `%a` frame offsets: arguments, locals, the
+  interpreter's slots.
+- [`ConstantPool`] reads pool entries by the index `%s` / `%c` operands
+  carry.
 
 ## Cargo features
 

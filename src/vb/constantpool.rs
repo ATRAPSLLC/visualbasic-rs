@@ -1,29 +1,41 @@
 //! Constant pool reader.
 //!
-//! Each VB6 compilation unit (module, class, form) has its own constant pool,
-//! shared by all procedures in that unit. The pool contains:
+//! Each VB6 object (module, class, form) has one constant pool, shared by all
+//! its procedures: an array of 4-byte entries, each the VA of
 //!
-//! - **BSTR strings**: Length-prefixed little-endian Unicode strings
-//! - **API call stubs**: Native `push; jmp DllFunctionCall` thunks
-//! - **COM GUIDs**: CLSID/IID pairs
-//! - **Code object offsets**: Base addresses for code objects
+//! - a **BSTR** string literal (`LitStr`, `LitVarStr`, a late-bound member
+//!   name);
+//! - a **GUID**: the interface a `VCallHresult` reports a failure against;
+//! - an **ObjectInfo**: the class `New` creates;
+//! - a P-Code **procedure thunk** (`ImpAdCall*` to a module procedure or a
+//!   `Friend` method);
+//! - a **`Declare` stub** (`ImpAdCall*` to a declared DLL function);
+//! - an **import thunk** `jmp [IAT]` (`ImpAdCall*` to a runtime function
+//!   such as `rtcIsMissing`);
+//! - any other address: a global another module holds (`ImpAdLd*`), the
+//!   descriptor of an array `For Each` walks.
 //!
 //! # Addressing
 //!
-//! The constant pool base address comes from `ObjectInfo.lpConstants` (offset 0x34).
-//! P-Code operands with format `%s` (constant pool index) are resolved as:
+//! The pool's base comes from `ObjectInfo.lpConstants` (offset 0x34); the
+//! runtime keeps it at `[ebp-0x54]` while a procedure runs. A `%s` / `%c`
+//! operand is an entry **index**, which the handlers scale by 4:
 //!
 //! ```text
-//! effective_va = data_const_va + (index * 1)
+//! entry = *(u32 *)(lpConstants + 4 * index)
 //! ```
 //!
-//! The value at that effective address is itself a VA pointing to the actual
-//! data (a BSTR, a GUID, etc.). This double-indirection is critical:
-//! the pool entry is a **pointer**, not the data itself.
+//! The entry is a pointer, not the data itself. Which kind an entry is
+//! follows from the opcode that names it (`LitStr` reads a string,
+//! `VCallHresult` a GUID); [`ConstantPool::entry_at`] recognizes the kinds
+//! whose bytes say what they are, and the typed accessors
+//! ([`string_at`](ConstantPool::string_at),
+//! [`guid_at`](ConstantPool::guid_at), [`api_stub_at`](ConstantPool::api_stub_at))
+//! read an entry as the kind its opcode implies.
 //!
 //! # BSTR Format
 //!
-//! VB6 uses COM BSTRs (Basic Strings):
+//! VB6 stores its string constants as COM BSTRs:
 //! - 4 bytes **before** the string pointer: length in bytes (not characters)
 //! - Followed by the UTF-16LE string data
 //! - Followed by a null terminator (2 bytes, `\0\0`)
@@ -33,28 +45,56 @@
 use crate::{
     addressmap::AddressMap,
     error::Error,
-    util::{read_cstr, read_u32_le},
+    util::read_u32_le,
     vb::{
         bstr::BStr,
+        control::Guid,
         external::{CallApiStub, resolve_api_stub},
+        object::ObjectInfo,
     },
 };
 
-/// Resolved content of a constant pool entry.
+/// A constant pool entry, by what its bytes say it is.
+///
+/// Returned by [`ConstantPool::entry_at`]. Entries whose bytes do not
+/// identify them - a GUID, a global's address - are
+/// [`Address`](PoolEntry::Address); the opcode naming the entry says which.
 #[derive(Debug)]
-pub enum ConstPoolEntry<'a> {
-    /// BSTR string literal.
-    BStr(BStr<'a>),
-    /// Null entry (VA was 0).
+pub enum PoolEntry<'a> {
+    /// The entry is 0.
     Null,
-    /// Non-string VA that couldn't be classified as BSTR.
-    /// May be an API stub, COM GUID, or other data.
-    RawVa(u32),
+    /// A non-empty BSTR string literal.
+    String(BStr<'a>),
+    /// A P-Code procedure's thunk (`ImpAdCall*` to a module procedure or a
+    /// `Friend` method): the VA of the procedure's ProcDscInfo.
+    Procedure {
+        /// VA of the procedure's ProcDscInfo.
+        proc_dsc_va: u32,
+    },
+    /// A `Declare` function's call stub.
+    Declare(CallApiStub<'a>),
+    /// An import thunk, `jmp [iat_va]` (`FF 25 <iat_va>`): a function the
+    /// executable imports, usually from the VB runtime.
+    Import {
+        /// VA of the import address table slot.
+        iat_va: u32,
+    },
+    /// An object's ObjectInfo, the class `New` creates: its
+    /// `lpPublicObject` descriptor points back to it.
+    ObjectInfo {
+        /// VA of the ObjectInfo.
+        va: u32,
+        /// The object's index in the project's object table.
+        object_index: u16,
+    },
+    /// Any other address.
+    Address(u32),
 }
 
 /// Reader for a VB6 constant pool.
 ///
-/// Provides methods to resolve pool indices to strings, API stubs, etc.
+/// Every accessor takes an entry **index**, the value of a `%s` / `%c`
+/// operand ([`Operand::ConstPoolIndex`](crate::pcode::operand::Operand::ConstPoolIndex)).
 ///
 /// # Lifetime
 ///
@@ -69,6 +109,10 @@ pub struct ConstantPool<'a> {
 }
 
 impl<'a> ConstantPool<'a> {
+    /// The longest member name [`name_at`](Self::name_at) reads, in UTF-16
+    /// code units.
+    pub const MAX_NAME_CHARS: usize = 1024;
+
     /// Creates a new constant pool reader.
     ///
     /// # Arguments
@@ -86,144 +130,166 @@ impl<'a> ConstantPool<'a> {
         self.data_const_va
     }
 
-    /// Reads a raw 4-byte value from the pool at the given byte offset.
-    ///
-    /// # Arguments
-    ///
-    /// * `offset` - Byte offset from `data_const_va`.
-    ///
-    /// # Returns
-    ///
-    /// The 32-bit value at `data_const_va + offset`.
+    /// Returns the VA entry `index` holds.
     ///
     /// # Errors
     ///
-    /// Returns an error if the VA cannot be resolved.
-    pub fn read_u32(&self, offset: u16) -> Result<u32, Error> {
-        let va = self.data_const_va.wrapping_add(u32::from(offset));
-        let data = self.map.slice_from_va(va, 4)?;
-        read_u32_le(data, 0)
+    /// Returns an address-translation error if the entry cannot be read.
+    pub fn va_at(&self, index: u16) -> Result<u32, Error> {
+        let va = self
+            .data_const_va
+            .wrapping_add(u32::from(index).wrapping_mul(4));
+        read_u32_le(self.map.slice_from_va(va, 4)?, 0)
     }
 
-    /// Reads a [`BStr`] from the pool at the given byte offset.
+    /// Returns the BSTR entry `index` points to (`LitStr`, `LitVarStr`, a
+    /// late-bound member name).
     ///
-    /// Resolves the pool entry at `data_const_va + offset` as a pointer
-    /// to a BSTR, then reads the length prefix and string data.
-    ///
-    /// # Arguments
-    ///
-    /// * `offset` - Byte offset into the constant pool.
+    /// Returns `Ok(None)` for a null entry and for an entry that is no BSTR:
+    /// its length prefix is odd or 64 KiB or more, or the two bytes after the
+    /// characters are not the null terminator.
     ///
     /// # Errors
     ///
-    /// Returns an error if any VA in the chain cannot be resolved.
-    pub fn read_bstr(&self, offset: u16) -> Result<BStr<'a>, Error> {
-        let bstr_va = self.read_u32(offset)?;
-        self.resolve_bstr_at_va(bstr_va)
-    }
-
-    /// Reads a BSTR and converts it to a Rust `String`.
-    ///
-    /// Convenience wrapper around [`read_bstr`](Self::read_bstr) that
-    /// decodes the UTF-16LE bytes. Invalid UTF-16 sequences are replaced
-    /// with U+FFFD.
-    pub fn read_bstr_as_string(&self, offset: u16) -> Result<String, Error> {
-        Ok(self.read_bstr(offset)?.to_string_lossy())
-    }
-
-    /// Returns the BSTR at constant-pool **entry index** `index`, if any.
-    ///
-    /// Each pool entry is a 4-byte VA pointer; this maps `index` → byte
-    /// offset `index * 4`, dereferences the pointer, and probes the target
-    /// for a valid BSTR length prefix.
-    ///
-    /// Returns `Ok(Some(bstr))` for valid string entries, `Ok(None)` for
-    /// null entries (`pool[index] == 0`) and entries that don't look like
-    /// BSTRs (likely API stubs, GUIDs, or code refs - try
-    /// [`api_stub_at`](Self::api_stub_at) for those). Returns `Err` only
-    /// when address translation fails.
-    ///
-    /// This is the typed accessor for the dominant `%s` operand-resolution
-    /// path: P-Code [`Operand::ConstPoolIndex`](crate::pcode::operand::Operand::ConstPoolIndex)
-    /// values map directly here.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::ArithmeticOverflow`] if `index * 4` would overflow `u16`.
-    /// - Address-translation errors propagated from
-    ///   [`AddressMap::slice_from_va`](crate::addressmap::AddressMap::slice_from_va).
+    /// Returns an address-translation error if the entry cannot be read.
     pub fn string_at(&self, index: u16) -> Result<Option<BStr<'a>>, Error> {
-        let offset = index_to_offset(index, "ConstantPool::string_at")?;
-        let va = self.read_u32(offset)?;
+        let va = self.va_at(index)?;
         if va == 0 {
             return Ok(None);
         }
-        Ok(self.try_parse_bstr(va))
+        Ok(self.bstr(va))
     }
 
-    /// Returns the [`CallApiStub`] at constant-pool **entry index** `index`,
-    /// if the entry resolves to a Declare-style API call stub.
+    /// Returns the member name entry `index` points to: a null-terminated
+    /// UTF-16 string with no length prefix, the form the late-bound opcodes
+    /// (`LateMem*`, and the names of a named call's arguments) pass to
+    /// `IDispatch::GetIDsOfNames`.
     ///
-    /// Each pool entry is a 4-byte VA pointer; this maps `index` → byte
-    /// offset `index * 4`, dereferences the pointer to a stub VA, and
-    /// parses the `push offset CallApiStruct; jmp DllFunctionCall`
-    /// pattern via [`resolve_api_stub`].
-    ///
-    /// Returns `Ok(Some(stub))` for entries whose target begins with the
-    /// `push imm32` (`0x68`) byte expected of API stubs, `Ok(None)` for
-    /// null entries and entries with non-stub leading bytes (BSTRs,
-    /// GUIDs, code refs). Returns `Err` only when address translation
-    /// fails.
+    /// Returns `Ok(None)` for a null entry and for one with no terminator in
+    /// the first [`MAX_NAME_CHARS`](Self::MAX_NAME_CHARS) characters.
     ///
     /// # Errors
     ///
-    /// - [`Error::ArithmeticOverflow`] if `index * 4` would overflow `u16`.
-    /// - Address-translation errors propagated from
-    ///   [`AddressMap::slice_from_va`](crate::addressmap::AddressMap::slice_from_va).
+    /// Returns an address-translation error if the entry cannot be read.
+    pub fn name_at(&self, index: u16) -> Result<Option<String>, Error> {
+        let va = self.va_at(index)?;
+        if va == 0 {
+            return Ok(None);
+        }
+        let Ok(data) = self.map.slice_from_va(va, 2) else {
+            return Ok(None);
+        };
+        let units: Vec<u16> = data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(Self::MAX_NAME_CHARS)
+            .map(|&pair| u16::from_le_bytes(pair))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        if units.len() >= Self::MAX_NAME_CHARS || units.len().saturating_mul(2) >= data.len() {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf16_lossy(&units)))
+    }
+
+    /// Returns the `Declare` stub entry `index` points to (`ImpAdCall*`).
+    ///
+    /// Returns `Ok(None)` for a null entry and for an entry that is no stub
+    /// (see [`resolve_api_stub`] for the forms recognized).
+    ///
+    /// # Errors
+    ///
+    /// Returns an address-translation error if the entry cannot be read.
     pub fn api_stub_at(&self, index: u16) -> Result<Option<CallApiStub<'a>>, Error> {
-        let offset = index_to_offset(index, "ConstantPool::api_stub_at")?;
-        let va = self.read_u32(offset)?;
+        let va = self.va_at(index)?;
         if va == 0 {
             return Ok(None);
         }
         Ok(resolve_api_stub(self.map, va).ok())
     }
 
-    /// Resolves a constant pool entry to its typed content.
+    /// Returns the GUID entry `index` points to: the interface of a
+    /// `VCallHresult` (`%v`'s second half).
     ///
-    /// Probes the target VA to classify the entry:
-    /// 1. VA == 0 → [`Null`](ConstPoolEntry::Null)
-    /// 2. VA-4 contains a plausible BSTR length (even, < 64KB) → [`BStr`](ConstPoolEntry::BStr)
-    /// 3. Otherwise → [`RawVa`](ConstPoolEntry::RawVa)
-    pub fn resolve(&self, offset: u16) -> Result<ConstPoolEntry<'a>, Error> {
-        let va = self.read_u32(offset)?;
+    /// Returns `Ok(None)` for a null entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an address-translation error if the entry or the 16 bytes it
+    /// points to cannot be read.
+    pub fn guid_at(&self, index: u16) -> Result<Option<Guid>, Error> {
+        let va = self.va_at(index)?;
         if va == 0 {
-            return Ok(ConstPoolEntry::Null);
+            return Ok(None);
         }
-
-        match self.try_parse_bstr(va) {
-            Some(bstr) => Ok(ConstPoolEntry::BStr(bstr)),
-            None => Ok(ConstPoolEntry::RawVa(va)),
-        }
+        let data = self.map.slice_from_va(va, 16)?;
+        Ok(Guid::from_bytes(data))
     }
 
-    /// Resolves a constant pool entry as a string, if it is a BSTR.
+    /// Classifies entry `index` by the bytes it points to.
     ///
-    /// Returns `Ok(Some(string))` for BSTR entries, `Ok(None)` for
-    /// non-string entries, and `Err` for VA resolution failures.
-    pub fn resolve_string(&self, offset: u16) -> Result<Option<String>, Error> {
-        match self.resolve(offset)? {
-            ConstPoolEntry::BStr(bstr) => Ok(Some(bstr.to_string_lossy())),
-            ConstPoolEntry::Null => Ok(Some(String::new())),
-            ConstPoolEntry::RawVa(_) => Ok(None),
+    /// Checked in this order:
+    ///
+    /// 1. a procedure thunk: `BA <ProcDscInfo> B9 <engine> FF E1`, or a
+    ///    `Friend` method's `B8 00000000 66 3D 33 C0 BA <ProcDscInfo> 68
+    ///    <engine> C3`;
+    /// 2. an import thunk `FF 25 <IAT slot>`;
+    /// 3. a `Declare` stub;
+    /// 4. an ObjectInfo whose descriptor (`+0x18`) points back to it;
+    /// 5. a non-empty BSTR;
+    /// 6. otherwise an [`Address`](PoolEntry::Address).
+    ///
+    /// # Errors
+    ///
+    /// Returns an address-translation error if the entry itself cannot be
+    /// read.
+    pub fn entry_at(&self, index: u16) -> Result<PoolEntry<'a>, Error> {
+        /// The `Friend` thunk's bytes before the ProcDscInfo VA.
+        const FRIEND_HEAD: [u8; 10] = [0xB8, 0, 0, 0, 0, 0x66, 0x3D, 0x33, 0xC0, 0xBA];
+
+        let va = self.va_at(index)?;
+        if va == 0 {
+            return Ok(PoolEntry::Null);
         }
+        if let Ok(code) = self.map.slice_from_va(va, 6) {
+            let at = |offset: usize| read_u32_le(code, offset).ok();
+            if code.first() == Some(&0xBA)
+                && code.get(5) == Some(&0xB9)
+                && code.get(10..12) == Some(&[0xFF, 0xE1])
+                && let Some(proc_dsc_va) = at(1)
+            {
+                return Ok(PoolEntry::Procedure { proc_dsc_va });
+            }
+            if code.get(..10) == Some(&FRIEND_HEAD[..])
+                && let Some(proc_dsc_va) = at(10)
+            {
+                return Ok(PoolEntry::Procedure { proc_dsc_va });
+            }
+            if code.get(..2) == Some(&[0xFF, 0x25])
+                && let Some(iat_va) = at(2)
+            {
+                return Ok(PoolEntry::Import { iat_va });
+            }
+        }
+        if let Ok(stub) = resolve_api_stub(self.map, va) {
+            return Ok(PoolEntry::Declare(stub));
+        }
+        if let Some(object_index) = self.object_info(va) {
+            return Ok(PoolEntry::ObjectInfo { va, object_index });
+        }
+        if let Some(bstr) = self.bstr(va)
+            && !bstr.is_empty()
+        {
+            return Ok(PoolEntry::String(bstr));
+        }
+        Ok(PoolEntry::Address(va))
     }
 
-    /// Returns an iterator over all constant pool entries.
+    /// Returns an iterator over the first `count` entries, classified by
+    /// [`entry_at`](Self::entry_at), with their indices.
     ///
-    /// Yields `(byte_offset, entry)` pairs for each of the `count` entries.
-    /// Each entry is at `data_const_va + offset` where offset advances by 4
-    /// bytes per entry (each entry is a 4-byte VA pointer).
+    /// `ObjectInfo.wConstantsCount` gives an object's entry count.
     pub fn entries(&self, count: u16) -> ConstPoolIter<'a> {
         ConstPoolIter {
             pool: self.clone(),
@@ -232,125 +298,40 @@ impl<'a> ConstantPool<'a> {
         }
     }
 
-    /// Reserved signature for the future type-hint-enriched entry iterator.
-    ///
-    /// Today this is a thin alias for [`entries`](Self::entries) - it yields
-    /// the same `ConstPoolEntry` items. The reserved name lets downstream
-    /// code reference the "rich" iterator now without breakage when the
-    /// hint-enriched implementation lands (planned: per-entry classification
-    /// of API stubs, GUIDs, code refs, and numeric literals beyond the
-    /// current BStr / RawVa / Null variants).
-    ///
-    /// # Stability
-    ///
-    /// The current return type is the same as [`entries`](Self::entries); once richer hints
-    /// are implemented, the item type will gain new variants but the method
-    /// signature will not break (additive enum extension).
-    #[inline]
-    pub fn entries_with_hints(&self, count: u16) -> ConstPoolIter<'a> {
-        self.entries(count)
+    /// Returns the index of the object whose ObjectInfo is at `va`, if `va`
+    /// holds one: its public object descriptor's first field points back.
+    fn object_info(&self, va: u32) -> Option<u16> {
+        let info = ObjectInfo::parse(self.map.slice_from_va(va, ObjectInfo::SIZE).ok()?).ok()?;
+        let descriptor = self
+            .map
+            .slice_from_va(info.public_object_va().ok()?, 4)
+            .ok()?;
+        (read_u32_le(descriptor, 0).ok()? == va)
+            .then(|| info.object_index().ok())
+            .flatten()
     }
 
-    /// Returns an iterator over only the BSTR entries in the constant pool.
-    ///
-    /// Filters out null entries and non-string VAs, yielding only valid,
-    /// non-empty BSTRs.
-    pub fn bstr_entries(&self, count: u16) -> impl Iterator<Item = BStr<'a>> {
-        self.entries(count).filter_map(|(_, r)| match r {
-            Ok(ConstPoolEntry::BStr(b)) if b.va() != 0 && !b.is_empty() => Some(b),
-            _ => None,
-        })
-    }
-
-    /// Attempts to parse a BSTR at the given VA.
-    ///
-    /// Returns `Some(BStr)` if the length prefix looks valid (even, < 64KB),
-    /// or `None` if it doesn't look like a BSTR.
-    fn try_parse_bstr(&self, va: u32) -> Option<BStr<'a>> {
-        let len_va = va.wrapping_sub(4);
-        let len_data = self.map.slice_from_va(len_va, 4).ok()?;
-        let byte_len = read_u32_le(len_data, 0).ok()?;
-
-        // Zero-length BSTR is valid
-        if byte_len == 0 {
-            return Some(BStr::new(va, 0, &[]));
-        }
-
-        // Plausible BSTR: even length, under 64KB
+    /// Reads the BSTR whose characters start at `va`, if the bytes there
+    /// are one: an even length prefix under 64 KiB, then the characters and
+    /// the null terminator.
+    fn bstr(&self, va: u32) -> Option<BStr<'a>> {
+        let byte_len = read_u32_le(self.map.slice_from_va(va.wrapping_sub(4), 4).ok()?, 0).ok()?;
         if byte_len >= 0x10000 || byte_len % 2 != 0 {
             return None;
         }
-
-        let str_data = self.map.slice_from_va(va, byte_len as usize).ok()?;
-        let bytes = str_data.get(..byte_len as usize)?;
-        Some(BStr::new(va, byte_len, bytes))
-    }
-
-    /// Resolves a raw VA as a [`BStr`], without going through the pool indirection.
-    ///
-    /// Use this when you already have the BSTR pointer value (e.g., from
-    /// reading a pool entry manually).
-    pub fn resolve_bstr_at_va(&self, bstr_va: u32) -> Result<BStr<'a>, Error> {
-        if bstr_va == 0 {
-            return Ok(BStr::empty());
+        let len = usize::try_from(byte_len).ok()?;
+        let data = self.map.slice_from_va(va, len.checked_add(2)?).ok()?;
+        if data.get(len..len.checked_add(2)?) != Some(&[0, 0]) {
+            return None;
         }
-
-        let len_va = bstr_va.wrapping_sub(4);
-        let len_data = self.map.slice_from_va(len_va, 4)?;
-        let byte_len = read_u32_le(len_data, 0)?;
-
-        if byte_len == 0 {
-            return Ok(BStr::new(bstr_va, 0, &[]));
-        }
-
-        let str_data = self.map.slice_from_va(bstr_va, byte_len as usize)?;
-        let bytes = str_data.get(..byte_len as usize).ok_or(Error::TooShort {
-            expected: byte_len as usize,
-            actual: str_data.len(),
-            context: "BSTR data",
-        })?;
-        Ok(BStr::new(bstr_va, byte_len, bytes))
-    }
-
-    /// Reads a null-terminated ANSI string from a pool-referenced VA.
-    ///
-    /// The pool entry at `data_const_va + offset` is a VA pointing to
-    /// a null-terminated ANSI (single-byte) string.
-    ///
-    /// # Arguments
-    ///
-    /// * `offset` - Byte offset into the constant pool.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the VA cannot be resolved.
-    pub fn read_ansi_string(&self, offset: u16) -> Result<&'a [u8], Error> {
-        let str_va = self.read_u32(offset)?;
-        if str_va == 0 {
-            return Ok(&[]);
-        }
-        let offset = self.map.va_to_offset(str_va)?;
-        read_cstr(self.map.file(), offset)
+        Some(BStr::new(va, byte_len, data.get(..len)?))
     }
 }
 
-/// Translates a constant-pool entry index into the byte offset used by the
-/// raw-byte accessors. Each entry occupies 4 bytes (a VA pointer); the
-/// `u16`-typed offset must not overflow.
-#[inline]
-fn index_to_offset(index: u16, context: &'static str) -> Result<u16, Error> {
-    index
-        .checked_mul(4)
-        .ok_or(Error::ArithmeticOverflow { context })
-}
-
-/// Iterator over all entries in a constant pool.
+/// Iterator over a constant pool's entries.
 ///
-/// Yields `(byte_offset, Result<ConstPoolEntry>)` pairs. Each entry is a
-/// 4-byte VA pointer at `data_const_va + (index * 4)`. The VA is resolved
-/// to determine entry type (BSTR, null, or raw VA).
-///
-/// Created by [`ConstantPool::entries`].
+/// Yields `(index, Result<PoolEntry>)` pairs. Created by
+/// [`ConstantPool::entries`].
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct ConstPoolIter<'a> {
     pool: ConstantPool<'a>,
@@ -359,15 +340,15 @@ pub struct ConstPoolIter<'a> {
 }
 
 impl<'a> Iterator for ConstPoolIter<'a> {
-    type Item = (u16, Result<ConstPoolEntry<'a>, Error>);
+    type Item = (u16, Result<PoolEntry<'a>, Error>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.count {
             return None;
         }
-        let offset = self.index.saturating_mul(4);
+        let index = self.index;
         self.index = self.index.saturating_add(1);
-        Some((offset, self.pool.resolve(offset)))
+        Some((index, self.pool.entry_at(index)))
     }
 }
 
@@ -376,6 +357,8 @@ mod tests {
     use super::*;
     use crate::addressmap::SectionEntry;
 
+    /// One section: VA 0x401000..0x403000 at file 0x200; the pool at
+    /// 0x401000 (file 0x200).
     fn make_test_map(file: &[u8]) -> AddressMap<'_> {
         AddressMap::from_parts(
             file,
@@ -389,268 +372,206 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_read_u32() {
-        let mut file = vec![0u8; 0x3000];
-        // data_const at RVA 0x1000 (offset 0x200)
-        // Pool entry at offset 0: value 0xDEADBEEF
-        file[0x200..0x204].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+    /// Writes `value` at the file offset of `va`.
+    fn put(file: &mut [u8], va: u32, value: &[u8]) {
+        let at = (va - 0x401000 + 0x200) as usize;
+        file[at..at + value.len()].copy_from_slice(value);
+    }
 
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-        assert_eq!(pool.read_u32(0).unwrap(), 0xDEADBEEF);
+    /// Writes the BSTR `text` with its characters at `va`.
+    fn put_bstr(file: &mut [u8], va: u32, text: &str) {
+        let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        put(file, va - 4, &(utf16.len() as u32).to_le_bytes());
+        put(file, va, &utf16);
+        put(file, va + utf16.len() as u32, &[0, 0]);
     }
 
     #[test]
-    fn test_read_u32_with_offset() {
+    fn test_va_at_scales_the_index() {
         let mut file = vec![0u8; 0x3000];
-        // Pool entry at offset 8: value 0x12345678
-        file[0x208..0x20C].copy_from_slice(&0x12345678u32.to_le_bytes());
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-        assert_eq!(pool.read_u32(8).unwrap(), 0x12345678);
-    }
-
-    #[test]
-    fn test_read_bstr() {
-        let mut file = vec![0u8; 0x3000];
-
-        // data_const at RVA 0x1000 (offset 0x200)
-        // Pool entry at offset 0: VA pointing to the BSTR (0x00401100 = RVA 0x1100 = offset 0x300)
-        file[0x200..0x204].copy_from_slice(&0x00401104u32.to_le_bytes()); // points to string chars
-
-        // BSTR at offset 0x300: [length=10][H\0e\0l\0l\0o\0][\0\0]
-        // Length prefix at offset 0x300 (4 bytes before the string data at 0x304)
-        file[0x300..0x304].copy_from_slice(&10u32.to_le_bytes()); // 10 bytes = 5 UTF-16 chars
-        // "Hello" in UTF-16LE at offset 0x304
-        file[0x304] = b'H';
-        file[0x305] = 0;
-        file[0x306] = b'e';
-        file[0x307] = 0;
-        file[0x308] = b'l';
-        file[0x309] = 0;
-        file[0x30A] = b'l';
-        file[0x30B] = 0;
-        file[0x30C] = b'o';
-        file[0x30D] = 0;
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-
-        let bstr = pool.read_bstr(0).unwrap();
-        assert_eq!(bstr.byte_length(), 10);
-        assert_eq!(bstr.char_count(), 5);
-        assert_eq!(bstr.va(), 0x00401104);
-        assert_eq!(bstr.as_bytes().len(), 10);
-
-        let s = pool.read_bstr_as_string(0).unwrap();
-        assert_eq!(s, "Hello");
-    }
-
-    #[test]
-    fn test_read_bstr_null_pointer() {
-        let mut file = vec![0u8; 0x3000];
-        // Pool entry is 0 (null pointer)
-        file[0x200..0x204].copy_from_slice(&0u32.to_le_bytes());
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-
-        let bstr = pool.read_bstr(0).unwrap();
-        assert!(bstr.is_empty());
-
-        let s = pool.read_bstr_as_string(0).unwrap();
-        assert!(s.is_empty());
-    }
-
-    #[test]
-    fn test_read_bstr_zero_length() {
-        let mut file = vec![0u8; 0x3000];
-        // Pool entry points to a BSTR with length 0
-        file[0x200..0x204].copy_from_slice(&0x00401104u32.to_le_bytes());
-        file[0x300..0x304].copy_from_slice(&0u32.to_le_bytes()); // length = 0
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-
-        let bstr = pool.read_bstr(0).unwrap();
-        assert!(bstr.is_empty());
-    }
-
-    #[test]
-    fn test_read_ansi_string() {
-        let mut file = vec![0u8; 0x3000];
-        // Pool entry at offset 0: VA pointing to ANSI string
-        file[0x200..0x204].copy_from_slice(&0x00401100u32.to_le_bytes());
-        // ANSI string at RVA 0x1100 (offset 0x300)
-        file[0x300..0x306].copy_from_slice(b"Hello\0");
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-
-        let s = pool.read_ansi_string(0).unwrap();
-        assert_eq!(s, b"Hello");
-    }
-
-    #[test]
-    fn test_read_ansi_string_null_va() {
-        let mut file = vec![0u8; 0x3000];
-        file[0x200..0x204].copy_from_slice(&0u32.to_le_bytes());
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-
-        let s = pool.read_ansi_string(0).unwrap();
-        assert!(s.is_empty());
-    }
-
-    #[test]
-    fn test_data_const_va_accessor() {
-        let file = vec![0u8; 0x3000];
+        put(&mut file, 0x401008, &0x12345678u32.to_le_bytes());
         let map = make_test_map(&file);
         let pool = ConstantPool::new(&map, 0x00401000);
         assert_eq!(pool.data_const_va(), 0x00401000);
+        assert_eq!(pool.va_at(2).unwrap(), 0x12345678);
+        assert_eq!(pool.va_at(0).unwrap(), 0);
+        // Past the section.
+        assert!(pool.va_at(0x0800).is_err());
     }
 
     #[test]
-    fn test_resolve_null() {
+    fn test_string_at() {
         let mut file = vec![0u8; 0x3000];
-        file[0x200..0x204].copy_from_slice(&0u32.to_le_bytes());
-
+        put(&mut file, 0x401004, &0x00401104u32.to_le_bytes());
+        put_bstr(&mut file, 0x401104, "Hello");
+        // Entry 2: an odd length prefix is no BSTR.
+        put(&mut file, 0x401008, &0x00401204u32.to_le_bytes());
+        put(&mut file, 0x401200, &7u32.to_le_bytes());
+        // Entry 3: no terminator after the characters.
+        put(&mut file, 0x40100C, &0x00401304u32.to_le_bytes());
+        put(&mut file, 0x401300, &2u32.to_le_bytes());
+        put(&mut file, 0x401304, &[b'x', 0, b'y', 0]);
+        // Entry 4: an empty BSTR.
+        put(&mut file, 0x401010, &0x00401404u32.to_le_bytes());
         let map = make_test_map(&file);
         let pool = ConstantPool::new(&map, 0x00401000);
 
-        assert!(
-            matches!(pool.resolve(0).unwrap(), ConstPoolEntry::Null),
-            "expected Null, got {:?}",
-            pool.resolve(0)
-        );
-    }
-
-    #[test]
-    fn test_resolve_bstr() {
-        let mut file = vec![0u8; 0x3000];
-        // Pool entry → VA pointing to BSTR
-        file[0x200..0x204].copy_from_slice(&0x00401104u32.to_le_bytes());
-        // BSTR: length=6 at offset 0x300, string at 0x304
-        file[0x300..0x304].copy_from_slice(&6u32.to_le_bytes());
-        file[0x304] = b'H';
-        file[0x305] = 0;
-        file[0x306] = b'i';
-        file[0x307] = 0;
-        file[0x308] = b'!';
-        file[0x309] = 0;
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-
-        let entry = pool.resolve(0).unwrap();
-        let ConstPoolEntry::BStr(bstr) = entry else {
-            panic!("expected BStr, got {entry:?}");
-        };
-        assert_eq!(bstr.byte_length(), 6);
-        assert_eq!(bstr.va(), 0x00401104);
-
-        let s = pool.resolve_string(0).unwrap();
-        assert_eq!(s, Some("Hi!".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_raw_va() {
-        let mut file = vec![0u8; 0x3000];
-        // Pool entry → VA pointing to non-BSTR data (odd-length prefix)
-        file[0x200..0x204].copy_from_slice(&0x00401104u32.to_le_bytes());
-        // At VA-4 (offset 0x300): put an odd "length" that fails BSTR check
-        file[0x300..0x304].copy_from_slice(&7u32.to_le_bytes()); // odd = not BSTR
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-
-        let entry = pool.resolve(0).unwrap();
-        let ConstPoolEntry::RawVa(va) = entry else {
-            panic!("expected RawVa, got {entry:?}");
-        };
-        assert_eq!(va, 0x00401104);
-
-        assert_eq!(pool.resolve_string(0).unwrap(), None);
-    }
-
-    #[test]
-    fn test_resolve_string_null() {
-        let mut file = vec![0u8; 0x3000];
-        file[0x200..0x204].copy_from_slice(&0u32.to_le_bytes());
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-
-        assert_eq!(pool.resolve_string(0).unwrap(), Some(String::new()));
-    }
-
-    #[test]
-    fn test_string_at_indexed() {
-        let mut file = vec![0u8; 0x3000];
-
-        // Pool entry index 0 → null (skipped).
-        file[0x200..0x204].copy_from_slice(&0u32.to_le_bytes());
-        // Pool entry index 1 → BSTR pointer at 0x00401200.
-        file[0x204..0x208].copy_from_slice(&0x00401204u32.to_le_bytes());
-        // BSTR header (length prefix at 0x400): 4 bytes = 2 UTF-16 chars "Hi"
-        file[0x400..0x404].copy_from_slice(&4u32.to_le_bytes());
-        file[0x404] = b'H';
-        file[0x405] = 0;
-        file[0x406] = b'i';
-        file[0x407] = 0;
-
-        let map = make_test_map(&file);
-        let pool = ConstantPool::new(&map, 0x00401000);
-
-        // Index 0 → null pointer → None
         assert!(pool.string_at(0).unwrap().is_none());
-        // Index 1 → "Hi"
-        let bstr = pool
-            .string_at(1)
-            .unwrap()
-            .expect("entry 1 should be a BSTR");
-        assert_eq!(bstr.byte_length(), 4);
-        assert_eq!(bstr.to_string_lossy(), "Hi");
+        let bstr = pool.string_at(1).unwrap().unwrap();
+        assert_eq!(bstr.byte_length(), 10);
+        assert_eq!(bstr.va(), 0x00401104);
+        assert_eq!(bstr.to_string_lossy(), "Hello");
+        assert!(pool.string_at(2).unwrap().is_none());
+        assert!(pool.string_at(3).unwrap().is_none());
+        assert!(pool.string_at(4).unwrap().unwrap().is_empty());
+
+        assert!(matches!(pool.entry_at(1).unwrap(), PoolEntry::String(_)));
+        // An empty "string" is no evidence of one.
+        assert!(matches!(
+            pool.entry_at(4).unwrap(),
+            PoolEntry::Address(0x00401404)
+        ));
+    }
+
+    #[test]
+    fn test_name_at() {
+        // The file ends with the section.
+        let mut file = vec![0u8; 0x2200];
+        // "Add" with no length prefix: the dword before it is a character.
+        put(&mut file, 0x401000, &0x00401102u32.to_le_bytes());
+        put(
+            &mut file,
+            0x401100,
+            &[b'x', 0, b'A', 0, b'd', 0, b'd', 0, 0, 0],
+        );
+        // No terminator before the section's end.
+        put(&mut file, 0x401004, &0x00402FFEu32.to_le_bytes());
+        put(&mut file, 0x402FFE, &[b'z', 0]);
+        let map = make_test_map(&file);
+        let pool = ConstantPool::new(&map, 0x00401000);
+        assert_eq!(pool.name_at(0).unwrap().as_deref(), Some("Add"));
+        assert_eq!(pool.name_at(1).unwrap(), None);
+        assert_eq!(pool.name_at(2).unwrap(), None);
+    }
+
+    #[test]
+    fn test_guid_at() {
+        let mut file = vec![0u8; 0x3000];
+        put(&mut file, 0x401000, &0x00401100u32.to_le_bytes());
+        let guid: [u8; 16] = core::array::from_fn(|i| i as u8 + 1);
+        put(&mut file, 0x401100, &guid);
+        let map = make_test_map(&file);
+        let pool = ConstantPool::new(&map, 0x00401000);
+        assert_eq!(pool.guid_at(0).unwrap(), Guid::from_bytes(&guid));
+        assert!(pool.guid_at(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_entry_at_procedure_thunks() {
+        let mut file = vec![0u8; 0x3000];
+        // A module procedure: mov edx, 0x402000; mov ecx, 0x401050; jmp ecx.
+        put(&mut file, 0x401000, &0x00401100u32.to_le_bytes());
+        put(
+            &mut file,
+            0x401100,
+            &[
+                0xBA, 0x00, 0x20, 0x40, 0x00, 0xB9, 0x50, 0x10, 0x40, 0x00, 0xFF, 0xE1,
+            ],
+        );
+        // A Friend method's thunk.
+        put(&mut file, 0x401004, &0x00401120u32.to_le_bytes());
+        put(
+            &mut file,
+            0x401120,
+            &[
+                0xB8, 0, 0, 0, 0, 0x66, 0x3D, 0x33, 0xC0, 0xBA, 0x40, 0x20, 0x40, 0x00, 0x68, 0x54,
+                0x10, 0x40, 0x00, 0xC3,
+            ],
+        );
+        // An import thunk: jmp [0x401004].
+        put(&mut file, 0x401008, &0x00401140u32.to_le_bytes());
+        put(&mut file, 0x401140, &[0xFF, 0x25, 0x04, 0x10, 0x40, 0x00]);
+        let map = make_test_map(&file);
+        let pool = ConstantPool::new(&map, 0x00401000);
+
+        assert!(matches!(
+            pool.entry_at(0).unwrap(),
+            PoolEntry::Procedure {
+                proc_dsc_va: 0x00402000
+            }
+        ));
+        assert!(matches!(
+            pool.entry_at(1).unwrap(),
+            PoolEntry::Procedure {
+                proc_dsc_va: 0x00402040
+            }
+        ));
+        assert!(matches!(
+            pool.entry_at(2).unwrap(),
+            PoolEntry::Import { iat_va: 0x00401004 }
+        ));
+        assert!(matches!(pool.entry_at(3).unwrap(), PoolEntry::Null));
+    }
+
+    #[test]
+    fn test_entry_at_object_info() {
+        let mut file = vec![0u8; 0x3000];
+        // ObjectInfo at 0x401100: object index 3, descriptor at 0x401200,
+        // whose first field points back.
+        put(&mut file, 0x401000, &0x00401100u32.to_le_bytes());
+        put(&mut file, 0x401100, &[1, 0, 3, 0]);
+        put(&mut file, 0x401118, &0x00401200u32.to_le_bytes());
+        put(&mut file, 0x401200, &0x00401100u32.to_le_bytes());
+        // The same without the back-pointer is an address.
+        put(&mut file, 0x401004, &0x00401300u32.to_le_bytes());
+        put(&mut file, 0x401300, &[1, 0, 3, 0]);
+        put(&mut file, 0x401318, &0x00401200u32.to_le_bytes());
+        let map = make_test_map(&file);
+        let pool = ConstantPool::new(&map, 0x00401000);
+
+        assert!(matches!(
+            pool.entry_at(0).unwrap(),
+            PoolEntry::ObjectInfo {
+                va: 0x00401100,
+                object_index: 3
+            }
+        ));
+        assert!(matches!(
+            pool.entry_at(1).unwrap(),
+            PoolEntry::Address(0x00401300)
+        ));
     }
 
     #[test]
     fn test_api_stub_at_classification() {
         let mut file = vec![0u8; 0x3000];
-
-        // Pool entry index 0 → null
-        file[0x200..0x204].copy_from_slice(&0u32.to_le_bytes());
-        // Pool entry index 1 → API stub at 0x00401300 (push imm32; ...)
-        file[0x204..0x208].copy_from_slice(&0x00401300u32.to_le_bytes());
-        // Stub bytes at 0x500: push 0x00401400 (target struct VA)
-        file[0x500] = 0x68;
-        file[0x501..0x505].copy_from_slice(&0x00401400u32.to_le_bytes());
-        // CallApiStub at 0x00401400 (offset 0x600): library_va, function_va
-        file[0x600..0x604].copy_from_slice(&0x00401500u32.to_le_bytes());
-        file[0x604..0x608].copy_from_slice(&0x00401510u32.to_le_bytes());
-        // Library/function name strings
-        file[0x700..0x709].copy_from_slice(b"kernel32\0");
-        file[0x710..0x71d].copy_from_slice(b"GetLastError\0");
-
-        // Pool entry index 2 → BSTR (NOT an API stub)
-        file[0x208..0x20C].copy_from_slice(&0x00401204u32.to_le_bytes());
-        file[0x400..0x404].copy_from_slice(&4u32.to_le_bytes());
-
+        // Entry 1: a stub, push 0x00401400.
+        put(&mut file, 0x401004, &0x00401300u32.to_le_bytes());
+        put(&mut file, 0x401300, &[0x68, 0x00, 0x14, 0x40, 0x00]);
+        // CallApiStub at 0x401400: library_va, function_va.
+        put(&mut file, 0x401400, &0x00401500u32.to_le_bytes());
+        put(&mut file, 0x401404, &0x00401510u32.to_le_bytes());
+        put(&mut file, 0x401500, b"kernel32\0");
+        put(&mut file, 0x401510, b"GetLastError\0");
+        // Entry 2: a BSTR, not a stub.
+        put(&mut file, 0x401008, &0x00401204u32.to_le_bytes());
+        put_bstr(&mut file, 0x401204, "ab");
         let map = make_test_map(&file);
         let pool = ConstantPool::new(&map, 0x00401000);
 
-        // Index 0 → null
         assert!(pool.api_stub_at(0).unwrap().is_none());
-        // Index 1 → API stub
-        let stub = pool
-            .api_stub_at(1)
-            .unwrap()
-            .expect("entry 1 should be an API stub");
+        let stub = pool.api_stub_at(1).unwrap().unwrap();
         assert_eq!(stub.library_name_bytes(&map).unwrap(), b"kernel32");
         assert_eq!(stub.function_name_bytes(&map).unwrap(), b"GetLastError");
-        // Index 2 → BSTR is not a stub (no 0x68 leading byte)
         assert!(pool.api_stub_at(2).unwrap().is_none());
+        assert!(matches!(pool.entry_at(1).unwrap(), PoolEntry::Declare(_)));
+
+        let kinds: Vec<_> = pool
+            .entries(3)
+            .map(|(index, entry)| (index, entry.unwrap()))
+            .collect();
+        assert!(matches!(kinds[0], (0, PoolEntry::Null)));
+        assert!(matches!(kinds[1], (1, PoolEntry::Declare(_))));
+        assert!(matches!(kinds[2], (2, PoolEntry::String(_))));
     }
 }

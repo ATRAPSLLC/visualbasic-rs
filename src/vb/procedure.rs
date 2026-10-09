@@ -9,9 +9,10 @@
 //! P-Code Start = &ProcDscInfo - ProcDscInfo.wPCodeBackOffset
 //! ```
 //!
-//! # Runtime Confirmation (ProcCallEngine_Body at 0x66108C00)
+//! # Runtime Confirmation
 //!
-//! The first dword of ProcDscInfo is dereferenced as an ObjectInfo pointer:
+//! `ProcCallEngine` (MSVBVM60 6.00.8176, 0x66104a99) dereferences the first
+//! dword of ProcDscInfo as an ObjectInfo pointer:
 //! - `*ProcDscInfo` → ObjectInfo
 //! - `ObjectInfo.lpConstants` (+0x34) → constant pool base for P-Code execution
 //! - `ObjectInfo.lpObjectTable` (+0x04) → ObjectTable → project data
@@ -19,10 +20,13 @@
 //! # Variable-Length Structure
 //!
 //! ProcDscInfo is **not** a fixed-size struct. The base header is 0x18 bytes,
-//! followed by an error handler table whose size is given by `wErrTableSize`
-//! (+0x18). Total size = `wTotalSize` (+0x0A) = 0x18 + wErrTableSize.
+//! followed by two [`CleanupTable`]s: the primary one at +0x18 and the
+//! secondary one at `wTotalSize` (+0x0A), which is `0x18 + ` the primary
+//! table's size rounded up to a multiple of 4. A procedure with line numbers
+//! also has a line-number table at the self-relative offset in +0x0E (see
+//! [`ProcDscInfo::line_numbers`]).
 
-use std::fmt;
+use std::{fmt, ops::Range};
 
 use crate::{
     error::Error,
@@ -32,20 +36,27 @@ use crate::{
 
 /// View over a cleanup/property table.
 ///
-/// This is the common table format used by both the primary cleanup table
-/// (at ProcDscInfo +0x18, processed by `InitLocalCleanupAll`) and the
-/// secondary table (immediately following table 1, purpose unknown -
-/// not processed by MSVBVM60.DLL during normal method entry/exit).
+/// This is the common table format of the two tables that follow a
+/// [`ProcDscInfo`] header (MSVBVM60 6.00.8176 addresses):
+///
+/// - the primary table (ProcDscInfo +0x18) lists the procedure's locals that
+///   hold a resource, and a function's return value: `ProcCallEngine`
+///   initializes its first `wCount` entries on entry (0x66104b44, 0x660e99bc)
+///   and `ExitProc` releases its entries on return (0x661064a5, 0x66027da2);
+/// - the secondary table (ProcDscInfo + `wTotalSize`) lists the temporaries
+///   the `FFree*` opcodes release; the runtime releases them when an error
+///   unwinds the procedure (0x66107ff6..0x6610800e), not on entry or a normal
+///   exit.
 ///
 /// # Layout
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 2 | `wSize` - total table size in bytes (including this header) |
-/// | 0x02 | 2 | Reserved (always 0) |
-/// | 0x04 | 2 | `wCount` - entries to actively process on exit/error |
-/// | 0x06 | 2 | `wTotal` - total entry count in the table |
-/// | 0x08 | 4 | Flags (bit 0 at byte +0x0B checked by `InitLocalCleanupEntries`) |
+/// | 0x00 | 2 | `wSize` - total table size in bytes (including this header; not always a multiple of 4) |
+/// | 0x02 | 2 | Reserved (0 in every table of the fixtures) |
+/// | 0x04 | 2 | `wCount` - leading entries to initialize on entry (fixed-size arrays, UDTs; 0 in a secondary table) |
+/// | 0x06 | 2 | `wTotal` - entry count; every entry is released |
+/// | 0x08 | 4 | Flags: bit 0 of byte +0x0B = the first entry is the function's return value |
 /// | 0x0C | var | [`ControlPropertyEntry`](super::controlprop::ControlPropertyEntry) records |
 ///
 /// Minimum size is 0x0C (header only, no entries).
@@ -81,10 +92,14 @@ impl<'a> CleanupTable<'a> {
         read_u16_le(self.bytes, 0x00)
     }
 
-    /// Number of entries to actively process on exit/error at offset 0x04.
+    /// Number of leading entries the runtime initializes on entry, at
+    /// offset 0x04.
     ///
-    /// Used by `InitLocalCleanupEntries` as the iteration limit for
-    /// entries requiring resource release.
+    /// `ProcCallEngine` calls its table initializer only when this is
+    /// non-zero (MSVBVM60 6.00.8176, 0x66104b44), and the initializer
+    /// (0x660e99bc) stops after this many entries. In the fixtures it counts
+    /// the fixed-size arrays and UDTs among the locals (`Dim fixed(3) As
+    /// Long` gives 1); it is 0 in every secondary table.
     #[inline]
     pub fn count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x04)
@@ -92,8 +107,8 @@ impl<'a> CleanupTable<'a> {
 
     /// Total number of entries in the table at offset 0x06.
     ///
-    /// May exceed [`count`](Self::count) - entries beyond `count` exist
-    /// in the table but are not actively processed for cleanup.
+    /// The release routine (MSVBVM60 6.00.8176, 0x66027da2) walks all of
+    /// them; [`count`](Self::count) only limits initialization.
     #[inline]
     pub fn total(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x06)
@@ -101,8 +116,11 @@ impl<'a> CleanupTable<'a> {
 
     /// Flags dword at offset 0x08.
     ///
-    /// Bit 0 of byte +0x0B is checked by `InitLocalCleanupEntries` to
-    /// skip the first entry when set.
+    /// Bit 0 of byte +0x0B marks the first entry as the function's return
+    /// value (a String, Object, Variant or array result): the initializer
+    /// (0x660e99ce) and the release on a normal exit (0x66027d7e) skip it.
+    /// The fixtures also show byte +0x0B = 0x10 in four procedures, meaning
+    /// unknown.
     #[inline]
     pub fn flags(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x08)
@@ -153,38 +171,44 @@ impl<'a> CleanupTable<'a> {
 /// ```text
 /// +0x00: Base header (0x18 bytes)
 ///   +0x00  u32  lpObjectInfo       VA of parent ObjectInfo
-///   +0x04  u16  wArgSize           caller arg bytes (like retn N)
+///   +0x04  u16  wArgSize           bytes ExitProc pops: the ebp+8 slot and the arguments
 ///   +0x06  u16  wFrameSize         local variable frame size
 ///   +0x08  u16  wPCodeBackOffset   P-Code stream size (back-offset)
-///   +0x0A  u16  wTotalSize         0x18 + primary_table_size
-///   +0x0C  u16  wProcOptFlags      error handling (bit 4=OnError, bit 5=ResumeNext)
-///   +0x0E  u16  reserved
-///   +0x10  u16  wResumeFixupOff    Resume Next fallback fixup-table offset (usually 0)
-///   +0x12  u16  base_iface_slot    (init_event_offset/4) - 1
-///   +0x14  u16  reserved
-///   +0x16  u16  reserved
+///   +0x0A  u16  wTotalSize         offset of the secondary table: align4(0x18 + primary size)
+///   +0x0C  u16  wProcOptFlags      entry options (0x10 Friend, 0x20; see ProcOptFlags)
+///   +0x0E  i16  wLineTableOff      self-relative offset of the line-number table, or 0
+///   +0x10  u16  wResumeFixupOff    Resume Next fallback fixup-table offset (0 in the fixtures)
+///   +0x12  u16  unknown            0x26 or 0 in the fixtures
+///   +0x14  u16  reserved           (0 in the fixtures)
+///   +0x16  u16  reserved           (0 in the fixtures)
 ///
-/// +0x18: Primary CleanupTable (processed by InitLocalCleanupAll)
+/// +0x18: Primary CleanupTable (locals and return value; entry and exit)
 ///   +0x00  u16  wSize              table size including this header
 ///   +0x02  u16  reserved
-///   +0x04  u16  wCount             entries to process on exit/error
-///   +0x06  u16  wTotal             total entry count
-///   +0x08  u32  flags
+///   +0x04  u16  wCount             leading entries to initialize on entry
+///   +0x06  u16  wTotal             entry count (all released)
+///   +0x08  u32  flags              byte +0x0B bit 0: first entry is the return value
 ///   +0x0C  var  ControlPropertyEntry[] records
 ///
-/// +0x18 + primary_size: Secondary CleanupTable (NOT processed by runtime)
-///   Same header format as primary table. Purpose unknown -
-///   not read by MSVBVM60.DLL during method entry/exit.
-///   Always present (minimum 0x0C bytes).
+/// +wTotalSize: Secondary CleanupTable (temporaries; released when an
+///   error unwinds the procedure). Same header format; always present
+///   (minimum 0x0C bytes).
+///
+/// +wLineTableOff (when non-zero): line-number table
+///   +0x00  u16  count
+///   +0x02  (u16 P-Code offset, u16 line number)[count]
 /// ```
 ///
-/// The primary cleanup table describes local variables needing resource
-/// release on procedure exit or error (strings via `SysFreeString`, COM
-/// objects via `IUnknown::Release`, SafeArrays via `SafeArrayDestroy`, etc.).
+/// The primary cleanup table describes the local variables needing resource
+/// release on procedure exit or error, and a String, Object, Variant or
+/// array return value (strings via `SysFreeString`, COM objects via
+/// `IUnknown::Release`, SafeArrays via `SafeArrayDestroy`, etc.).
 ///
-/// `wTotalSize` at +0x0A only covers `0x18 + primary_table_size`. Use
-/// [`actual_size`](Self::actual_size) for the true extent including the
-/// secondary table. The next method's P-Code starts immediately after.
+/// `wTotalSize` at +0x0A only covers the header and the primary table. Use
+/// [`actual_size`](Self::actual_size) for the extent including the
+/// secondary table. When procedures are adjacent, the next one's P-Code
+/// starts at the next multiple of 4 after the secondary table, or after the
+/// line-number table when there is one.
 #[derive(Clone, Copy, Debug)]
 pub struct ProcDscInfo<'a> {
     /// Raw backing bytes borrowed from the PE file buffer.
@@ -228,20 +252,35 @@ impl<'a> ProcDscInfo<'a> {
     /// let const_va = read_constants_va(oi_data);
     /// ```
     ///
-    /// The runtime's ProcCallEngine_Body dereferences this to access:
+    /// `ProcCallEngine` (MSVBVM60 6.00.8176, 0x66104ada) dereferences this to
+    /// access:
     /// - [`ObjectInfo::constants_va`](super::object::ObjectInfo::constants_va) (+0x34)
     /// - [`ObjectInfo::object_table_va`](super::object::ObjectInfo::object_table_va) (+0x04)
+    ///
+    /// In every procedure of the fixtures it is the ObjectInfo of the object
+    /// the procedure belongs to.
     #[inline]
     pub fn object_info_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x00)
     }
 
-    /// Caller argument bytes to clean on return at offset 0x04.
+    /// Bytes `ExitProc` pops on return, at offset 0x04, like a stdcall
+    /// `retn N`.
     ///
-    /// Used by the ExitProc opcode handler path (`sub_6610a574`) to adjust
-    /// the stack pointer on return, like a stdcall `retn N`.
-    /// - Value 0x10 (16) = 4 DWORDs (typical: `this` + 3 COM dispatch args)
-    /// - Value 0x04 (4) = 1 DWORD (typical: just `this` pointer)
+    /// The shared exit path (MSVBVM60 6.00.8176, 0x661064a0) reads it and
+    /// removes that many bytes above the return address. It counts:
+    /// - the `ebp+8` slot: `Me` in an object's method, the module's data
+    ///   block in a standard module's procedure (see [`pcode_frame::ME`]);
+    /// - each parameter at its stack width: 4 bytes for a `ByRef` parameter
+    ///   and the 4-byte types, 8 for a `ByVal` `Double`, `Date` or
+    ///   `Currency`, 16 for a `ByVal` `Variant`;
+    /// - 4 more for the return-value pointer of an object's `Function` or
+    ///   `Property Get`.
+    ///
+    /// Fixture values: a module's `Function Add(a As Long, b As Long) As
+    /// Long` 0x0C; a class's `Property Get Value() As Long` 0x08; `Function
+    /// D(ByVal x As Date) As Date` 0x10; `Function V(ByVal x As Variant) As
+    /// Variant` 0x18; a module's `Sub Main` 0x04.
     #[inline]
     pub fn arg_size(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x04)
@@ -249,44 +288,67 @@ impl<'a> ProcDscInfo<'a> {
 
     /// Stack frame size for local variables at offset 0x06.
     ///
-    /// Confirmed by ProcCallEngine_Body: `sub esp, wFrameSize; memset(0)`.
+    /// `ProcCallEngine` (MSVBVM60 6.00.8176, 0x66104b04..0x66104b3a)
+    /// subtracts it from `esp` and zeroes the region (see
+    /// [`zeroed_frame`](Self::zeroed_frame)).
     #[inline]
     pub fn frame_size(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x06)
     }
 
+    /// Returns the `ebp`-relative byte range `ProcCallEngine` zeroes before
+    /// the procedure's first instruction: the locals, from
+    /// `ebp - 0x84 - frame_size` up to the saved registers at `ebp - 0x84`.
+    ///
+    /// The engine clears `frame_size / 4` dwords (`rep stosd`, MSVBVM60
+    /// 6.00.8176, 0x66104b3a) on every entry path, so a local read before
+    /// any write is 0. The interpreter's own slots above it are not part of
+    /// the range (see [`pcode_frame`] for their state on entry). Every
+    /// fixture's frame size is a multiple of 4.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame size cannot be read.
+    pub fn zeroed_frame(&self) -> Result<Range<i32>, Error> {
+        let frame_size = u32::from(self.frame_size()?);
+        let zeroed = frame_size & !3;
+        let start = 0i32
+            .saturating_sub_unsigned(pcode_frame::HOUSEKEEPING_SIZE)
+            .saturating_sub_unsigned(frame_size);
+        Ok(start..start.saturating_add_unsigned(zeroed))
+    }
+
     /// P-Code byte stream back-offset at offset 0x08.
     ///
     /// The P-Code bytes are located at `[addr - offset .. addr]`
-    /// where `addr` is the address of this ProcDscInfo structure.
+    /// where `addr` is the address of this ProcDscInfo structure
+    /// (`ProcCallEngine`, MSVBVM60 6.00.8176, 0x66104b7f).
     #[inline]
     pub fn pcode_back_offset(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x08)
     }
 
-    /// Alias for [`pcode_back_offset`](Self::pcode_back_offset) (legacy name).
+    /// Same as [`pcode_back_offset`](Self::pcode_back_offset): the size of
+    /// the procedure's P-Code in bytes.
     #[inline]
     pub fn proc_size(&self) -> Result<u16, Error> {
         self.pcode_back_offset()
     }
 
-    /// Total structure size at offset 0x0A.
+    /// Size of the header and the primary cleanup table at offset 0x0A,
+    /// which is the offset of the secondary cleanup table.
     ///
-    /// Equals `HEADER_SIZE (0x18) + wCleanupTableSize`. The structure is
-    /// variable-length due to the local cleanup table.
+    /// Equals `HEADER_SIZE (0x18) + ` [`cleanup_table_size`](Self::cleanup_table_size)
+    /// rounded up to a multiple of 4 (0x90 for a 0x76-byte primary table).
+    /// The runtime's error unwinding reads it to find the secondary table
+    /// (MSVBVM60 6.00.8176, 0x66107ff9).
     #[inline]
     pub fn total_size(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x0A)
     }
 
-    /// Procedure option flags at offset 0x0C as a [`ProcOptFlags`] wrapper.
-    ///
-    /// Only two bits are used by the P-Code engine (`ProcCallEngine_Body`
-    /// in MSVBVM60.DLL, exhaustively verified):
-    /// - Bit 4 (`0x10`): Procedure has an `On Error` exception handler.
-    /// - Bit 5 (`0x20`): Procedure uses `On Error Resume Next`.
-    ///
-    /// All other bits are unused/reserved.
+    /// Procedure option flags at offset 0x0C as a [`ProcOptFlags`] wrapper:
+    /// how `ProcCallEngine` enters an object's method (see [`ProcOptFlags`]).
     #[inline]
     pub fn proc_opt_flags(&self) -> Result<ProcOptFlags, Error> {
         Ok(ProcOptFlags(read_u16_le(self.bytes, 0x0C)?))
@@ -298,83 +360,116 @@ impl<'a> ProcDscInfo<'a> {
         read_u16_le(self.bytes, 0x0C)
     }
 
-    /// Returns `true` if this procedure has an `On Error` handler.
+    /// Returns `true` if this procedure is a `Friend` method (see
+    /// [`ProcOptFlags::FRIEND`]).
     #[inline]
-    pub fn has_error_handler(&self) -> bool {
-        self.proc_opt_flags()
-            .map(|f| f.has_error_handler())
-            .unwrap_or(false)
+    pub fn is_friend(&self) -> bool {
+        self.proc_opt_flags().is_ok_and(ProcOptFlags::is_friend)
     }
 
-    /// Returns `true` if this procedure uses `On Error Resume Next`.
+    /// Returns `true` if bit 0x20 is set ([`ProcOptFlags::ADJUSTED_ME_AS_PRIMARY`]):
+    /// a `Class_Initialize` or an `Implements` member. Whether `Me` is
+    /// `AddRef`ed on entry also depends on the thunk and the runtime context
+    /// (see [`ProcOptFlags`]).
     #[inline]
-    pub fn has_resume_next(&self) -> bool {
+    pub fn enters_adjusted_me_as_primary(&self) -> bool {
         self.proc_opt_flags()
-            .map(|f| f.has_resume_next())
-            .unwrap_or(false)
+            .is_ok_and(ProcOptFlags::enters_adjusted_me_as_primary)
     }
 
-    /// Reserved field at offset 0x0E (not read by MSVBVM60.DLL runtime).
+    /// Self-relative offset of the procedure's line-number table at offset
+    /// 0x0E, or 0 when the procedure has no line numbers.
+    ///
+    /// The table is a `u16` count followed by that many (`u16` P-Code
+    /// offset, `u16` line number) pairs. When an error occurs, the runtime
+    /// looks up the last pair at or before the faulting P-Code offset and
+    /// stores its line as `Erl` (MSVBVM60 6.00.8176, 0x66108075 and
+    /// 0x6610d15a, which reads the field as signed). In the fixtures only
+    /// `flow`'s `ErrLines` (numbered lines 10 to 60) has one: offset 0x44,
+    /// six pairs, placed right after the secondary cleanup table, outside
+    /// [`actual_size`](Self::actual_size).
     #[inline]
-    pub fn reserved_0e(&self) -> Result<u16, Error> {
-        read_u16_le(self.bytes, 0x0E)
+    pub fn line_table_offset(&self) -> Result<i16, Error> {
+        Ok(read_u16_le(self.bytes, 0x0E)?.cast_signed())
+    }
+
+    /// Returns the procedure's line numbers: each numbered line's P-Code
+    /// offset and number, from the table at
+    /// [`line_table_offset`](Self::line_table_offset); empty for a
+    /// procedure without line numbers or whose table is not in the parsed
+    /// slice.
+    pub fn line_numbers(&self) -> Vec<LineNumber> {
+        let Some(start) = self
+            .line_table_offset()
+            .ok()
+            .filter(|&offset| offset > 0)
+            .and_then(|offset| usize::try_from(offset).ok())
+        else {
+            return Vec::new();
+        };
+        let Ok(count) = read_u16_le(self.bytes, start) else {
+            return Vec::new();
+        };
+        (0..usize::from(count))
+            .map_while(|index| {
+                let at = start.checked_add(2)?.checked_add(index.checked_mul(4)?)?;
+                Some(LineNumber {
+                    offset: read_u16_le(self.bytes, at).ok()?,
+                    line: read_u16_le(self.bytes, at.checked_add(2)?).ok()?,
+                })
+            })
+            .collect()
     }
 
     /// `Resume Next` fixup-table offset at offset 0x10.
     ///
     /// Self-relative offset from the start of `ProcDscInfo` to a per-procedure
-    /// fixup table consulted by the runtime's `Resume Next` handler
-    /// (`op_Lead2_Resume` at 0x6610F212) - and **only** on a narrow fallback
-    /// path. Earlier revisions of this crate mislabelled the field
-    /// `wBosSkipTableOffset` and treated it as a per-opcode instruction-size
-    /// table; subsequent reverse engineering (see below) shows that is wrong.
+    /// fixup table consulted when `Resume Next` resumes after a statement
+    /// that does not start with a statement marker.
     ///
-    /// # How `Resume` actually works
+    /// # How `Resume Next` uses it
     ///
-    /// `op_Lead2_Resume` dispatches on the `Resume` instruction's signed operand:
-    /// `Resume <label>` (positive) jumps directly; bare `Resume` (`-2`)
-    /// re-dispatches the faulting statement; `Resume Next` (`-1`) advances to the
-    /// next statement. That advance normally uses the **inline length byte of the
-    /// `LargeBos` statement marker** at the saved position - *not* this field.
-    /// This field's table is the rare fallback used only when the saved position
-    /// is **not** a BOS marker.
+    /// The `Resume` handler (MSVBVM60 6.00.8176, 0x6610b0b6) dispatches on its
+    /// operand: a label offset jumps there; `0xFFFE` (`Resume`) re-executes the
+    /// statement the handler is handling (`[ebp-0x3C]`); `0xFFFF` (`Resume
+    /// Next`) skips it. When that statement starts with `LargeBos` (opcode
+    /// 0x00), the skip is the marker's inline length byte; otherwise the
+    /// handler reads this field, and the `u16` at `ProcDscInfo + offset + 2 +
+    /// 2 * k`, where `k` is the statement's second byte, is the length. The
+    /// error dispatcher's `On Error Resume Next` path does the same
+    /// (0x6610808e, which reads the field as signed).
     ///
-    /// # Why it is almost always zero
-    ///
-    /// Across a 100-binary VB6 malware corpus this field is `0` for the vast
-    /// majority of methods - including 457 of 461 methods that contain a literal
-    /// `Resume` opcode - because the fallback path is essentially never compiled.
-    /// `0` is therefore the normal, expected value, **not** "missing data." A
-    /// small population of (non-error) methods carry a non-zero value equal to
-    /// the procedure's `total_size`/`actual_size` that points at the following
-    /// procedure's P-Code rather than a real table; treat any non-zero value
-    /// with suspicion. No populated table exists in the corpus, so the table's
-    /// in-file format/extent is unconfirmed.
+    /// The field is 0 in all 370 P-Code procedures of the fixtures, including
+    /// `flow`'s procedures with `Resume Next` and `On Error Resume Next` (VB
+    /// marks their statements with `LargeBos`). No fixture has a table, so its
+    /// extent is unconfirmed; like the line-number table of
+    /// [`line_table_offset`](Self::line_table_offset) it would lie outside
+    /// [`actual_size`](Self::actual_size).
     #[inline]
     pub fn resume_fixup_table_offset(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x10)
     }
 
-    /// Base interface method count (minus 1) at offset 0x12.
+    /// Unexplained `u16` at offset 0x12.
     ///
-    /// Equal to `(OptionalObjectInfo.initialize_event_offset / 4) - 1`,
-    /// i.e., the 0-based index of the last dispatch table slot before the
-    /// Initialize event. Constant across all methods within the same object.
-    /// Not read by MSVBVM60.DLL at runtime - compiler metadata only.
-    ///
-    /// Known values: Class=2, Form/UserDoc=25, UserControl=25.
+    /// In the fixtures (built by VB6 6.00.8176) it is 0x26 in 176 of the 183
+    /// procedures, in modules, classes, forms and UserControls alike, and 0
+    /// in the 7 procedures that have an `Optional` parameter with a default
+    /// value or a `For Each` loop. It is not `(initialize_event_offset / 4) -
+    /// 1` (2 for these classes, 25 for these forms). No read of it was found
+    /// in `ProcCallEngine`.
     #[inline]
     pub fn base_iface_slot_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x12)
     }
 
-    /// Reserved field at offset 0x14 (not read by MSVBVM60.DLL runtime).
+    /// Reserved field at offset 0x14 (0 in every procedure of the fixtures).
     #[inline]
     pub fn reserved_14(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x14)
     }
 
-    /// Reserved field at offset 0x16 (not read by MSVBVM60.DLL runtime).
+    /// Reserved field at offset 0x16 (0 in every procedure of the fixtures).
     #[inline]
     pub fn reserved_16(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x16)
@@ -383,32 +478,37 @@ impl<'a> ProcDscInfo<'a> {
     /// Size of the primary cleanup table at offset 0x18.
     ///
     /// The table starts at ProcDscInfo +0x18 and extends for this many
-    /// bytes. Minimum value is 0x0C (header only, no entries).
+    /// bytes. Minimum value is 0x0C (header only, no entries). It need not
+    /// be a multiple of 4.
     ///
-    /// `total_size` = 0x18 + `cleanup_table_size`.
+    /// [`total_size`](Self::total_size) = 0x18 + `cleanup_table_size`,
+    /// rounded up to a multiple of 4.
     #[inline]
     pub fn cleanup_table_size(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x18)
     }
 
-    /// Reserved field at offset 0x1A (not read by MSVBVM60.DLL runtime).
+    /// Reserved field at offset 0x1A (the primary table's +0x02; 0 in every
+    /// procedure of the fixtures).
     #[inline]
     pub fn reserved_1a(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x1A)
     }
 
-    /// Number of cleanup entries to process at offset 0x1C.
+    /// Number of leading primary-table entries the runtime initializes on
+    /// entry, at offset 0x1C (see [`CleanupTable::count`]).
     ///
-    /// Used by `InitLocalCleanupEntries` (0x660ecaf9) as the iteration limit.
+    /// `ProcCallEngine` (MSVBVM60 6.00.8176, 0x66104b44) calls the table
+    /// initializer only when it is non-zero.
     #[inline]
     pub fn cleanup_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x1C)
     }
 
-    /// Total number of cleanup entries at offset 0x1E.
+    /// Total number of primary cleanup entries at offset 0x1E.
     ///
-    /// May be larger than [`cleanup_count`](Self::cleanup_count) - entries
-    /// beyond `count` exist but are not actively processed for resource release.
+    /// Every entry is released on exit (see [`CleanupTable::total`]);
+    /// [`cleanup_count`](Self::cleanup_count) only limits initialization.
     #[inline]
     pub fn cleanup_total(&self) -> u16 {
         if self.bytes.len() > 0x1F {
@@ -418,7 +518,8 @@ impl<'a> ProcDscInfo<'a> {
         }
     }
 
-    /// Returns `true` if this procedure has local variables needing cleanup.
+    /// Returns `true` if the primary cleanup table has entries: locals
+    /// needing cleanup, or a String, Object, Variant or array return value.
     #[inline]
     pub fn has_cleanup(&self) -> bool {
         self.cleanup_count().unwrap_or(0) > 0 || self.cleanup_total() > 0
@@ -426,9 +527,10 @@ impl<'a> ProcDscInfo<'a> {
 
     /// Returns the primary [`CleanupTable`] (at ProcDscInfo +0x18).
     ///
-    /// This table is processed by `InitLocalCleanupAll` during method entry
-    /// and by the exit handlers for resource release. It describes local
-    /// variables needing cleanup (strings, COM objects, SafeArrays, etc.).
+    /// The runtime initializes its first [`CleanupTable::count`] entries on
+    /// entry and releases its entries on exit. It describes the local
+    /// variables needing cleanup (strings, COM objects, SafeArrays, etc.) and
+    /// a String, Object, Variant or array return value.
     pub fn cleanup_table(&self) -> Option<CleanupTable<'a>> {
         let offset = Self::HEADER_SIZE; // 0x18
         let min_len = offset.checked_add(CleanupTable::HEADER_SIZE)?;
@@ -442,12 +544,15 @@ impl<'a> ProcDscInfo<'a> {
     /// Returns the secondary [`CleanupTable`] that follows the primary table.
     ///
     /// This table has the same header format as the primary table and is
-    /// always present (minimum 0x0C bytes). It is **not** processed by
-    /// MSVBVM60.DLL during normal method entry/exit - its purpose is
-    /// unknown (possibly compiler/IDE metadata).
+    /// always present (minimum 0x0C bytes). It lists the procedure's
+    /// temporaries, the frame slots the `FFree*` opcodes release (`late`:
+    /// one Variant at `ebp-0x98`, freed by `FFree1Var var_98`). The runtime
+    /// does not touch it on entry or on a normal exit; when an error unwinds
+    /// the procedure it releases every entry (MSVBVM60 6.00.8176,
+    /// 0x66107ff6..0x6610800e).
     ///
-    /// Located at `ProcDscInfo + total_size`, i.e., immediately after the
-    /// primary cleanup table.
+    /// Located at `ProcDscInfo + total_size`, after the primary cleanup
+    /// table and its padding to a multiple of 4.
     pub fn secondary_table(&self) -> Option<CleanupTable<'a>> {
         let offset = self.total_size().ok()? as usize;
         let min_len = offset.checked_add(CleanupTable::HEADER_SIZE)?;
@@ -461,9 +566,15 @@ impl<'a> ProcDscInfo<'a> {
     /// Actual total size of the ProcDscInfo structure including both
     /// cleanup tables.
     ///
-    /// This is `0x18 + primary_table_size + secondary_table_size` and
-    /// represents the true extent of the structure in the PE image.
-    /// The next method's P-Code bytes start immediately after.
+    /// This is [`total_size`](Self::total_size) (the header, the primary
+    /// table and its padding) plus the secondary table's size. It does not
+    /// include a line-number table ([`line_table_offset`](Self::line_table_offset)) or a
+    /// `Resume Next` fixup table
+    /// ([`resume_fixup_table_offset`](Self::resume_fixup_table_offset)),
+    /// which follow the secondary table: `flow`'s `ErrLines` has an
+    /// `actual_size` of 0x44 and its line table ends at 0x5E. Neither is the
+    /// result padded: the next procedure's P-Code, when it follows, starts
+    /// at the next multiple of 4 after the last table.
     ///
     /// Note: [`total_size`](Self::total_size) at offset +0x0A only covers
     /// the header and primary table. This method accounts for both tables.
@@ -494,9 +605,12 @@ impl<'a> ProcDscInfo<'a> {
         }
     }
 
-    /// Returns the number of caller arguments (from `arg_size / 4`).
+    /// Returns the number of stack dwords `ExitProc` pops (`arg_size / 4`).
     ///
-    /// Each argument is 4 bytes (DWORD) on the x86 stack.
+    /// This is not the parameter count: it includes the `ebp+8` slot and an
+    /// object method's return-value pointer, and a `ByVal` `Double`, `Date`
+    /// or `Currency` takes 2 dwords and a `ByVal` `Variant` 4 (see
+    /// [`arg_size`](Self::arg_size)).
     #[inline]
     pub fn arg_count(&self) -> Result<u16, Error> {
         Ok(self.arg_size()? / 4)
@@ -520,16 +634,39 @@ pub fn read_constants_va(object_info_data: &[u8]) -> Result<u32, Error> {
 
 /// Procedure option flags from `ProcDscInfo` offset 0x0C.
 ///
-/// Only two bits are used by the P-Code engine (exhaustively verified
-/// against `ProcCallEngine_Body` in MSVBVM60.DLL).
+/// `ProcCallEngine` (MSVBVM60 6.00.8176, 0x66104b99) tests two bits when it
+/// enters an object's method (through `MethCallEngine`, 0x661080b8):
+///
+/// | Bit | Meaning | Seen on (fixtures) |
+/// |-----|---------|--------------------|
+/// | 0x10 ([`FRIEND`](Self::FRIEND)) | `Me` must be an instance of the defining class: error 91 when it is `Nothing`, 97 ("Can not call friend function on object which is not an instance of defining class") when its vtable is another's | the `Friend` methods `Ring.Diameter` (`events`) and `Kinds.Rec` (`types`) |
+/// | 0x20 ([`ADJUSTED_ME_AS_PRIMARY`](Self::ADJUSTED_ME_AS_PRIMARY)) | Selects how `Me` is referenced on entry (below) | `Class_Initialize`, the members an `Implements` provides (`calls`: `Square.Shape_*`; `events`: `Ring.Measure_*`) |
+///
+/// The method's thunk (`xor eax, eax; mov edx, <ProcDscInfo>; push
+/// <MethCallEngine>; ret`) passes a `Me` adjustment in `eax`, which
+/// `MethCallEngine` subtracts from `Me`. With bit 0x20 clear and a non-zero
+/// adjustment, `ProcCallEngine` `AddRef`s `Me` and sets the frame flags
+/// `[ebp-0x48]` to 0xE000. Otherwise (bit 0x20 set, or an adjustment of 0)
+/// it `AddRef`s `Me` with frame flags 0xC000, unless the runtime context's
+/// byte +0x74 has bit 0 set and bit 1 clear: then it clears those bits and
+/// enters with frame flags 0x4000 and no `AddRef`. `ExitProc` releases `Me`
+/// when the frame flags have 0x8000. Every thunk in the fixtures loads
+/// `eax` = 0, so there the bit does not change the entry path.
+///
+/// Neither bit is about error handling: the procedures of
+/// `tests/fixtures/flow` with `On Error GoTo`, `Resume` and `On Error Resume
+/// Next` have no bit set. An error handler shows in the code
+/// (`OnErrorGoto`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ProcOptFlags(pub u16);
 
 impl ProcOptFlags {
-    /// Procedure has an `On Error` exception handler.
-    pub const HAS_ERROR_HANDLER: u16 = 0x10;
-    /// Procedure uses `On Error Resume Next`.
-    pub const HAS_RESUME_NEXT: u16 = 0x20;
+    /// A `Friend` method: the runtime checks `Me` is an instance of the
+    /// defining class.
+    pub const FRIEND: u16 = 0x10;
+    /// Set on `Class_Initialize` and on `Implements` members: `ProcCallEngine`
+    /// does not take the adjusted-`Me` `AddRef` path (see [`ProcOptFlags`]).
+    pub const ADJUSTED_ME_AS_PRIMARY: u16 = 0x20;
 
     /// Tests whether the given flag bit(s) are set.
     #[inline]
@@ -537,27 +674,28 @@ impl ProcOptFlags {
         self.0 & flag != 0
     }
 
-    /// Returns `true` if this procedure has an `On Error` handler.
+    /// Returns `true` for a `Friend` method ([`FRIEND`](Self::FRIEND)).
     #[inline]
-    pub fn has_error_handler(self) -> bool {
-        self.has(Self::HAS_ERROR_HANDLER)
+    pub fn is_friend(self) -> bool {
+        self.has(Self::FRIEND)
     }
 
-    /// Returns `true` if this procedure uses `On Error Resume Next`.
+    /// Returns `true` if bit 0x20 ([`ADJUSTED_ME_AS_PRIMARY`](Self::ADJUSTED_ME_AS_PRIMARY)) is
+    /// set.
     #[inline]
-    pub fn has_resume_next(self) -> bool {
-        self.has(Self::HAS_RESUME_NEXT)
+    pub fn enters_adjusted_me_as_primary(self) -> bool {
+        self.has(Self::ADJUSTED_ME_AS_PRIMARY)
     }
 }
 
 impl fmt::Debug for ProcOptFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ProcOptFlags(0x{:02X}", self.0)?;
-        if self.has_error_handler() {
-            write!(f, " HAS_ERROR_HANDLER")?;
+        if self.is_friend() {
+            write!(f, " FRIEND")?;
         }
-        if self.has_resume_next() {
-            write!(f, " | HAS_RESUME_NEXT")?;
+        if self.enters_adjusted_me_as_primary() {
+            write!(f, " ADJUSTED_ME_AS_PRIMARY")?;
         }
         write!(f, ")")
     }
@@ -569,96 +707,115 @@ impl fmt::Display for ProcOptFlags {
     }
 }
 
+/// A numbered source line: where its code starts and its number, which the
+/// runtime reports as `Erl` for an error in it. Returned by
+/// [`ProcDscInfo::line_numbers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineNumber {
+    /// The P-Code offset of the line's first instruction.
+    pub offset: u16,
+    /// The line number.
+    pub line: u16,
+}
+
 /// P-Code runtime stack frame layout (housekeeping region).
 ///
-/// When `ProcCallEngine_Body` (0x66108C00) enters a P-Code procedure, it
-/// establishes an x86 stack frame with 0x88 bytes of runtime housekeeping
-/// slots above the user's local variable area. Opcode handlers receive
-/// the frame pointer as `arg1` and access slots via `arg1[-N]` indexing.
+/// When `ProcCallEngine` enters a P-Code procedure it establishes an x86
+/// frame with 0x84 bytes of runtime housekeeping below `ebp`; the
+/// procedure's locals (`ProcDscInfo.wFrameSize` bytes) lie below that, and
+/// the evaluation stack is the native stack below them. Opcode handlers
+/// reach the slots as `[ebp - N]`.
 ///
-/// This struct documents the layout for P-Code analysis and lifting.
-/// The frame is NOT stored in the PE file - it exists only at runtime.
+/// The frame is NOT stored in the PE file - it exists only at runtime. Only
+/// the slots the opcode handlers of MSVBVM60 6.00.8176 and 6.00.9848 were
+/// seen to use are named (handler addresses are 8176's).
 ///
 /// # Stack Layout (high to low addresses)
 ///
 /// ```text
-/// ┌─────────────────────────┐ ← caller's ESP
-/// │  caller arguments       │
-/// │  return address          │
-/// ├─────────────────────────┤ ← EBP (frame pointer, arg1 to opcode handlers)
-/// │  saved EBP        [-01] │  EBP-0x04
-/// │  state_flag       [-02] │  EBP-0x08  (initially 0)
-/// │  saved_seh_link   [-03] │  EBP-0x0C
-/// │  (gap)            [-04] │  EBP-0x10
-/// │  (gap)            [-05] │  EBP-0x14
-/// │  saved_pcode_ip   [-06] │  EBP-0x18
-/// │  ... SEH record ...     │  EBP-0x1C..EBP-0x2B
-/// │  seh_handler_data [-0B] │  EBP-0x2C
-/// │  object_ptr       [-0C] │  EBP-0x30
-/// │  (gap)            [-0D] │  EBP-0x34
-/// │  error_state      [-0E] │  EBP-0x38  (initially 0)
-/// │  error_handler_ip [-0F] │  EBP-0x3C  (On Error GoTo target)
-/// │  error_target     [-10] │  EBP-0x40  (resolved handler: 0=off, -2=resume next)
-/// │  engine_context   [-11] │  EBP-0x44  (runtime state, has +0x78/+0x98 fields)
-/// │  engine_tls       [-12] │  EBP-0x48  (thread-local engine state)
-/// │  proc_flags       [-13] │  EBP-0x4C  (error handling mode flags)
-/// │  proc_dsc_info    [-14] │  EBP-0x50  (ProcDscInfo/RTMI pointer)
-/// │  proc_dsc_arg     [-15] │  EBP-0x54  (ProcDscInfo, original arg2)
-/// │  const_pool_va    [-16] │  EBP-0x58  (ObjectInfo.constants_va)
-/// │  pcode_ip         [-17] │  EBP-0x5C  (current P-Code instruction pointer)
-/// │  prev_exc_link    [-18] │  EBP-0x60  (previous exception chain link)
-/// │  (gap)                  │  EBP-0x64..EBP-0x6F
-/// │  handler_fn       [-1C] │  EBP-0x70  (dispatch handler function ptr)
-/// │  (gap)                  │  EBP-0x74..EBP-0x7F
-/// │  saved_ebx        [-20] │  EBP-0x80
-/// │  saved_esi        [-21] │  EBP-0x84
-/// │  saved_edi        [-22] │  EBP-0x88
-/// ├─────────────────────────┤ ← start of user local variables
-/// │  local variables        │  EBP-0x88-wFrameSize .. EBP-0x89
-/// │  (zeroed by memset)     │  size = ProcDscInfo.wFrameSize
-/// └─────────────────────────┘ ← ESP during P-Code execution
+/// ebp+0x0C..       arguments, each as wide as its type (4, 8 or 16 bytes)
+/// ebp+0x08         Me, for a class, form or control method (FLdPrThis);
+///                  in a standard module's procedure, the module's data
+///                  block (`ProcCallEngine` inserts it, 0x66104a99)
+/// ebp+0x04         return address
+/// ebp              saved ebp
+/// ebp-0x14         start of the current statement (LargeBos, 0x66104bfe)
+/// ebp-0x1C         evaluation stack pointer GoSub/Return leave (0x66104d96)
+/// ebp-0x34         GoSub nesting depth (GoSub / Return)
+/// ebp-0x3C         statement an error handler is handling (Resume, 0x6610b0b6)
+/// ebp-0x40         error handler: 0 none, -1 Resume Next, else its address
+///                  (OnErrorGoto, 0x66105e46)
+/// ebp-0x44         runtime context (+0x78 error info, +0x98 Erl, the line
+///                  number of the last error, +0x9C Err.LastDllError)
+/// ebp-0x48         frame flags (ExitProc releases Me when 0x8000 is set)
+/// ebp-0x4C         Pr, the object register of the Mem* / VCall* opcodes
+/// ebp-0x50         the procedure's ProcDscInfo (ExitProc reads its +4)
+/// ebp-0x54         constant pool base (`%s` / `%c` operands: pool + 4 * index)
+/// ebp-0x58         P-Code base (`%l` targets: base + offset)
+/// ebp-0x68         handler scratch
+/// ebp-0x6C         the engine's exit routine, set on entry: 0x66105ddf by
+///                  ProcCallEngine, 0x66105e14 by MethCallEngine
+/// ebp-0x7C..-0x84  saved ebx, esi, edi (ExitProc restores them from ebp-0x84)
+/// ebp-0x84-n..     locals, wFrameSize bytes; a function's return value is at
+///                  their top: an Integer at ebp-0x86, a Long, String or
+///                  object at ebp-0x88, a Double or Currency at ebp-0x8C
 /// ```
 ///
-/// # Key Fields for Analysis
+/// # State on entry
 ///
-/// - **`pcode_ip` (EBP-0x5C)**: Updated by branch/call opcodes. The current
-///   instruction address.
-/// - **`const_pool_va` (EBP-0x58)**: Base VA for all constant pool references
-///   (`%s` operand format). Equal to `ObjectInfo.constants_va`.
-/// - **`proc_dsc_info` (EBP-0x50)**: Pointer to the ProcDscInfo/RTMI structure.
-///   Used by Resume handler for BOS skip table lookup.
-/// - **`error_handler_ip` (EBP-0x3C)**: Set by `On Error GoTo <label>` (opcode
-///   0x4B). Cleared to 0 by `On Error GoTo 0`. Set to -2 for `Resume Next`.
-/// - **`engine_context` (EBP-0x44)**: Pointer to runtime engine state with
-///   error tracking (+0x78 = current error info, +0x98 = error code).
+/// Before the first instruction `ProcCallEngine` (0x66104b04..0x66104b3f)
+/// zeroes the locals ([`ProcDscInfo::zeroed_frame`]), so every local,
+/// including a function's return value, starts as 0 (an empty String, a
+/// `Nothing` object, an `Empty` Variant). A frame below the thread's stack
+/// limit raises error 28 (Out of stack space) instead. Then, when
+/// [`ProcDscInfo::cleanup_count`] is non-zero, the cleanup table's
+/// initializer writes the descriptors of the fixed-size arrays and UDTs it
+/// lists over those zeroes.
+///
+/// Of the housekeeping slots, the error handler (ebp-0x40), the handled
+/// statement (ebp-0x3C) and the GoSub depth (ebp-0x34) start at 0; the frame
+/// flags (ebp-0x48) at 0, or at 0x4000, 0xC000 or 0xE000 when the
+/// procedure is a method entered through `MethCallEngine`; the
+/// ProcDscInfo, constant pool, P-Code base, runtime context and exit routine
+/// slots hold their values. Pr (ebp-0x4C) is not written: it holds
+/// whatever the stack held until the procedure's first `FLdPr`-family
+/// instruction loads it.
 pub mod pcode_frame {
-    /// Offset of the current P-Code instruction pointer from EBP.
-    pub const PCODE_IP: i32 = -0x5C;
-    /// Offset of the constant pool base VA from EBP.
-    pub const CONST_POOL_VA: i32 = -0x58;
-    /// Offset of the ProcDscInfo (RTMI) pointer from EBP.
-    pub const PROC_DSC_INFO: i32 = -0x50;
-    /// Offset of the error handler P-Code address from EBP.
-    pub const ERROR_HANDLER_IP: i32 = -0x3C;
-    /// Offset of the resolved error target from EBP.
-    /// 0 = disabled, -2 = Resume Next, else = P-Code VA.
-    pub const ERROR_TARGET: i32 = -0x40;
-    /// Offset of the runtime engine context pointer from EBP.
+    /// Offset of `Me` from EBP in an object's method.
+    ///
+    /// A standard module's procedure has the module's data block in this
+    /// slot instead: `ProcCallEngine` (0x66104a99) pops the return address,
+    /// pushes `PublicObjectDescriptor.lpModulePublic` of the procedure's
+    /// object and pushes the return address back, so every P-Code procedure
+    /// has the same frame shape.
+    pub const ME: i32 = 0x08;
+    /// Offset of the first explicit argument from EBP, in every P-Code
+    /// procedure (an object's method or a standard module's procedure).
+    pub const FIRST_ARG: i32 = 0x0C;
+    /// Offset of the current statement's start (written by `LargeBos`).
+    pub const STATEMENT_IP: i32 = -0x14;
+    /// Offset of the evaluation stack pointer `GoSub` and `Return` record.
+    pub const STATEMENT_ESP: i32 = -0x1C;
+    /// Offset of the `GoSub` nesting depth.
+    pub const GOSUB_DEPTH: i32 = -0x34;
+    /// Offset of the statement an error handler is handling (`Resume` target).
+    pub const ERROR_STATEMENT: i32 = -0x3C;
+    /// Offset of the error handler: 0 none, -1 `Resume Next`, else its address.
+    pub const ERROR_HANDLER: i32 = -0x40;
+    /// Offset of the runtime context pointer.
     pub const ENGINE_CONTEXT: i32 = -0x44;
-    /// Offset of the thread-local engine state from EBP.
-    pub const ENGINE_TLS: i32 = -0x48;
-    /// Offset of the procedure flags (error mode) from EBP.
-    pub const PROC_FLAGS: i32 = -0x4C;
-    /// Offset of the object/dispatch pointer from EBP.
-    pub const OBJECT_PTR: i32 = -0x30;
-    /// Offset of the error state from EBP.
-    pub const ERROR_STATE: i32 = -0x38;
-    /// Offset of the saved P-Code IP (for returns) from EBP.
-    pub const SAVED_PCODE_IP: i32 = -0x18;
-    /// Offset of the dispatch handler function pointer from EBP.
-    pub const HANDLER_FN: i32 = -0x70;
-    /// Total size of the housekeeping region (bytes above local vars).
-    pub const HOUSEKEEPING_SIZE: u32 = 0x88;
+    /// Offset of the frame flags.
+    pub const FRAME_FLAGS: i32 = -0x48;
+    /// Offset of Pr, the object register.
+    pub const OBJECT_REGISTER: i32 = -0x4C;
+    /// Offset of the procedure's ProcDscInfo pointer.
+    pub const PROC_DSC_INFO: i32 = -0x50;
+    /// Offset of the constant pool base.
+    pub const CONST_POOL: i32 = -0x54;
+    /// Offset of the P-Code base that jump targets are relative to.
+    pub const CODE_BASE: i32 = -0x58;
+    /// Total size of the housekeeping region (bytes above the locals).
+    pub const HOUSEKEEPING_SIZE: u32 = 0x84;
 }
 
 #[cfg(test)]
@@ -678,6 +835,7 @@ mod tests {
         assert_eq!(pdi.arg_size().unwrap(), 0x0010);
         assert_eq!(pdi.arg_count().unwrap(), 4);
         assert_eq!(pdi.frame_size().unwrap(), 0x0100);
+        assert_eq!(pdi.zeroed_frame().unwrap(), -0x184..-0x84);
         assert_eq!(pdi.pcode_back_offset().unwrap(), 0x0050);
         assert_eq!(pdi.proc_size().unwrap(), 0x0050); // legacy alias
         assert_eq!(pdi.total_size().unwrap(), 0x0024);
@@ -723,7 +881,7 @@ mod tests {
         let _ = pdi.pcode_back_offset().unwrap();
         let _ = pdi.total_size().unwrap();
         let _ = pdi.proc_opt_flags().unwrap();
-        let _ = pdi.reserved_0e().unwrap();
+        let _ = pdi.line_table_offset().unwrap();
         let _ = pdi.resume_fixup_table_offset().unwrap();
         let _ = pdi.base_iface_slot_count().unwrap();
         let _ = pdi.reserved_14().unwrap();
