@@ -1,351 +1,75 @@
-//! PublicBytes structure parsers.
+//! Variable descriptor tables (PublicBytes and StaticBytes).
 //!
-//! The `PublicObjectDescriptor.public_bytes_va` field points to a structure
-//! that varies by object type:
-//!
-//! - **Standard modules (.bas)**: [`PublicVarTable`] - variable descriptor table
-//!   with frame offsets and type codes for each public variable.
-//! - **Classes/Forms**: [`ClassFormPublicBytes`] - COM interface GUIDs, instance
-//!   size, and runtime function stubs.
-//!
-//! Both formats share `+0x02` as a u16 read by `EbLoadRunTime` in the runtime.
-//! For modules this is the total public variable data frame size; for
-//! classes/forms it's the per-instance data size. In both cases the runtime
-//! uses it as the `memset` byte count for zero-initializing the instance.
-//!
-//! # Module Variable Descriptor Layout
+//! The `PublicObjectDescriptor.public_bytes_va` field points to a variable
+//! descriptor table, and `PublicObjectDescriptor.static_bytes_va` (when
+//! non-zero) to one for the object's `Static` locals. The format is the
+//! same for every object type, standard modules included:
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x00 | 2 | `wTotalSize` - total byte size of the structure |
-//! | 0x02 | 2 | `wDataFrameSize` - instance data frame size in bytes |
-//! | 0x04 | 2 | Reserved (0) |
-//! | 0x06 | 2 | `wVarCount` - number of public variable descriptors |
+//! | 0x00 | 2 | Total byte size of the structure |
+//! | 0x02 | 2 | Size of the variable data block (module data, class instance, static block) |
+//! | 0x04 | 2 | Number of entries that need initialization (fixed-size arrays in the fixtures) |
+//! | 0x06 | 2 | Number of entries |
+//! | 0x08 | 4 | Unknown (0, except 0x10000000 in both tables of `tests/fixtures/statics` `Program`) |
+//! | 0x0C | var | Entries, variable-length, in the [`controlprop`](super::controlprop) format |
 //!
-//! After the 8-byte header, variable descriptors follow as 4-byte entries:
+//! There is one entry per variable that needs initialization or cleanup
+//! (`String`, `Variant`, `Object`, arrays, UDTs; Private as well as
+//! Public), none for scalars such as `Long` (`statics` `Other` declares
+//! `Public o_Value As Long` and `Public o_Text As String` and has one
+//! entry, String at 0x04). An entry's type byte is a
+//! [`ControlPropertyType`](super::controlprop::ControlPropertyType)
+//! nibble: `0x01` is String (`flow`: `Private m_Log As String` at offset 0).
+//! The table holds no variable names.
 //!
-//! | Offset | Size | Field |
-//! |--------|------|-------|
-//! | 0x00 | 2 | `wFrameOffset` - byte offset within the module's public data area |
-//! | 0x02 | 2 | `wTypeCode` - variable type (see below) |
+//! The runtime walks all three kinds of table with one routine (MSVBVM60
+//! 6.00.8176 `0x6600E62B`): it visits `+0x06` entries from +0x0C, sizing
+//! each with `0x660399BA`, and stops once `+0x04` of them have been
+//! initialized. For a module it first zero-fills the module data block with
+//! the `+0x02` size (6.00.8176 `0x660276C1`). `EbLoadRunTime` stores each
+//! object's `+0x02` size in its per-object record (6.00.9848
+//! `0x6602F883`).
 //!
-//! # Known Type Codes
-//!
-//! | Code | Meaning |
-//! |------|---------|
-//! | 0x0001 | Variant or untyped (default in VB6 for `Public x`) |
-//! | 0x0003 | Long |
-//! | 0x0008 | String |
-//! | 0x0105 | Double (with flags?) |
-//!
-//! # Discovery
-//!
-//! Reverse-engineered from pe\_x86\_vb\_loader sample. The format is confirmed
-//! for standard modules (`mod_Variaveis`, `modUtil`). Class/form objects use
-//! a different format at the same VA - the per-instance member descriptor
-//! table - parsed by [`ClassFormPublicBytes`] and
-//! [`controlprop`](super::controlprop) (member types and resource-cleanup
-//! classification verified against the runtime init/cleanup dispatchers).
+//! [`ClassFormPublicBytes`] reads this format for every object type.
 
-use crate::{
-    error::Error,
-    util::read_u16_le,
-    vb::{control::Guid, controlprop::ControlPropertyIter, external::VbBaseType},
-};
+use crate::{error::Error, util::read_u16_le, vb::controlprop::ControlPropertyIter};
 
-/// View over a PublicBytes variable descriptor table.
+/// View over a variable descriptor table (see the [module docs](self)).
 ///
-/// The format is shared across all object types (modules, forms, classes).
-/// The table contains a mix of public variable descriptors and potentially
-/// other data entries. Use [`valid_vars`](Self::valid_vars) to iterate only
-/// entries that look like valid variable descriptors.
+/// The table at `PublicObjectDescriptor.public_bytes_va` (or
+/// `static_bytes_va`) of any object: standard module, class, form or
+/// UserControl. [`VbObject::public_bytes`](crate::project::VbObject::public_bytes)
+/// and [`VbObject::static_bytes`](crate::project::VbObject::static_bytes)
+/// read it. Despite the type's name and its accessors' (`control_*`,
+/// `property_count`), the entries describe variables.
 ///
-/// # Header (12 bytes)
+/// # Runtime Access (MSVBVM60 6.00.9848 addresses)
 ///
-/// | Offset | Size | Field |
-/// |--------|------|-------|
-/// | 0x00 | 2 | `wTotalSize` - total byte size of the structure |
-/// | 0x02 | 2 | `wDataFrameSize` - instance data frame size in bytes (see below) |
-/// | 0x04 | 2 | `wExtraCount` - number of non-variable entries mixed in |
-/// | 0x06 | 2 | `wVarCount` - total entry count (includes extra entries) |
-/// | 0x08 | 4 | Padding (always 0) |
-///
-/// # Data Frame Size (+0x02)
-///
-/// Read by `EbLoadRunTime` (stored at `basic_class+0x1C`) and by
-/// `InitObjectInstances` as the `memset` byte count when zero-initializing
-/// the object's instance data area. For modules this is the total byte
-/// size of the public variable data frame. For classes/forms this is the
-/// per-instance COM object data size (same semantics as
-/// [`ClassFormPublicBytes::instance_size`]).
-#[derive(Clone, Copy, Debug)]
-pub struct PublicVarTable<'a> {
-    /// Raw backing bytes borrowed from the PE file buffer.
-    bytes: &'a [u8],
-    /// Number of entries parsed from the header.
-    var_count: u16,
-}
-
-impl<'a> PublicVarTable<'a> {
-    /// Header size in bytes (8 bytes of header + 4 bytes of sentinel/padding).
-    pub const HEADER_SIZE: usize = 12;
-
-    /// Size of each variable descriptor entry in bytes.
-    pub const ENTRY_SIZE: usize = 4;
-
-    /// Parses a PublicVarTable from the given byte slice.
-    ///
-    /// Reads the 12-byte header and validates that enough data exists for
-    /// all declared variable entries.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::TooShort`] if the slice is shorter than the header
-    /// or doesn't contain enough bytes for the declared variable count.
-    pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
-        if data.len() < Self::HEADER_SIZE {
-            return Err(Error::TooShort {
-                expected: Self::HEADER_SIZE,
-                actual: data.len(),
-                context: "PublicVarTable header",
-            });
-        }
-
-        let var_count = read_u16_le(data, 0x06)?;
-
-        // Entries follow the header; we need at least header + var_count * 4 bytes.
-        // Some objects have extra padding entries, so we tolerate shorter data
-        // by clamping var_count to what's available.
-        let available_entries = (data.len().saturating_sub(Self::HEADER_SIZE)) / Self::ENTRY_SIZE;
-        let effective_count = var_count.min(available_entries as u16);
-
-        Ok(Self {
-            bytes: data,
-            var_count: effective_count,
-        })
-    }
-
-    /// Total size declared in the header at offset 0x00.
-    #[inline]
-    pub fn total_size(&self) -> Result<u16, Error> {
-        read_u16_le(self.bytes, 0x00)
-    }
-
-    /// Number of non-variable entries at offset 0x04.
-    ///
-    /// When non-zero, some entries in the table are NOT variable descriptors
-    /// but other data (COM interface info, string fragments, etc.).
-    /// Use [`valid_vars`](Self::valid_vars) to skip these.
-    #[inline]
-    pub fn extra_count(&self) -> Result<u16, Error> {
-        read_u16_le(self.bytes, 0x04)
-    }
-
-    /// Instance data frame size in bytes at offset 0x02.
-    ///
-    /// Read by `EbLoadRunTime` (0x6602f6ce) and stored at `basic_class+0x1C`.
-    /// Used by `InitObjectInstances` (0x6602b56d) as the `memset` byte count
-    /// to zero-initialize the object's data area.
-    ///
-    /// For modules: total byte size of the public variable data frame
-    /// (e.g., 0x48 for 15 variables ending at offset 0x3C + 8-byte Double).
-    /// For classes/forms: equivalent to [`ClassFormPublicBytes::instance_size`].
-    #[inline]
-    pub fn data_frame_size(&self) -> Result<u16, Error> {
-        read_u16_le(self.bytes, 0x02)
-    }
-
-    /// Number of public variable descriptors.
-    #[inline]
-    pub fn var_count(&self) -> u16 {
-        self.var_count
-    }
-
-    /// Returns the variable descriptor at `index`.
-    ///
-    /// Returns `None` if `index >= var_count()`.
-    pub fn var(&self, index: u16) -> Option<PublicVarEntry> {
-        if index >= self.var_count {
-            return None;
-        }
-        let offset =
-            Self::HEADER_SIZE.checked_add((index as usize).checked_mul(Self::ENTRY_SIZE)?)?;
-        let end = offset.checked_add(Self::ENTRY_SIZE)?;
-        if end > self.bytes.len() {
-            return None;
-        }
-        Some(PublicVarEntry {
-            frame_offset: read_u16_le(self.bytes, offset).ok()?,
-            type_code: read_u16_le(self.bytes, offset.checked_add(2)?).ok()?,
-        })
-    }
-
-    /// Returns an iterator over all entries (including potentially invalid ones).
-    pub fn vars(&self) -> PublicVarIter<'_> {
-        PublicVarIter {
-            table: self,
-            index: 0,
-        }
-    }
-
-    /// Returns an iterator over only valid variable descriptors.
-    ///
-    /// Filters out entries that don't look like variable descriptors
-    /// (e.g., COM interface data mixed into the table when `extra_count > 0`).
-    pub fn valid_vars(&self) -> impl Iterator<Item = PublicVarEntry> + '_ {
-        self.vars().filter(|e| e.is_valid())
-    }
-}
-
-/// A single public variable descriptor entry.
-///
-/// # Available data
-///
-/// Each entry is exactly 4 bytes: `frame_offset` (u16) + `type_code` (u16).
-/// There is **no per-entry name VA** in `PublicVarTable` - the runtime
-/// (`EbLoadRunTime` at `0x6602F6CE`) reads only the table header for the
-/// instance-buffer size and never inspects entries for names.
-///
-/// # Recovering variable names
-///
-/// Public-variable names ARE recoverable indirectly: the VB6 compiler
-/// emits `Property Get` / `Let` / `Set` accessors for each public module
-/// variable, and these appear at the **tail** of the FuncTypDesc array
-/// (at indices `>= func_count`) reachable via
-/// [`PrivateObjectDescriptor::func_type_descs_va`](super::privateobj::PrivateObjectDescriptor::func_type_descs_va).
-/// Use [`VbObject::func_type_descs`](crate::project::VbObject::func_type_descs)
-/// to walk that array and recover names by stripping the `Get_` / `Let_` /
-/// `Set_` prefix from the accessor name. One-to-one mapping with this
-/// table is not exhaustively verified across all object types.
-///
-/// # Default values
-///
-/// VB6 syntax does not allow inline initializers at module scope
-/// (`Public x As Long = 5` is invalid), so this table carries **no static
-/// default values**. Defaults observed at runtime are produced by
-/// compiler-generated initialization P-Code (`Class_Initialize` and
-/// equivalents), not by metadata. Recovering them requires P-Code
-/// analysis of the module's init procedure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PublicVarEntry {
-    /// Byte offset within the module's public data area.
-    pub frame_offset: u16,
-    /// Type code for the variable.
-    ///
-    /// Known values: `0x0001` = Variant/untyped, `0x0003` = Long,
-    /// `0x0008` = String. Other values are type+flags combinations
-    /// whose exact encoding is not fully documented.
-    pub type_code: u16,
-}
-
-impl PublicVarEntry {
-    /// Returns the base type as a [`VbBaseType`] enum.
-    ///
-    /// The low byte of `type_code` uses the same VB type encoding as
-    /// [`VbType`](crate::vb::external::VbType). Note: code `0x01` in
-    /// PublicVarTable means Variant (not Null as in VarType), and
-    /// `0x0C` also maps to Variant.
-    pub fn base_type(&self) -> VbBaseType {
-        // PublicVarTable uses slightly different codes than VbType:
-        // 0x01 = Variant (not Null), 0x0C = Variant (not Boolean)
-        match self.type_code & 0xFF {
-            0x01 | 0x0C => VbBaseType::Variant,
-            0x09 => VbBaseType::Object,
-            other => VbBaseType::from_raw(other as u8),
-        }
-    }
-
-    /// Returns a human-readable type name based on the low byte of the type code.
-    pub fn type_name(&self) -> &'static str {
-        self.base_type().name()
-    }
-
-    /// Returns the flags in the high byte of the type code.
-    ///
-    /// Known values: `0x01` in `0x0105` (Double with flag). Exact semantics
-    /// of individual bits are not fully documented.
-    #[inline]
-    pub fn type_flags(&self) -> u8 {
-        (self.type_code >> 8) as u8
-    }
-
-    /// Returns `true` if this entry looks like a valid variable descriptor.
-    ///
-    /// Some PublicBytes tables contain non-variable entries (COM interface data,
-    /// string fragments) mixed in. This checks that the frame offset is reasonable
-    /// and the type code has a known base type.
-    pub fn is_valid(&self) -> bool {
-        // Exclude null/sentinel entries (offset=0 AND type=0)
-        if self.frame_offset == 0 && self.type_code == 0 {
-            return false;
-        }
-        let base = self.type_code & 0xFF;
-        let known_type = matches!(
-            base,
-            0x01 | 0x02
-                | 0x03
-                | 0x04
-                | 0x05
-                | 0x06
-                | 0x07
-                | 0x08
-                | 0x09
-                | 0x0B
-                | 0x0C
-                | 0x0D
-                | 0x11
-        );
-        known_type && self.frame_offset < 0x1000
-    }
-}
-
-/// Iterator over public variable descriptors in a [`PublicVarTable`].
-#[must_use = "iterators are lazy and do nothing unless consumed"]
-pub struct PublicVarIter<'a> {
-    /// Reference to the parent table.
-    table: &'a PublicVarTable<'a>,
-    /// Current zero-based position.
-    index: u16,
-}
-
-impl Iterator for PublicVarIter<'_> {
-    type Item = PublicVarEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.table.var(self.index)?;
-        self.index = self.index.saturating_add(1);
-        Some(entry)
-    }
-}
-
-/// View over a class/form PublicBytes structure.
-///
-/// For classes and forms, `PublicObjectDescriptor.public_bytes_va` points to
-/// a structure with instance size and control initialization data, NOT the
-/// variable descriptor table used by modules.
-///
-/// # Runtime Access (verified via MSVBVM60.DLL tracing)
-///
-/// - `EbLoadRunTime`: reads `+0x02` (wInstanceSize) → `basic_class+0x1C`
-/// - `sub_6602b56d`: reads `+0x02` for `memset` sizing of instance buffer
-/// - `sub_6601505e`: reads `+0x04` (wPropertyCount), `+0x06` (wControlCount),
-///   then iterates typed entries starting at `+0x0C`
-/// - `+0x00` (wDataSize) is **not read** by the runtime
+/// - `EbLoadRunTime` (`0x6602F6CE`): reads `+0x02` (wInstanceSize) into its
+///   per-object record at `+0x1C` (`0x6602F883`)
+/// - `0x6602B56D`: zero-fills a module's data block with `+0x02` bytes
+/// - `0x6601505E`: reads `+0x04` (wPropertyCount), `+0x06` (wControlCount),
+///   then walks the entries from `+0x0C`
+/// - no read of `+0x00` (wDataSize) was found
 ///
 /// # Layout
 ///
 /// | Offset | Size | Field | Runtime reads? |
 /// |--------|------|-------|----------------|
-/// | 0x00 | 2 | `wDataSize` - compiler metadata (header size) | No |
-/// | 0x02 | 2 | `wInstanceSize` - per-object instance size in bytes | Yes |
-/// | 0x04 | 2 | `wPropertyCount` - property init entries in the array | Yes |
-/// | 0x06 | 2 | `wControlCount` - total control init entries | Yes |
+/// | 0x00 | 2 | `wDataSize` - total size of the table | No |
+/// | 0x02 | 2 | `wInstanceSize` - size of the variable data block | Yes |
+/// | 0x04 | 2 | `wPropertyCount` - entries that need initialization | Yes |
+/// | 0x06 | 2 | `wControlCount` - number of entries | Yes |
 /// | 0x08 | 4 | Reserved / flags | No |
-/// | 0x0C | var | Control/property init entries (typed, variable-length) | Yes (when counts > 0) |
+/// | 0x0C | var | Variable entries (typed, variable-length) | Yes (when counts > 0) |
 ///
-/// When `wControlCount == 0` (forms with no embedded controls), the data at
-/// +0x0C may contain COM interface GUIDs written by the compiler but not
-/// read by the runtime.
+/// The structure is `wDataSize` bytes long: 0x0C when both counts are 0
+/// (every such class and form in `tests/fixtures`). What follows it belongs
+/// to other structures (Board in `tests/fixtures/forms`: the `Global` class
+/// record of another object's constant pool; Gauge: a BSTR), so nothing
+/// past `wDataSize` is read. The object's IIDs are in its
+/// [`OptionalObjectInfo`](super::object::OptionalObjectInfo).
 #[derive(Clone, Copy, Debug)]
 pub struct ClassFormPublicBytes<'a> {
     bytes: &'a [u8],
@@ -355,7 +79,7 @@ impl<'a> ClassFormPublicBytes<'a> {
     /// Minimum size to read the header fields.
     pub const MIN_SIZE: usize = 0x0C;
 
-    /// Parses class/form PublicBytes from the given byte slice.
+    /// Parses a variable descriptor table from the given byte slice.
     ///
     /// # Errors
     ///
@@ -371,85 +95,79 @@ impl<'a> ClassFormPublicBytes<'a> {
         Ok(Self { bytes: data })
     }
 
-    /// Header/data area size at offset 0x00.
+    /// Total size of the structure at offset 0x00: the 0x0C-byte header
+    /// plus the entries.
     ///
-    /// Compiler metadata. Not read by the runtime.
-    /// Forms: typically 0x0C. Classes: 0x38+.
+    /// 0x0C when there are no entries (every form in the fixtures, and
+    /// `calls` `Shape`, `events` `Source`); 0x10 for `flow`'s module
+    /// (`m_Log As String`); 0x46 for `data`'s module; 0x64 for `dispid` `Bag`.
     #[inline]
     pub fn data_size(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x00)
     }
 
-    /// Per-object instance data size at offset 0x02.
+    /// Size of the variable data block at offset 0x02: the instance size of
+    /// a class, form or UserControl, the data block of a module, the static
+    /// block of a `Static` table.
     ///
-    /// Read by `EbLoadRunTime` and stored at `basic_class+0x1C`.
-    /// Also used by `sub_6602b56d` to `memset` the instance buffer.
-    /// - Forms: typically 0x44 (68 bytes)
-    /// - Classes: typically 0x28-0x60+ depending on member variables
+    /// Read by `EbLoadRunTime` into its per-object record (6.00.9848
+    /// `0x6602F883`); for a module the runtime zero-fills the block at
+    /// [`PublicObjectDescriptor::module_public_va`](super::object::PublicObjectDescriptor::module_public_va)
+    /// with this size (6.00.8176 `0x66027700`). Equal to
+    /// [`PrivateObjectDescriptor::instance_size`](super::privateobj::PrivateObjectDescriptor::instance_size)
+    /// for every fixture object that has one. Fixtures: classes 0x40 (no
+    /// member variables: `calls` `Shape`, `events` `Measure`) to 0x88
+    /// (`dispid` `Bag`); forms 0x44 to 0x54; UserControls 0x50 and 0x94;
+    /// modules 0x08 (`flow`) to 0x44 (`statics` `Program`).
     #[inline]
     pub fn instance_size(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x02)
     }
 
-    /// Number of property init entries at offset 0x04.
+    /// Number of entries that need initialization, at offset 0x04.
     ///
-    /// Inner loop limit in `sub_6601505e`. Zero for forms without
-    /// embedded control properties.
+    /// The runtime's entry walk stops once this many entries have been
+    /// initialized (MSVBVM60 6.00.8176 `0x6600E64F`). In the fixtures it
+    /// counts the fixed-size arrays (`data` `Program` 1, `dispid` `Bag` 2).
     #[inline]
     pub fn property_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x04)
     }
 
-    /// Total number of control init entries at offset 0x06.
+    /// Number of entries at offset 0x06.
     ///
-    /// Outer loop count in `sub_6601505e`. Each entry at +0x0C is a
-    /// typed control property descriptor with variable length.
-    /// Zero for forms without embedded controls.
+    /// The runtime's walk visits at most this many (6.00.8176
+    /// `0x6600E68F`). Each entry at +0x0C is a typed, variable-length
+    /// [`controlprop`](super::controlprop) entry. 0 for a table with only
+    /// its header.
     #[inline]
     pub fn control_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x06)
     }
 
-    /// Returns `true` if this structure has control initialization entries.
+    /// Returns `true` if the table has entries.
     #[inline]
     pub fn has_controls(&self) -> bool {
         self.control_count().is_ok_and(|c| c > 0)
     }
 
-    /// Raw bytes of the control/property entry array starting at +0x0C.
+    /// Raw bytes of the entry array: from +0x0C to `wDataSize` (or the end
+    /// of the backing slice, if shorter).
     ///
-    /// When [`has_controls`](Self::has_controls) is true, this contains
-    /// typed control property descriptors parsed by `sub_660481fc`.
-    /// When false, may contain COM interface GUIDs (compiler metadata).
+    /// Empty when the structure is only its 0x0C-byte header.
     pub fn entry_data(&self) -> &'a [u8] {
-        self.bytes.get(0x0C..).unwrap_or(&[])
+        let end = self.data_size().map_or(self.bytes.len(), |size| {
+            usize::from(size).min(self.bytes.len())
+        });
+        self.bytes.get(0x0C..end).unwrap_or(&[])
     }
 
-    /// Default interface IID at offset 0x0C (when no controls are present).
+    /// Returns an iterator over the variable entries starting at +0x0C.
     ///
-    /// Only meaningful when `control_count() == 0`. When controls ARE present,
-    /// offset +0x0C contains control property data instead.
-    pub fn default_iid(&self) -> Option<Guid> {
-        if self.has_controls() {
-            return None;
-        }
-        Guid::from_bytes(self.bytes.get(0x0C..0x1C)?)
-    }
-
-    /// Events interface IID at offset 0x1C (when no controls are present).
-    ///
-    /// Only meaningful when `control_count() == 0`.
-    pub fn events_iid(&self) -> Option<Guid> {
-        if self.has_controls() {
-            return None;
-        }
-        Guid::from_bytes(self.bytes.get(0x1C..0x2C)?)
-    }
-
-    /// Returns an iterator over control/property init entries starting at +0x0C.
-    ///
-    /// Only meaningful when [`has_controls`](Self::has_controls) is true.
     /// See [`controlprop`](super::controlprop) for entry types and format.
+    /// `tests/fixtures/flow`'s module yields one String entry at offset 0
+    /// (`Private m_Log As String`); `statics` `Program` String at 0x0C, UDT
+    /// at 0x10 and array at 0x24.
     pub fn control_entries(&self) -> ControlPropertyIter<'a> {
         ControlPropertyIter::new(self.entry_data(), self.control_count().unwrap_or(0))
     }
@@ -460,8 +178,8 @@ mod tests {
     use super::*;
     use crate::vb::controlprop::ControlPropertyType;
 
-    // Real data from mod_Variaveis in pe_x86_vb_loader sample
-    // 15 public variables, all type 0x0001 except last = 0x0105
+    // A module's table from an external sample (mod_Variaveis): 15 entries,
+    // String entries at 0x00..0x30, a dynamic array at 0x3C, String at 0x40.
     const MOD_VARIAVEIS: [u8; 78] = [
         0x4E, 0x00, 0x48, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
         0x00, 0x04, 0x00, 0x01, 0x00, 0x08, 0x00, 0x01, 0x00, 0x0C, 0x00, 0x01, 0x00, 0x10, 0x00,
@@ -471,71 +189,19 @@ mod tests {
         0x00, 0x01, 0x00,
     ];
 
-    // Real data from modUtil - 1 public variable of type Long
-    const MOD_UTIL: [u8; 16] = [
-        0x10, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
-        0x00,
-    ];
-
     #[test]
-    fn test_parse_mod_variaveis() {
-        let table = PublicVarTable::parse(&MOD_VARIAVEIS).unwrap();
-        assert_eq!(table.total_size().unwrap(), 0x4E);
-        assert_eq!(table.var_count(), 15);
-
-        // First variable
-        let v0 = table.var(0).unwrap();
-        assert_eq!(v0.frame_offset, 0x0000);
-        assert_eq!(v0.type_code, 0x0001);
-        assert_eq!(v0.type_name(), "Variant");
-
-        // Second variable
-        let v1 = table.var(1).unwrap();
-        assert_eq!(v1.frame_offset, 0x0004);
-        assert_eq!(v1.type_code, 0x0001);
-
-        // Iterator count
-        assert_eq!(table.vars().count(), 15);
-    }
-
-    #[test]
-    fn test_parse_mod_util() {
-        let table = PublicVarTable::parse(&MOD_UTIL).unwrap();
-        assert_eq!(table.total_size().unwrap(), 0x10);
-        assert_eq!(table.var_count(), 1);
-
-        let v0 = table.var(0).unwrap();
-        assert_eq!(v0.frame_offset, 0x0000);
-        assert_eq!(v0.type_code, 0x0003);
-        assert_eq!(v0.type_name(), "Long");
-        assert_eq!(v0.type_flags(), 0);
-    }
-
-    #[test]
-    fn test_var_out_of_range() {
-        let table = PublicVarTable::parse(&MOD_UTIL).unwrap();
-        assert!(table.var(1).is_none());
-    }
-
-    #[test]
-    fn test_parse_too_short() {
-        assert!(PublicVarTable::parse(&[0; 7]).is_err());
-    }
-
-    #[test]
-    fn test_type_names() {
-        let entry = PublicVarEntry {
-            frame_offset: 0,
-            type_code: 0x0003,
-        };
-        assert_eq!(entry.type_name(), "Long");
-
-        let entry = PublicVarEntry {
-            frame_offset: 0,
-            type_code: 0x0105,
-        };
-        assert_eq!(entry.type_name(), "Double");
-        assert_eq!(entry.type_flags(), 0x01);
+    fn test_module_table_entries() {
+        let table = ClassFormPublicBytes::parse(&MOD_VARIAVEIS).unwrap();
+        assert_eq!(table.data_size().unwrap(), 0x4E);
+        assert_eq!(table.instance_size().unwrap(), 0x48);
+        assert_eq!(table.control_count().unwrap(), 15);
+        let entries: Vec<_> = table.control_entries().take(14).collect();
+        for (i, entry) in entries.iter().take(13).enumerate() {
+            assert_eq!(usize::from(entry.frame_offset().unwrap()), 4 * i);
+            assert_eq!(entry.property_type(), ControlPropertyType::String);
+        }
+        assert_eq!(entries[13].frame_offset().unwrap(), 0x3C);
+        assert_eq!(entries[13].property_type(), ControlPropertyType::Array);
     }
 
     // Real data from Form1 in pe_x86_vb_loader sample (no embedded controls)
@@ -572,10 +238,8 @@ mod tests {
         assert_eq!(cfpb.property_count().unwrap(), 0);
         assert_eq!(cfpb.control_count().unwrap(), 0);
         assert!(!cfpb.has_controls());
-        // GUIDs available when no controls
-        assert!(cfpb.default_iid().is_some());
-        assert!(cfpb.events_iid().is_some());
-        assert_ne!(cfpb.default_iid(), cfpb.events_iid());
+        // The structure ends at wDataSize: what follows is not its data.
+        assert!(cfpb.entry_data().is_empty());
     }
 
     #[test]
@@ -586,9 +250,6 @@ mod tests {
         assert_eq!(cfpb.property_count().unwrap(), 1);
         assert_eq!(cfpb.control_count().unwrap(), 1);
         assert!(cfpb.has_controls());
-        // GUIDs NOT available when controls present (+0x0C is control data)
-        assert!(cfpb.default_iid().is_none());
-        assert!(cfpb.events_iid().is_none());
         // Entry data is available
         assert!(!cfpb.entry_data().is_empty());
     }

@@ -1,8 +1,9 @@
 //! Parse and inspect Visual Basic 6 compiled binaries.
 //!
-//! This crate provides typed access to all internal structures within a
-//! VB6 compiled executable, from the PE entry point down to individual
-//! P-Code bytecode instructions.
+//! This crate provides typed access to the internal structures of a VB6
+//! compiled executable, from the PE entry point down to individual P-Code
+//! instructions. In a native-code build the procedures are machine code,
+//! which the crate locates but does not decode.
 //!
 //! # Quick Start
 //!
@@ -28,10 +29,14 @@
 //!
 //! - **Address translation** ([`addressmap::AddressMap`]): Converts VAs/RVAs to file offsets
 //!   using section tables from [`goblin`].
+//! - **Entry point** ([`entrypoint`]): Finds the VBHeader through the PE entry
+//!   point stub (EXE) or the COM export stubs (DLL, OCX).
 //! - **VB structures** ([`vb`]): View types for each structure in the VB6
 //!   internal format (VBHeader, ProjectData, ObjectTable, etc.).
 //! - **P-Code decoding** ([`pcode`]): Opcode tables, operand types, and a streaming
 //!   instruction iterator.
+//! - **Imports** ([`imports::ImportTable`]): The PE import table by address
+//!   table slot, naming the runtime functions P-Code calls by ordinal.
 //! - **High-level API** ([`VbProject`]): Ties everything together into a convenient
 //!   exploration interface.
 //!
@@ -45,7 +50,7 @@
 //!
 //! VB6 binaries from the wild include malware samples that may be truncated,
 //! have inconsistent structure-size fields, or carry intentionally adversarial
-//! VAs. Every public API in this crate falls into one of three behavioural
+//! VAs. Every public API in this crate falls into one of four behavioural
 //! categories - pick the one that matches your call site:
 //!
 //! ## 1. Fail-loud at the byte boundary (primitive accessors)
@@ -56,35 +61,41 @@
 //! [`VbObject::name_bytes`](crate::project::VbObject::name_bytes) returns
 //! `Result<T, Error>`. The crate's underlying byte readers are
 //! panic-free (no `unwrap`, no panicking indexing, no unchecked arithmetic);
-//! out-of-buffer reads surface as
-//! [`Error::Truncated`] and offset overflows as [`Error::ArithmeticOverflow`].
-//! Use `?` to propagate.
+//! out-of-buffer reads surface as [`Error::Truncated`] or [`Error::TooShort`],
+//! VAs with no bytes in the file as [`Error::RvaNotMapped`],
+//! [`Error::RvaInBssRegion`] or [`Error::VaBelowImageBase`], and offset
+//! overflows as [`Error::ArithmeticOverflow`]. Use `?` to propagate.
 //!
 //! ## 2. Skip-and-continue (per-entry iterators)
 //!
 //! Iterators like
 //! [`InstructionIterator`](crate::pcode::decoder::InstructionIterator),
 //! [`PCodeMethodIterator`](crate::project::PCodeMethodIterator), and
-//! [`ConstPoolIter`](crate::vb::constantpool::ConstPoolIter) yield
-//! `Item = Result<T, Error>` per entry - they emit one `Err` per malformed
-//! row and *keep going*, so a single bad entry does not poison the whole
-//! sweep. Match on each `Item` to pull successes, log failures, or stop
-//! early on first error per your policy. Iteration ends only when the
-//! underlying byte stream is exhausted (or a structural-truncation
-//! `Err` is yielded - most iterators continue past per-entry errors).
+//! [`ConstPoolIter`](crate::vb::constantpool::ConstPoolIter) yield a
+//! `Result<T, Error>` per entry (`ConstPoolIter` pairs it with the entry's
+//! index) - they emit one `Err` per malformed row and *keep going*, so a
+//! single bad entry does not poison the whole sweep. Match on each `Item` to
+//! pull successes, log failures, or stop early on first error per your
+//! policy. An iterator over a counted table ends after the count the file
+//! declares, whether or not its entries read;
+//! [`InstructionIterator`](crate::pcode::decoder::InstructionIterator) ends at
+//! the end of the procedure's P-Code, and after an `Err` resumes where the
+//! failed decode stopped, which need not be an instruction boundary.
 //!
 //! ## 3. Silent fail-soft (high-level joins)
 //!
 //! High-level convenience methods like
-//! [`VbObject::events`](crate::project::VbObject::events),
-//! [`VbProject::code_entrypoints`](crate::project::VbProject::code_entrypoints),
-//! and the [`pcode::calltarget`] resolvers eagerly
-//! collect from one or more underlying iterators and **silently drop**
-//! malformed rows (`filter_map(|r| r.ok())`) so the returned `Vec` is
-//! "everything that parsed". This matches malware-analysis triage: one
-//! corrupt control should not block enumeration of the other 50.
-//! Enable the optional `tracing` feature to capture the dropped rows
-//! as `target = "visualbasic::dropped"` `warn` events.
+//! [`VbObject::events`](crate::project::VbObject::events) and
+//! [`VbProject::code_entrypoints`](crate::project::VbProject::code_entrypoints)
+//! eagerly collect from one or more underlying iterators and **silently
+//! drop** malformed rows (`code_entrypoints` drops a whole object whose
+//! entries do not read) so the returned `Vec` is "everything that parsed".
+//! This matches malware-analysis triage: one corrupt control should not
+//! block enumeration of the other 50. Enable the optional `tracing` feature
+//! to capture the dropped rows as `target = "visualbasic::dropped"` `warn`
+//! events. The [`pcode::calltarget`] resolver is fail-soft the same way but
+//! untraced: what it cannot read becomes `None` or
+//! [`Callee::Unknown`](crate::pcode::calltarget::Callee::Unknown).
 //!
 //! ## 4. Recognition-time errors at [`VbProject::from_bytes`]
 //!
@@ -130,6 +141,7 @@
 pub mod addressmap;
 pub mod entrypoint;
 pub mod error;
+pub mod imports;
 pub mod pcode;
 pub mod project;
 pub mod vb;

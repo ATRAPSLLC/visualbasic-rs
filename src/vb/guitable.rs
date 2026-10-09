@@ -20,23 +20,28 @@ use crate::{addressmap::AddressMap, error::Error, util::read_u32_le, vb::control
 
 /// Type of GUI element, derived from `dwObjectType & 0xF`.
 ///
-/// Mapped by the runtime to different COM wrapper class sizes:
-/// - Types 0-2 → class 3 (0x30 bytes, standard forms)
-/// - Type 3 → class 4 (0x30 bytes, MDI form)
-/// - Type 4 → class 5 (0x6C bytes, user control)
-/// - Type 5 → class 6 (external form reference)
-/// - Types 6-7 → class 7 (0x34 bytes)
+/// The runtime maps the code to a wrapper class (MSVBVM60 6.00.8176,
+/// 0x6602B8FF): 0-2 → 3, 3 → 4, 4 → 5, 5 → 6, 6-7 → 7. Measured codes:
+/// 0 for a form (`tests/fixtures/forms` Board 0x200, `controls` Form1
+/// 0x110, `dispid` Host 0x80), 1 for an MDIForm (`mdi` Frame 0x01), 2 for an
+/// MDI child form (`mdi` Child 0x182), 3 for a UserControl (`forms` Gauge
+/// 0xC3, `dispid` Dial 0x43, `ocx` Knob 0x83), 4 for a PropertyPage (`ocx`
+/// KnobPage 0x84), 5 for a UserDocument (`docs` Page 0x105).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuiObjectType {
-    /// Standard form (types 0, 1, 2).
+    /// Form (type 0).
     Form,
-    /// MDI form (type 3).
+    /// MDI form (type 1).
     MdiForm,
-    /// User control (type 4).
+    /// MDI child form, a form with `MDIChild = True` (type 2).
+    MdiChild,
+    /// UserControl (type 3).
     UserControl,
-    /// Property page or external form (type 5).
+    /// PropertyPage (type 4).
     PropertyPage,
-    /// Other GUI element (types 6, 7).
+    /// UserDocument (type 5).
+    UserDocument,
+    /// Types 6 and 7, which the runtime accepts (no designer measured).
     Other(u8),
     /// Unknown type value (> 7).
     Unknown(u8),
@@ -46,11 +51,13 @@ impl GuiObjectType {
     /// Converts the raw 4-bit type code to a [`GuiObjectType`].
     pub fn from_raw(raw: u8) -> Self {
         match raw & 0x0F {
-            0..=2 => Self::Form,
-            3 => Self::MdiForm,
-            4 => Self::UserControl,
-            5 => Self::PropertyPage,
-            6 | 7 => Self::Other(raw & 0x0F),
+            0 => Self::Form,
+            1 => Self::MdiForm,
+            2 => Self::MdiChild,
+            3 => Self::UserControl,
+            4 => Self::PropertyPage,
+            5 => Self::UserDocument,
+            n @ (6 | 7) => Self::Other(n),
             n => Self::Unknown(n),
         }
     }
@@ -61,8 +68,10 @@ impl fmt::Display for GuiObjectType {
         match self {
             Self::Form => write!(f, "Form"),
             Self::MdiForm => write!(f, "MDIForm"),
+            Self::MdiChild => write!(f, "MDIChild"),
             Self::UserControl => write!(f, "UserControl"),
             Self::PropertyPage => write!(f, "PropertyPage"),
+            Self::UserDocument => write!(f, "UserDocument"),
             Self::Other(n) => write!(f, "GuiType{n}"),
             Self::Unknown(n) => write!(f, "Unknown({n})"),
         }
@@ -154,10 +163,10 @@ impl fmt::Display for GuiTypeFlags {
 /// | 0x00 | 4 | `dwEntrySize` - offset to next entry (self-relative) |
 /// | 0x04 | 16 | `uuidObject` - primary object GUID |
 /// | 0x14 | 16 | `uuidSecondary` - secondary GUID (zeros for standard Forms) |
-/// | 0x24 | 4 | `dwField24` - stored to runtime wrapper (zero for Forms) |
+/// | 0x24 | 4 | `dwObjectIndex` - index of the object in the object table |
 /// | 0x28 | 4 | `dwObjectType` - type + flag bits (see below) |
-/// | 0x2C | 4 | `dwTypeDataDword` - non-zero for MDI (size/offset), 0 for others |
-/// | 0x30 | 16 | `guidTypeDataIID` - interface IID for MDI/UserControl, zeros for Form |
+/// | 0x2C | 4 | `dwTypeDataDword` - a UserControl's `OLEMISC` status (0x00020191), 0 for a Form |
+/// | 0x30 | 16 | `guidTypeDataIID` - a UserControl's CLSID, zeros for a Form |
 /// | 0x40 | 4 | `dwFormDataSize` - compiled form binary size |
 /// | 0x44 | 4 | Reserved (zero) |
 /// | 0x48 | 4 | `lpFormData` - VA of form design/binary data |
@@ -167,7 +176,7 @@ impl fmt::Display for GuiTypeFlags {
 ///
 /// | Bits | Meaning |
 /// |------|---------|
-/// | 3:0 | GUI type code (0-2=Form, 3=MDI, 4=UserCtl, 5=PropPage) |
+/// | 3:0 | GUI type code (0-2=Form, 3=UserControl; see [`GuiObjectType`]) |
 /// | 4 | Stored to wrapper dispatch table |
 /// | 5 | Runtime flag bit |
 /// | 7 | Stored to wrapper flags byte |
@@ -243,12 +252,26 @@ impl<'a> GuiTableEntry<'a> {
         Guid::from_bytes(data)
     }
 
-    /// Field at offset 0x24.
+    /// Field at offset 0x24: the object's index in the object table.
     ///
-    /// Stored to the runtime wrapper's internal structure at +0x88.
-    /// Zero for standard Forms.
+    /// Stored to the runtime wrapper's internal structure at +0x88. The GUI
+    /// table lists only the designer objects, so this, not the entry's
+    /// position, pairs an entry with its object (`tests/fixtures/forms`:
+    /// Board 1, Gauge 2; `dispid`: Host 2, Dial 3; `controls`: Form1 0).
+    /// Same as [`object_index`](Self::object_index).
     #[inline]
     pub fn field_24(&self) -> Result<u32, Error> {
+        read_u32_le(self.bytes, 0x24)
+    }
+
+    /// Returns the index of the object this entry describes, in the object
+    /// table ([`VbProject::objects`](crate::project::VbProject::objects)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the field cannot be read.
+    #[inline]
+    pub fn object_index(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x24)
     }
 
@@ -392,11 +415,12 @@ mod tests {
     #[test]
     fn test_gui_object_types() {
         assert_eq!(GuiObjectType::from_raw(0), GuiObjectType::Form);
-        assert_eq!(GuiObjectType::from_raw(1), GuiObjectType::Form);
-        assert_eq!(GuiObjectType::from_raw(2), GuiObjectType::Form);
-        assert_eq!(GuiObjectType::from_raw(3), GuiObjectType::MdiForm);
-        assert_eq!(GuiObjectType::from_raw(4), GuiObjectType::UserControl);
-        assert_eq!(GuiObjectType::from_raw(5), GuiObjectType::PropertyPage);
+        assert_eq!(GuiObjectType::from_raw(1), GuiObjectType::MdiForm);
+        assert_eq!(GuiObjectType::from_raw(2), GuiObjectType::MdiChild);
+        assert_eq!(GuiObjectType::from_raw(3), GuiObjectType::UserControl);
+        assert_eq!(GuiObjectType::from_raw(4), GuiObjectType::PropertyPage);
+        assert_eq!(GuiObjectType::from_raw(5), GuiObjectType::UserDocument);
+        assert_eq!(GuiObjectType::from_raw(6), GuiObjectType::Other(6));
         assert_eq!(format!("{}", GuiObjectType::Form), "Form");
         assert_eq!(format!("{}", GuiObjectType::MdiForm), "MDIForm");
     }

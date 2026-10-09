@@ -10,17 +10,18 @@ use std::{env, fs, process};
 
 use visualbasic::{
     MethodEntry, VbControl, VbObject, VbProject,
-    pcode::operand::Operand,
+    pcode::{calltarget::CallResolver, operand::Operand},
+    project::MethodLinkKind,
     vb::{
-        comreg::ComRegData,
-        constants, eventname,
+        comreg::{ComRegData, ComRegObject},
+        eventname,
         external::ExternalKind,
         formdata::{FormControlType, FormDataParser},
         functype::FuncTypDesc,
         guitable::{GuiTableEntry, GuiTableIter},
         projectinfo2::{ControlTypeIter, ProjectInfo2, read_name_strings},
-        property::{PropertyValue, decode_form_type},
-        publicbytes::{ClassFormPublicBytes, PublicVarTable},
+        property::{Property, PropertyValue},
+        publicbytes::ClassFormPublicBytes,
         varstub::VarStubIter,
     },
 };
@@ -60,20 +61,25 @@ fn print_asm(project: &VbProject<'_>, path: &str) -> DynResult<()> {
 
     let pi2_va = project.object_table().project_info2_va()?;
 
-    // Collect GUI table entries for form data parsing (parallel index with objects)
+    // Collect GUI table entries for form data parsing (keyed by object index)
     let map = project.address_map();
     let hdr = project.vb_header();
     let gui_va = hdr.gui_table_va()?;
     let form_count = hdr.form_count()?;
     let gui_entries: Vec<GuiTableEntry<'_>> = GuiTableIter::new(map, gui_va, form_count).collect();
 
+    let resolver = CallResolver::new(project)?;
     for (i, obj) in project.objects()?.enumerate() {
         let obj = obj.map_err(|e| -> Box<dyn StdError> {
             format!("failed to parse object {i}: {e}").into()
         })?;
         println!();
-        let gui_entry = gui_entries.get(i);
-        print_object(&obj, pi2_va, gui_entry)?;
+        // The GUI table lists only the designer objects, each naming its
+        // object's index at +0x24: match by it, not by position.
+        let gui_entry = gui_entries
+            .iter()
+            .find(|entry| entry.object_index().ok() == u32::try_from(i).ok());
+        print_object(&obj, u16::try_from(i)?, &resolver, pi2_va, gui_entry)?;
     }
     Ok(())
 }
@@ -97,20 +103,21 @@ fn print_assembly_header(project: &VbProject<'_>, path: &str) -> DynResult<()> {
     let object_count = project.object_count()?;
     let project_data_va = hdr.project_data_va()?;
     let sub_main_va = hdr.sub_main_va()?;
+    let vbp_path = pd.path().unwrap_or_default();
 
     println!("// VB6 Assembly: {path}");
     println!(
         "// Runtime {runtime_build}.{runtime_revision:02} | {mode} | LCID 0x{lcid:04X} | {object_count} objects"
     );
     println!("// Language DLL: {}", lossy_cstr(hdr.lang_dll()?));
-    println!("// Path: {}", lossy_cstr(pd.path_info()?));
+    println!("// Path: {vbp_path}");
     if sub_main_va != 0 {
         println!("// Entry: Sub Main (VA 0x{sub_main_va:08X})");
     }
     println!("//");
     println!(
         "// VBHeader VA:     0x{:08X}  ProjectData VA: 0x{:08X}",
-        project_data_va.wrapping_sub(0x30),
+        project.vb_header_va(),
         project_data_va
     );
     println!(
@@ -189,17 +196,14 @@ fn print_com_registration(project: &VbProject<'_>) -> DynResult<()> {
         let desc = obj.description(map);
         let prog_id = format!("{proj_name}.{name}");
         let object_flags = obj.object_flags()?;
+        let flag_names = format_obj_flags(&obj)?;
 
         println!("//   .comclass {prog_id} {{");
         println!("//       CLSID = {clsid}");
         if let Some(d) = desc {
             println!("//       Description = \"{d}\"");
         }
-        println!(
-            "//       Flags = 0x{:04X}{}",
-            object_flags,
-            format_obj_flags(object_flags)
-        );
+        println!("//       Flags = 0x{object_flags:04X}{flag_names}");
         let misc = obj.misc_status()?;
         if misc != 0 {
             println!("//       MiscStatus = {misc}");
@@ -243,7 +247,14 @@ fn print_gui_table(project: &VbProject<'_>) -> DynResult<()> {
             .guid()
             .map(|g| format!("{g}"))
             .unwrap_or_else(|| "?".into());
-        let otype = entry.object_type();
+        // The designer of the object the entry names (its index at +0x24),
+        // else what the entry's type says.
+        let otype = entry
+            .object_index()
+            .ok()
+            .and_then(|index| project.objects().ok()?.nth(usize::try_from(index).ok()?))
+            .and_then(|obj| obj.ok()?.object_kind().ok())
+            .map_or_else(|| entry.object_type().to_string(), str::to_string);
         let data_va = entry.form_data_va()?;
         let data_size = entry.form_data_size()?;
         let type_flags = entry.object_type_raw()?;
@@ -297,9 +308,14 @@ fn print_components(project: &VbProject<'_>) -> DynResult<()> {
         let progid = comp.prog_id();
         let class = comp.class_name();
         print!(".component {filename}!{class} // {progid}");
-        let events = comp.event_names();
-        if !events.is_empty() {
-            print!(" events=[{}]", events.join(", "));
+        let dispids = comp.event_dispids();
+        if !dispids.is_empty() {
+            let list: Vec<String> = dispids.iter().map(i32::to_string).collect();
+            print!(" event_dispids=[{}]", list.join(", "));
+        }
+        let bindable: Vec<&str> = comp.bindable_properties().iter().map(|p| p.name).collect();
+        if !bindable.is_empty() {
+            print!(" bindable=[{}]", bindable.join(", "));
         }
         println!();
     }
@@ -324,8 +340,8 @@ fn print_control_types(project: &VbProject<'_>) -> DynResult<()> {
         return Ok(());
     }
 
-    // Collect COM property names from trailing strings
-    let prop_names = read_name_strings(map, pi2_va, entries.len() as u32);
+    // The parameter names between and after the records
+    let param_names = read_name_strings(map, pi2_va);
 
     println!();
     println!(".controltypes {{");
@@ -338,33 +354,33 @@ fn print_control_types(project: &VbProject<'_>) -> DynResult<()> {
             println!("    {guid_str} \"{name_str}\"");
         }
     }
-    if !prop_names.is_empty() {
-        println!("    // COM properties: {}", prop_names.join(", "));
+    if !param_names.is_empty() {
+        println!("    // Parameter names: {}", param_names.join(", "));
     }
     println!("}}");
     Ok(())
 }
 
-/// Formats object type flags as a human-readable parenthesized list.
-fn format_obj_flags(flags: u16) -> String {
+/// Formats a COM registration record's flags as a parenthesized list.
+fn format_obj_flags(obj: &ComRegObject<'_>) -> DynResult<String> {
     let mut parts = Vec::new();
-    if flags & 0x0020 != 0 {
+    if obj.is_control()? {
         parts.push("Control");
     }
-    if flags & 0x0080 != 0 {
+    if obj.is_doc_object()? {
         parts.push("DocObject");
     }
-    if flags & 0x00B2 != 0 {
+    if obj.is_automatable()? {
         parts.push("Automatable");
     }
-    if flags & 0x0001 != 0 {
+    if obj.object_flags()? & 0x0001 != 0 {
         parts.push("SkipReg");
     }
-    if parts.is_empty() {
+    Ok(if parts.is_empty() {
         String::new()
     } else {
         format!(" ({})", parts.join(", "))
-    }
+    })
 }
 
 /// Formats a ProjectInfo2 control type entry as `{GUID} (ClassName)`.
@@ -408,11 +424,10 @@ fn resolve_external(
                 let func = decl.function_name(map).unwrap_or("?");
                 // Surface by-ordinal imports - the API name is absent and the
                 // runtime resolves via GetProcAddress(ordinal), a name-hiding tell.
-                match decl.api_stub(map) {
-                    Some(stub) if stub.is_by_ordinal() => {
-                        format!("{lib}!#{}", stub.ordinal().unwrap_or(0))
-                    }
-                    _ => format!("{lib}!{func}"),
+                if decl.is_by_ordinal() {
+                    format!("{lib}!#{}", decl.ordinal().unwrap_or(0))
+                } else {
+                    format!("{lib}!{func}")
                 }
             } else {
                 format!("va=0x{obj_va:08X}")
@@ -437,6 +452,8 @@ fn resolve_external(
 /// disassembled P-Code methods.
 fn print_object(
     obj: &VbObject<'_, '_>,
+    object_index: u16,
+    resolver: &CallResolver<'_, '_>,
     _pi2_va: u32,
     gui_entry: Option<&GuiTableEntry<'_>>,
 ) -> DynResult<()> {
@@ -463,12 +480,13 @@ fn print_object(
                     obj.project()
                         .address_map()
                         .slice_from_va(entry_va, 4)
-                        .map(|d| <[u8; 4]>::try_from(d).map(u32::from_le_bytes).unwrap_or(0))
-                        .unwrap_or(0)
+                        .ok()
+                        .and_then(|d| d.first_chunk::<4>().copied())
+                        .map_or(0, u32::from_le_bytes)
                 }
                 MethodEntry::Native { va } => *va,
                 MethodEntry::Runtime { va } => *va,
-                MethodEntry::Null => 0,
+                MethodEntry::Null | MethodEntry::Declare => 0,
             };
             if va != 0 {
                 va_to_method.insert(va, (mi as u16, mname.clone()));
@@ -480,16 +498,23 @@ fn print_object(
     println!("    // Object Type:     0x{:08X}", desc.object_type_raw()?);
     println!("    // ObjectInfo VA:   0x{:08X}", desc.object_info_va()?);
     println!("    // Object Name VA:  0x{:08X}", desc.object_name_va()?);
-    println!(
-        "    // Methods VA:      0x{:08X}  ({} methods)",
-        info.methods_va()?,
-        desc.method_count()?
-    );
+    if obj.has_method_table()? {
+        println!(
+            "    // Methods VA:      0x{:08X}  ({} methods)",
+            info.methods_va()?,
+            obj.method_count()?
+        );
+    } else {
+        println!(
+            "    // Methods VA:      none  ({} methods counted)",
+            desc.method_count()?
+        );
+    }
     println!("    // Constants VA:    0x{:08X}", info.constants_va()?);
     if let Some(opt) = obj.optional_info() {
         println!(
-            "    // P-Code Count:    {}  Control Count: {}  Method Links: {}",
-            opt.pcode_count()?,
+            "    // Inherited slots: {}  Control Count: {}  Method Links: {}",
+            opt.inherited_vtable_slots()?,
             opt.control_count()?,
             opt.method_link_count()?
         );
@@ -508,17 +533,14 @@ fn print_object(
         }
         let init_off = opt.initialize_event_offset()?;
         let term_off = opt.terminate_event_offset()?;
-        let init_slot = init_off / 4;
-        let term_slot = term_off / 4;
-        println!(
-            "    // Init/Term slots: {init_slot}/{term_slot} (offsets 0x{init_off:04X}/0x{term_off:04X})"
-        );
+        println!("    // Init/Term offsets: 0x{init_off:04X}/0x{term_off:04X}");
     }
     if let Some(priv_obj) = obj.private_object() {
         println!(
-            "    // Public funcs:    {}  Public vars: {}  Flags: 0x{:04X}",
-            priv_obj.func_count()?,
-            priv_obj.var_count()?,
+            "    // Prototypes:      {}  Members: {}  Events: {}  Flags: 0x{:04X}",
+            obj.public_func_count()?,
+            priv_obj.member_count()?,
+            priv_obj.event_count()?,
             priv_obj.flags()?
         );
         let ftd_va = priv_obj.func_type_descs_va()?;
@@ -534,20 +556,18 @@ fn print_object(
     // Build FuncTypDesc lookup table (needed for signatures and variable types)
     let func_descs = build_func_type_descs(obj);
 
-    // PublicBytes has different formats per object type
-    let pb_va = desc.public_bytes_va()?;
-    if desc.is_module() {
-        // Modules: PublicVarTable with variable descriptors
-        print_public_vars(obj.project(), pb_va);
-    } else {
-        // Classes/Forms: instance size + control property init entries
-        print_class_form_public_bytes(obj.project(), pb_va);
+    // The variable descriptor tables (one format for every object type)
+    if let Some(table) = obj.public_bytes() {
+        print_variable_table("vars", &table);
+    }
+    if let Some(table) = obj.static_bytes() {
+        print_variable_table("statics", &table);
     }
 
     // Print variable implementation stubs (compiler metadata)
     if let Some(priv_obj) = obj.private_object() {
         let stubs_va = priv_obj.var_stubs_va()?;
-        let var_count = priv_obj.var_count()?;
+        let var_count = priv_obj.var_stub_count()?;
         if stubs_va != 0 && var_count > 0 {
             println!();
             for (i, stub) in
@@ -596,14 +616,8 @@ fn print_object(
         // Decode form-level properties
         let form_props = fd.form_properties();
         if !form_props.is_empty() {
-            let ge_otype = ge.object_type();
-            let form_ctype = decode_form_type(ge_otype, form_props, obj.project());
-            let decoded: Vec<String> = fd
-                .form_properties_decoded(form_ctype)
-                .map(|p| match &p.value {
-                    PropertyValue::Flag => p.name.to_string(),
-                    v => format!("{}={v}", p.name),
-                })
+            let decoded: Vec<String> = std::iter::once(format!("Name=\"{}\"", fd.form_name()))
+                .chain(fd.form_properties_decoded().map(|p| property_text(&p)))
                 .collect();
             if !decoded.is_empty() {
                 println!("        // {}", decoded.join(", "));
@@ -626,13 +640,7 @@ fn print_object(
                 fc.control_type()
             );
             if !props.is_empty() {
-                let decoded: Vec<String> = fc
-                    .properties()
-                    .map(|p| match &p.value {
-                        PropertyValue::Flag => p.name.to_string(),
-                        v => format!("{}={v}", p.name),
-                    })
-                    .collect();
+                let decoded: Vec<String> = fc.properties().map(|p| property_text(&p)).collect();
                 let decoded = decoded.join(", ");
                 if !decoded.is_empty() {
                     if props.len() > 64 {
@@ -664,6 +672,14 @@ fn print_object(
             Err(_) => Vec::new(),
         }
     };
+
+    // The library's event names per (control index, sink slot).
+    let bound_names: HashMap<(u16, u16), &'static str> = obj
+        .events_all_slots(None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|b| Some(((b.control_index, b.event_slot), b.event_name?)))
+        .collect();
 
     if !controls.is_empty() {
         println!();
@@ -708,16 +724,24 @@ fn print_object(
                             _ => FormControlType::Unknown(0xFF),
                         }
                     });
-                    let ev_name = eventname::event_name(slot, ev_ctype).unwrap_or("?");
+                    let ev_name = ctrl
+                        .class_name()
+                        .and_then(|class| eventname::event_name_for_class(class, slot))
+                        .or_else(|| eventname::event_name(slot, ev_ctype))
+                        .or_else(|| bound_names.get(&(ctrl_index, slot)).copied())
+                        .unwrap_or("?");
 
                     if let Some(thunk) = sink.resolve_handler_thunk(slot, map) {
+                        // The method table holds ProcDscInfo VAs: the thunk's
+                        // `mov edx` names the handler.
                         let method_ref = va_to_method
-                            .get(&thunk.method_entry_va)
+                            .get(&thunk.proc_dsc_info_va)
+                            .or_else(|| va_to_method.get(&thunk.method_entry_va))
                             .map(|(mi, mname)| format!("/*{mi:02X}*/ {mname}"))
                             .unwrap_or_else(|| format!("0x{:08X}", thunk.method_entry_va));
                         println!(
-                            "        sink[{:02}] {ev_name} event_id={} -> {}",
-                            slot, thunk.event_dispatch_id, method_ref
+                            "        sink[{:02}] {ev_name} this_adjust=0x{:X} -> {}",
+                            slot, thunk.this_adjust, method_ref
                         );
                     } else if let Some(native) = sink.resolve_native_thunk(slot, map) {
                         println!("        sink[{slot:02}] {ev_name} native {native}");
@@ -729,11 +753,18 @@ fn print_object(
         }
     }
 
-    // Build remaining lookup tables for method info
+    // Build remaining lookup tables for method info. The link table is in
+    // vtable order, not method order: a P-Code stub names its method by its
+    // ProcDscInfo; null entries and variable accessors name none.
     let links: HashMap<usize, _> = match obj.method_links() {
         Ok(it) => it
-            .enumerate()
-            .filter_map(|(i, r)| Some((i, r.ok()?)))
+            .filter_map(|r| {
+                let link = r.ok()?;
+                let MethodLinkKind::Procedure { proc_dsc_va } = link.kind else {
+                    return None;
+                };
+                Some((usize::from(va_to_method.get(&proc_dsc_va)?.0), link))
+            })
             .collect(),
         Err(_) => HashMap::new(),
     };
@@ -744,15 +775,7 @@ fn print_object(
 
     // Determine total method count from all sources
     let descriptor_method_count = obj.descriptor().method_count().unwrap_or(0);
-    let total = descriptor_method_count
-        .max(method_entries.len() as u32)
-        .max(
-            links
-                .keys()
-                .copied()
-                .max()
-                .map_or(0, |m| (m as u32).saturating_add(1)),
-        );
+    let total = descriptor_method_count.max(method_entries.len() as u32);
 
     // Print unified .method blocks
     for mi in 0..total as usize {
@@ -819,13 +842,8 @@ fn print_object(
 
         // Show method link thunk if available
         if let Some(lnk) = link {
-            let adjust = match lnk.this_adjust {
-                Some(0xFFFF) => " this_adjust=default".to_string(),
-                Some(a) => format!(" this_adjust=0x{a:02X}"),
-                None => String::new(),
-            };
             println!(
-                "        // thunk 0x{:08X} -> code 0x{:08X}{adjust}",
+                "        // thunk 0x{:08X} -> code 0x{:08X}",
                 lnk.thunk_va, lnk.code_va
             );
         }
@@ -855,19 +873,51 @@ fn print_object(
                     entry.property_type()
                 );
             }
+            // Where Pr, the object register, was last loaded from: a VCall*
+            // on Me reaches the object's own vtable.
+            let mut pr = None;
             for insn in method.instructions()? {
                 match insn {
                     Ok(i) => {
-                        // Annotate integer literals with VB6 constant names
-                        let annotation = i.operands.iter().find_map(|op| match op {
-                            Some(Operand::Int32(v)) => constants::constant_name(*v as i64),
-                            Some(Operand::Int16(v)) => constants::constant_name(*v as i64),
-                            _ => None,
-                        });
+                        // Annotate what the operands name: a call's callee and
+                        // effect, a string literal.
+                        let pool = obj.constants_pool().ok();
+                        let annotation = if i.info.is_call() {
+                            let call = resolver.resolve_with_pr(object_index, &i, pr.as_ref());
+                            let effect = i.stack_effect(call.as_ref());
+                            let callee = call.as_ref().map(|c| c.callee.to_string());
+                            let pops = effect
+                                .pop_slots()
+                                .map_or("?".to_string(), |n| n.to_string());
+                            let x87 = effect
+                                .fpu_pushes()
+                                .map_or("?".to_string(), |n| n.to_string());
+                            Some(format!(
+                                "{} (pops {pops}, pushes {}, x87 +{x87})",
+                                callee.unwrap_or_default(),
+                                effect.pushes()
+                            ))
+                        } else {
+                            i.operands.iter().find_map(|op| match op {
+                                Some(Operand::ConstPoolIndex(index))
+                                    if i.info.mnemonic.starts_with("Lit") =>
+                                {
+                                    pool.as_ref()?
+                                        .string_at(*index)
+                                        .ok()
+                                        .flatten()
+                                        .map(|s| format!("{:?}", s.to_string_lossy()))
+                                }
+                                _ => None,
+                            })
+                        };
                         if let Some(name) = annotation {
                             println!("        {i} // {name}");
                         } else {
                             println!("        {i}");
+                        }
+                        if i.info.writes_pr() {
+                            pr = i.pr_source();
                         }
                     }
                     Err(e) => {
@@ -892,89 +942,25 @@ fn str_or(result: Result<std::borrow::Cow<'_, str>, visualbasic::Error>, fallbac
         .unwrap_or_else(|_| fallback.into())
 }
 
-/// Prints public variable declarations from a module's PublicVarTable.
-fn print_public_vars(project: &VbProject<'_>, pb_va: u32) {
-    if pb_va == 0 {
-        return;
-    }
-    let map = project.address_map();
-    let Ok(header) = map.slice_from_va(pb_va, PublicVarTable::HEADER_SIZE) else {
-        return;
-    };
-    let Ok(pvt_header) = PublicVarTable::parse(header) else {
-        return;
-    };
-    let total_size = match pvt_header.total_size() {
-        Ok(t) => t as usize,
-        Err(_) => return,
-    };
-    let Ok(full_data) = map.slice_from_va(pb_va, total_size) else {
-        return;
-    };
-    let Ok(pvt) = PublicVarTable::parse(full_data) else {
-        return;
-    };
-    if pvt.var_count() == 0 {
-        return;
-    }
-    println!();
-    for entry in pvt.valid_vars() {
+/// Prints a variable descriptor table: data block size and entries.
+fn print_variable_table(label: &str, table: &ClassFormPublicBytes<'_>) {
+    let size = table.instance_size().unwrap_or(0);
+    println!("    // {label}: data size 0x{size:04X} ({size} bytes)");
+    for entry in table.control_entries() {
+        let cleanup = entry.cleanup_action();
+        let cleanup_note = if cleanup == visualbasic::vb::controlprop::CleanupAction::None {
+            String::new()
+        } else {
+            format!(" cleanup={cleanup}")
+        };
         println!(
-            "    Public var_{:04X} As {} // offset=0x{:04X} type=0x{:04X}",
-            entry.frame_offset,
-            entry.type_name(),
-            entry.frame_offset,
-            entry.type_code
+            "    //   +0x{:04X}: {} (type=0x{:02X} flags=0x{:02X}{})",
+            entry.frame_offset().unwrap_or(0),
+            entry.property_type(),
+            entry.raw_type(),
+            entry.flags(),
+            cleanup_note
         );
-    }
-}
-
-/// Prints class/form instance metadata (instance size, IIDs, control properties).
-fn print_class_form_public_bytes(project: &VbProject<'_>, pb_va: u32) {
-    if pb_va == 0 {
-        return;
-    }
-    let map = project.address_map();
-    // Read enough for header + potential GUID data
-    let Ok(data) = map.slice_from_va(pb_va, 0x80) else {
-        return;
-    };
-    let Ok(cfpb) = ClassFormPublicBytes::parse(data) else {
-        return;
-    };
-
-    let instance_size = cfpb.instance_size().unwrap_or(0);
-    println!("    // instance_size=0x{instance_size:04X} ({instance_size} bytes)");
-
-    if let Some(iid) = cfpb.default_iid() {
-        println!("    // default_iid={iid}");
-    }
-    if let Some(iid) = cfpb.events_iid() {
-        println!("    // events_iid={iid}");
-    }
-
-    if cfpb.has_controls() {
-        println!(
-            "    // control_props: {} entries ({} properties)",
-            cfpb.control_count().unwrap_or(0),
-            cfpb.property_count().unwrap_or(0)
-        );
-        for entry in cfpb.control_entries() {
-            let cleanup = entry.cleanup_action();
-            let cleanup_note = if cleanup == visualbasic::vb::controlprop::CleanupAction::None {
-                String::new()
-            } else {
-                format!(" cleanup={cleanup}")
-            };
-            println!(
-                "    //   +0x{:04X}: {} (type=0x{:02X} flags=0x{:02X}{})",
-                entry.frame_offset().unwrap_or(0),
-                entry.property_type(),
-                entry.raw_type(),
-                entry.flags(),
-                cleanup_note
-            );
-        }
     }
 }
 
@@ -986,44 +972,20 @@ fn lossy_cstr(bytes: &[u8]) -> String {
 
 /// Build a map of method_index -> FuncTypDesc from the PrivateObjectDescriptor.
 fn build_func_type_descs<'a>(obj: &VbObject<'a, 'a>) -> HashMap<usize, FuncTypDesc<'a>> {
-    let mut map = HashMap::new();
-    let Some(priv_obj) = obj.private_object() else {
-        return map;
+    obj.func_type_descs()
+        .map(|iter| iter.map(|(i, ftd)| (i as usize, ftd)).collect())
+        .unwrap_or_default()
+}
+
+/// One decoded form property as `Name=value`, an index the table does not
+/// describe as `?0xNN`.
+fn property_text(property: &Property) -> String {
+    let name = match property.name {
+        "?" => format!("?0x{:02X}", property.index),
+        name => name.to_string(),
     };
-    let ftd_array_va = match priv_obj.func_type_descs_va() {
-        Ok(v) => v,
-        Err(_) => return map,
-    };
-    if ftd_array_va == 0 {
-        return map;
+    match &property.value {
+        PropertyValue::Flag => name,
+        value => format!("{name}={value}"),
     }
-
-    // The FuncTypDesc pointer array has one entry per function+variable
-    let func_count = priv_obj.func_count().unwrap_or(0) as u32;
-    let var_count = priv_obj.var_count().unwrap_or(0) as u32;
-    let total = func_count.saturating_add(var_count);
-    let am = obj.project().address_map();
-
-    for i in 0..total {
-        // Read the VA of this FuncTypDesc entry
-        let ptr_va = ftd_array_va.wrapping_add(i.wrapping_mul(4));
-        let Ok(ptr_data) = am.slice_from_va(ptr_va, 4) else {
-            continue;
-        };
-        let desc_va = <[u8; 4]>::try_from(ptr_data)
-            .map(u32::from_le_bytes)
-            .unwrap_or(0);
-        if desc_va == 0 {
-            continue;
-        }
-
-        // Read and parse the FuncTypDesc with extended data (arg types at +0x20)
-        let Ok(desc_data) = am.slice_from_va(desc_va, 0x40) else {
-            continue;
-        };
-        if let Ok(ftd) = FuncTypDesc::parse_extended(desc_data) {
-            map.insert(i as usize, ftd);
-        }
-    }
-    map
 }

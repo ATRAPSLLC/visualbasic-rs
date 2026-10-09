@@ -14,6 +14,9 @@
 //! | `%c` | Control/import index (unsigned Int16) | 2 |
 //! | `%v` | VTable reference (two Int16 values) | 4 |
 //! | `%x` | External call (two Int16 values) | 4 |
+//! | `%N` / `%D` | Named arguments to the payload's end (names / DISPIDs) | rest |
+//! | `%L` | Jump table to the payload's end (u16 targets) | rest |
+//! | `%F` | Frame slots to the payload's end (i16 offsets from ebp) | rest |
 
 use crate::{
     error::Error,
@@ -36,27 +39,33 @@ pub enum Operand {
     /// Negative values are local variables (e.g., `-0x90` = `var_90`),
     /// positive values are function arguments.
     StackVar(i16),
-    /// `%s`: Constant pool index (unsigned 16-bit).
+    /// `%s` / `%c`: Constant pool index (unsigned 16-bit).
     ///
-    /// Resolved as `DataConst + index` to find the constant.
+    /// The procedure's constant pool is an array of 4-byte entries the runtime
+    /// reads at `pool + 4 * index` (`[ebp-0x54]` in the interpreter frame): a
+    /// string, a GUID, an object or class descriptor, or the address of a
+    /// procedure or a global another module holds. `%s` and `%c` encode the
+    /// same index; the table spells it `%c` where the entry is an address.
     ConstPoolIndex(u16),
     /// `%l`: Jump target (unsigned 16-bit offset from function start).
     JumpTarget(u16),
-    /// `%c`: Control/import index (unsigned 16-bit).
-    ControlIndex(u16),
-    /// `%v`: VTable reference (vtable offset + control index).
+    /// `%v`: A vtable call (`VCallHresult`): the byte offset of the method in
+    /// the receiver's vtable, and the constant pool index of the interface's
+    /// IID, which the runtime reports a failed call against.
     VTableRef {
-        /// VTable offset within the object's vtable.
+        /// Byte offset of the method in the receiver's vtable.
         offset: u16,
-        /// Control index for the object.
-        control: u16,
+        /// Constant pool index of the interface's IID.
+        interface: u16,
     },
-    /// `%x`: External call reference (import index + argument info).
+    /// `%x`: A call through the constant pool (`ImpAdCall*`): the index of the
+    /// entry holding the procedure's address, and the bytes of arguments it
+    /// takes, which the runtime checks the callee released.
     ExternalCall {
-        /// Index into the import/external table.
+        /// Constant pool index of the procedure's address.
         import: u16,
-        /// Argument count or stack adjustment info.
-        arg_info: u16,
+        /// Bytes of arguments the call passes.
+        arg_bytes: u16,
     },
     /// Variable-length byte list (for `FFreeVar`, `FFreeStr`, `FFreeAd`, etc.).
     ///
@@ -66,6 +75,56 @@ pub enum Operand {
         /// Number of payload bytes following the size field.
         byte_count: u16,
     },
+    /// `%N` / `%D`: the named arguments a named late-bound call ends with,
+    /// running to the end of its payload - `count` entries from stream offset
+    /// `at`, each the constant pool index of an argument's name (`%N`, two
+    /// bytes) or its DISPID (`%D`, four bytes).
+    NamedArgs {
+        /// Stream offset of the first entry.
+        at: u16,
+        /// Number of named arguments.
+        count: u16,
+        /// What each entry is.
+        kind: NamedArgKind,
+    },
+    /// `%F`: the frame slots `FFreeVar` / `FFreeStr` / `FFreeAd` release,
+    /// running to the end of their payload - `count` i16 offsets from ebp,
+    /// from stream offset `at` ([`Instruction::frame_slots`](super::decoder::Instruction::frame_slots)
+    /// reads them).
+    FrameList {
+        /// Stream offset of the first offset.
+        at: u16,
+        /// Number of frame slots.
+        count: u16,
+    },
+    /// `%L`: the jump table of `On ... GoTo` / `On ... GoSub`, running to the
+    /// end of its payload - `count` u16 jump targets from stream offset `at`.
+    JumpTable {
+        /// Stream offset of the first target.
+        at: u16,
+        /// Number of targets.
+        count: u16,
+    },
+}
+
+/// What a named-argument list ([`Operand::NamedArgs`]) names each argument by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedArgKind {
+    /// The constant pool index of the argument's name (`LateMem*`).
+    Name,
+    /// The argument's DISPID (`LateId*`).
+    DispId,
+}
+
+impl NamedArgKind {
+    /// Returns the size of one entry in bytes.
+    #[must_use]
+    pub const fn entry_len(self) -> usize {
+        match self {
+            Self::Name => 2,
+            Self::DispId => 4,
+        }
+    }
 }
 
 /// Decodes operands from the instruction stream according to the format string.
@@ -104,78 +163,130 @@ pub fn decode_operands(
             continue;
         }
         let Some(spec) = iter.next() else { break };
-        let operand = match spec {
-            b'1' => {
-                ensure_bytes(stream, *pos, 1, limit)?;
-                let val = stream
-                    .get(*pos)
-                    .copied()
-                    .ok_or(Error::UnexpectedEndOfPCode {
-                        offset: *pos,
-                        needed: 1,
+        let operand =
+            match spec {
+                b'1' => {
+                    ensure_bytes(stream, *pos, 1, limit)?;
+                    let val = stream
+                        .get(*pos)
+                        .copied()
+                        .ok_or(Error::UnexpectedEndOfPCode {
+                            offset: *pos,
+                            needed: 1,
+                        })?;
+                    advance(pos, 1)?;
+                    Operand::Byte(val)
+                }
+                b'2' => {
+                    ensure_bytes(stream, *pos, 2, limit)?;
+                    let val = read_i16_le(stream, *pos)?;
+                    advance(pos, 2)?;
+                    Operand::Int16(val)
+                }
+                b'4' => {
+                    ensure_bytes(stream, *pos, 4, limit)?;
+                    let val = read_i32_le(stream, *pos)?;
+                    advance(pos, 4)?;
+                    Operand::Int32(val)
+                }
+                b'a' => {
+                    ensure_bytes(stream, *pos, 2, limit)?;
+                    let val = read_i16_le(stream, *pos)?;
+                    advance(pos, 2)?;
+                    Operand::StackVar(val)
+                }
+                b's' => {
+                    ensure_bytes(stream, *pos, 2, limit)?;
+                    let val = read_u16_le(stream, *pos)?;
+                    advance(pos, 2)?;
+                    Operand::ConstPoolIndex(val)
+                }
+                b'l' => {
+                    ensure_bytes(stream, *pos, 2, limit)?;
+                    let val = read_u16_le(stream, *pos)?;
+                    advance(pos, 2)?;
+                    Operand::JumpTarget(val)
+                }
+                b'c' => {
+                    ensure_bytes(stream, *pos, 2, limit)?;
+                    let val = read_u16_le(stream, *pos)?;
+                    advance(pos, 2)?;
+                    Operand::ConstPoolIndex(val)
+                }
+                b'v' => {
+                    ensure_bytes(stream, *pos, 4, limit)?;
+                    let offset = read_u16_le(stream, *pos)?;
+                    let interface_pos = pos.checked_add(2).ok_or(Error::ArithmeticOverflow {
+                        context: "operand %v interface offset",
                     })?;
-                advance(pos, 1)?;
-                Operand::Byte(val)
-            }
-            b'2' => {
-                ensure_bytes(stream, *pos, 2, limit)?;
-                let val = read_i16_le(stream, *pos)?;
-                advance(pos, 2)?;
-                Operand::Int16(val)
-            }
-            b'4' => {
-                ensure_bytes(stream, *pos, 4, limit)?;
-                let val = read_i32_le(stream, *pos)?;
-                advance(pos, 4)?;
-                Operand::Int32(val)
-            }
-            b'a' => {
-                ensure_bytes(stream, *pos, 2, limit)?;
-                let val = read_i16_le(stream, *pos)?;
-                advance(pos, 2)?;
-                Operand::StackVar(val)
-            }
-            b's' => {
-                ensure_bytes(stream, *pos, 2, limit)?;
-                let val = read_u16_le(stream, *pos)?;
-                advance(pos, 2)?;
-                Operand::ConstPoolIndex(val)
-            }
-            b'l' => {
-                ensure_bytes(stream, *pos, 2, limit)?;
-                let val = read_u16_le(stream, *pos)?;
-                advance(pos, 2)?;
-                Operand::JumpTarget(val)
-            }
-            b'c' => {
-                ensure_bytes(stream, *pos, 2, limit)?;
-                let val = read_u16_le(stream, *pos)?;
-                advance(pos, 2)?;
-                Operand::ControlIndex(val)
-            }
-            b'v' => {
-                ensure_bytes(stream, *pos, 4, limit)?;
-                let offset = read_u16_le(stream, *pos)?;
-                let control_pos = pos.checked_add(2).ok_or(Error::ArithmeticOverflow {
-                    context: "operand %v control offset",
-                })?;
-                let control = read_u16_le(stream, control_pos)?;
-                advance(pos, 4)?;
-                Operand::VTableRef { offset, control }
-            }
-            b'x' => {
-                ensure_bytes(stream, *pos, 4, limit)?;
-                let import = read_u16_le(stream, *pos)?;
-                let arg_pos = pos.checked_add(2).ok_or(Error::ArithmeticOverflow {
-                    context: "operand %x arg_info offset",
-                })?;
-                let arg_info = read_u16_le(stream, arg_pos)?;
-                advance(pos, 4)?;
-                Operand::ExternalCall { import, arg_info }
-            }
-            // End-of-procedure marker (%}) and unknown specifiers consume 0 bytes.
-            _ => continue,
-        };
+                    let interface = read_u16_le(stream, interface_pos)?;
+                    advance(pos, 4)?;
+                    Operand::VTableRef { offset, interface }
+                }
+                b'x' => {
+                    ensure_bytes(stream, *pos, 4, limit)?;
+                    let import = read_u16_le(stream, *pos)?;
+                    let arg_pos = pos.checked_add(2).ok_or(Error::ArithmeticOverflow {
+                        context: "operand %x arg_bytes offset",
+                    })?;
+                    let arg_bytes = read_u16_le(stream, arg_pos)?;
+                    advance(pos, 4)?;
+                    Operand::ExternalCall { import, arg_bytes }
+                }
+                // A named-argument list runs to the end of the payload it is in.
+                b'N' | b'D' => {
+                    let kind = if spec == b'N' {
+                        NamedArgKind::Name
+                    } else {
+                        NamedArgKind::DispId
+                    };
+                    let remaining = limit.saturating_sub(*pos);
+                    let entry_len = kind.entry_len();
+                    let partial = remaining.checked_rem(entry_len).unwrap_or(0);
+                    if partial != 0 {
+                        return Err(Error::UnexpectedEndOfPCode {
+                            offset: *pos,
+                            needed: entry_len.saturating_sub(partial),
+                        });
+                    }
+                    let at = u16::try_from(*pos).map_err(|_| Error::ArithmeticOverflow {
+                        context: "operand named-argument list offset",
+                    })?;
+                    let count = u16::try_from(remaining.checked_div(entry_len).unwrap_or(0))
+                        .map_err(|_| Error::ArithmeticOverflow {
+                            context: "operand named-argument count",
+                        })?;
+                    advance(pos, remaining)?;
+                    Operand::NamedArgs { at, count, kind }
+                }
+                // A jump table, or a list of frame slots, runs to the end of
+                // the payload it is in.
+                b'L' | b'F' => {
+                    let remaining = limit.saturating_sub(*pos);
+                    if !remaining.is_multiple_of(2) {
+                        return Err(Error::UnexpectedEndOfPCode {
+                            offset: *pos,
+                            needed: 1,
+                        });
+                    }
+                    let at = u16::try_from(*pos).map_err(|_| Error::ArithmeticOverflow {
+                        context: "operand jump table offset",
+                    })?;
+                    let count = u16::try_from(remaining.div_euclid(2)).map_err(|_| {
+                        Error::ArithmeticOverflow {
+                            context: "operand jump table count",
+                        }
+                    })?;
+                    advance(pos, remaining)?;
+                    if spec == b'L' {
+                        Operand::JumpTable { at, count }
+                    } else {
+                        Operand::FrameList { at, count }
+                    }
+                }
+                // Unknown specifiers consume 0 bytes.
+                _ => continue,
+            };
         if let Some(slot) = operands.get_mut(op_idx) {
             *slot = Some(operand);
         }
@@ -271,11 +382,11 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_control_index() {
+    fn test_decode_import_pool_index() {
         let stream = [0x05, 0x00];
         let mut pos = 0;
         let ops = decode_operands("%c", &stream, &mut pos, stream.len()).unwrap();
-        assert_eq!(ops[0], Some(Operand::ControlIndex(5)));
+        assert_eq!(ops[0], Some(Operand::ConstPoolIndex(5)));
         assert_eq!(pos, 2);
     }
 
@@ -288,7 +399,7 @@ mod tests {
             ops[0],
             Some(Operand::VTableRef {
                 offset: 0x10,
-                control: 0x03,
+                interface: 0x03,
             })
         );
         assert_eq!(pos, 4);
@@ -303,7 +414,7 @@ mod tests {
             ops[0],
             Some(Operand::ExternalCall {
                 import: 2,
-                arg_info: 4,
+                arg_bytes: 4,
             })
         );
         assert_eq!(pos, 4);
@@ -335,7 +446,7 @@ mod tests {
         let stream = [];
         let mut pos = 0;
         let ops = decode_operands("%}", &stream, &mut pos, stream.len()).unwrap();
-        assert_eq!(ops[0], None); // %} consumes no bytes and produces no operand
+        assert_eq!(ops[0], None); // an unknown specifier consumes no bytes
         assert_eq!(pos, 0);
     }
 

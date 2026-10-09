@@ -2,13 +2,12 @@
 //!
 //! Describes ActiveX/VB controls embedded in forms. Each form's
 //! [`OptionalObjectInfo`](crate::vb::object::OptionalObjectInfo) points
-//! to an array of `ControlInfo` entries via `lpControls`.
-//!
-//! The exact layout of ControlInfo is not fully documented in public
-//! research. The fields below are based on cross-referencing multiple
-//! reverse engineering sources (VBDec, python-vb, Semi-VBDecompiler).
+//! to an array of `ControlInfo` entries via `lpControls`: one per control
+//! that has event handlers, `WithEvents` variable or implemented interface,
+//! and one for the object itself. [`ControlInfo`] gives the layout as the
+//! compiler writes it and MSVBVM60.DLL reads it.
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use crate::{
     error::Error,
@@ -33,8 +32,12 @@ impl Guid {
 
     /// Returns a human-readable name if this is a well-known VB6 intrinsic control.
     ///
-    /// Uses **exact CLSID matching** only - no fuzzy/IID variant guessing.
-    /// The lookup table is generated at build time from `data/vb6_control_guids.csv`.
+    /// Uses exact matching against the GUIDs a ControlInfo (+0x08) names: a
+    /// control's events (source) interface from `VB6.OLB` (`TextBoxEvents`
+    /// `{33AD4EE2-...}` → `"TextBox"`), the same IID + 1 for a control array
+    /// (`{33AD4EF3-...}` → `"CommandButton"`), `IClassModuleEvt`
+    /// `{FCFB3D21-...}` → `"Class"`; coclass CLSIDs match too. The lookup
+    /// table is generated at build time from `data/vb6_control_guids.csv`.
     ///
     /// For reliable control type identification, prefer
     /// [`FormControlType`](crate::vb::formdata::FormControlType) from form binary
@@ -82,6 +85,60 @@ impl fmt::Display for Guid {
     }
 }
 
+impl FromStr for Guid {
+    type Err = Error;
+
+    /// Parses the registry form [`Display`](fmt::Display) writes,
+    /// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (braces required, hex digits
+    /// of either case): the first three groups little-endian into
+    /// [`bytes`](Self::bytes), the last two as written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidGuid`] for any other text.
+    fn from_str(text: &str) -> Result<Self, Error> {
+        let invalid = || Error::InvalidGuid {
+            text: text.to_string(),
+        };
+        let inner = text
+            .strip_prefix('{')
+            .and_then(|t| t.strip_suffix('}'))
+            .ok_or_else(invalid)?;
+        let groups: Vec<&str> = inner.split('-').collect();
+        let [d1, d2, d3, d4, d5] = groups.as_slice() else {
+            return Err(invalid());
+        };
+        let widths = [(d1, 8), (d2, 4), (d3, 4), (d4, 4), (d5, 12)];
+        if widths.iter().any(|(group, width)| {
+            group.len() != *width || !group.bytes().all(|b| b.is_ascii_hexdigit())
+        }) {
+            return Err(invalid());
+        }
+        let d1 = u32::from_str_radix(d1, 16).map_err(|_| invalid())?;
+        let d2 = u16::from_str_radix(d2, 16).map_err(|_| invalid())?;
+        let d3 = u16::from_str_radix(d3, 16).map_err(|_| invalid())?;
+        let mut bytes = [0u8; 16];
+        let tail = format!("{d4}{d5}");
+        let (head, rest) = bytes.split_at_mut(8);
+        head.copy_from_slice(
+            &[
+                d1.to_le_bytes().as_slice(),
+                &d2.to_le_bytes(),
+                &d3.to_le_bytes(),
+            ]
+            .concat(),
+        );
+        for (k, byte) in rest.iter_mut().enumerate() {
+            let start = k.checked_mul(2).ok_or_else(invalid)?;
+            let pair = tail
+                .get(start..start.saturating_add(2))
+                .ok_or_else(invalid)?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
+        }
+        Ok(Self { bytes })
+    }
+}
+
 /// Build-time generated lookup tables from CSV data files.
 pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/vb6_data_generated.rs"));
@@ -101,10 +158,10 @@ pub(crate) mod generated {
 /// |--------|------|-------|-------------|
 /// | 0x00 | 2 | `wFlags` | Control flags (always 0x0040 in compiled binaries) |
 /// | 0x02 | 2 | `wEventHandlerSlots` | Event handler slot count in the event sink vtable |
-/// | 0x04 | 2 | `wDispatchOffset` | Byte offset of this control's event slot in the dispatch vtable |
+/// | 0x04 | 2 | `wDispatchOffset` | Offset of this control's event sink in the object's instance (the value the event stubs load into eax) |
 /// | 0x06 | 2 | Reserved | Always 0 |
-/// | 0x08 | 4 | `lpGuid` | VA of 16-byte control CLSID |
-/// | 0x0C | 2 | `wIndex` | Control index (Name property ID, 0xFFFF = form default) |
+/// | 0x08 | 4 | `lpGuid` | VA of the control's events (source) IID: `TextBoxEvents` `{33AD4EE2-...}`; IID + 1 for a control array of an intrinsic control (CommandButton, TextBox, Label: `tests/fixtures/mdi`); for a hosted ActiveX control or UserControl, the build-generated IID its [`ExternalComponentEntry`](crate::vb::external::ExternalComponentEntry) names (`instance_events_iid`, `array_events_iid`); `FormEvents` / `UserControlEvents` / `IClassModuleEvt` for the object itself; the interface's IID for an `Implements` entry; the source's events IID for a `WithEvents` variable |
+/// | 0x0C | 2 | `wIndex` | Control index (Name property ID, 0xFFFF = the object itself); a form's or UserControl's vtable has this control's getter at `designer interface size + 4 * index` |
 /// | 0x0E | 2 | `wMemberType` | Member type constant (always 3 for normal controls, 0xFFFF for default) |
 /// | 0x10 | 4 | `wDispIdCount` / `lpDispIdTable` | On disk: 0. At runtime: DISPID dispatch entry count (u16 at +0x10) |
 /// | 0x14 | 4 | `lpDispIdTable` | On disk: 0. At runtime: pointer to DISPID→handler dispatch table |
@@ -194,18 +251,21 @@ impl<'a> ControlInfo<'a> {
         read_u32_le(self.bytes, 0x00)
     }
 
-    /// Dispatch vtable byte offset at offset 0x04.
+    /// Offset of the control's event sink in the instance, at offset 0x04.
     ///
-    /// Byte offset of this control's event handler slot within the object's
-    /// dispatch vtable. Values are sequential multiples of 4 across controls
-    /// in the same form (e.g., 60, 64, 68, 72...), with each control
-    /// occupying one 4-byte slot.
+    /// Sequential multiples of 4 after the object's member variables (Board
+    /// in `tests/fixtures/forms`: `m_Clicks` at 0x34, then 0x38-0x48 for its
+    /// 5 ControlInfos; `tests/fixtures/events` Listener: the `WithEvents`
+    /// variable at 0x38, its sink at 0x3C). The event stub of a handler
+    /// for this control loads the same value into eax (`mov eax, imm32`
+    /// before `xor eax, eax`), the `this` adjustment back to the object.
     #[inline]
     pub fn dispatch_offset(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x04)
     }
 
-    /// VA of the control's 16-byte CLSID at offset 0x08.
+    /// VA of the 16-byte events (source) IID the control's sink implements,
+    /// at offset 0x08 (see the layout table; not a CLSID).
     #[inline]
     pub fn guid_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x08)
@@ -384,6 +444,39 @@ impl<'a> Iterator for ControlIterator<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_guid_parses_its_display() {
+        let text = "{33AD4EE2-6699-11CF-B70C-00AA0060D393}";
+        let guid: Guid = text.parse().unwrap();
+        assert_eq!(&guid.bytes[..4], &[0xE2, 0x4E, 0xAD, 0x33]);
+        assert_eq!(
+            &guid.bytes[8..],
+            &[0xB7, 0x0C, 0x00, 0xAA, 0x00, 0x60, 0xD3, 0x93]
+        );
+        assert_eq!(guid.to_string(), text);
+        // Either case; every byte value round-trips.
+        let lower: Guid = text.to_lowercase().parse().unwrap();
+        assert_eq!(lower, guid);
+        let all = Guid {
+            bytes: core::array::from_fn(|i| (i as u8).wrapping_mul(17)),
+        };
+        assert_eq!(all.to_string().parse::<Guid>().unwrap(), all);
+        // Control: anything else is refused.
+        for bad in [
+            "33AD4EE2-6699-11CF-B70C-00AA0060D393",
+            "{33AD4EE2-6699-11CF-B70C-00AA0060D39}",
+            "{33AD4EE2-6699-11CF-B70C00AA0060D393}",
+            "{33AD4EE2-6699-11CF-B70C-00AA0060D39G}",
+            "{+3AD4EE2-6699-11CF-B70C-00AA0060D393}",
+            "",
+        ] {
+            assert!(
+                matches!(bad.parse::<Guid>(), Err(Error::InvalidGuid { .. })),
+                "{bad}"
+            );
+        }
+    }
     use super::*;
 
     fn make_control_info() -> Vec<u8> {

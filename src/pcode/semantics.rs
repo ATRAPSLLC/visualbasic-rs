@@ -5,10 +5,18 @@
 //! at **build time** by `build.rs` - the generated opcode tables contain
 //! fully typed enum values with zero runtime string parsing.
 
-/// Data type operated on by a P-Code instruction.
+/// The type a P-Code mnemonic's suffix names.
 ///
-/// Determined at build time from the opcode mnemonic suffix
-/// (e.g., `"AddI4"` → `I4`, `"FLdFPR8"` → `FPR8`).
+/// Determined at build time from the mnemonic (`AddI4` is `I4`, `FLdFPR8`
+/// `FPR8`). For an operation (arithmetic, comparison, conversion) the suffix
+/// is the operands' type. For a move (a load, store or literal) it says the
+/// width, not the VB type the program gave the value: the compiler picks
+/// among opcodes that share a handler by width, so `MemLdStr` loads a Long
+/// and `FStR4` stores one (`tests/fixtures/statics`, `types`), `FStR8`
+/// stores a Double or a Currency, and `LitCy` pushes a Double's 8 bytes.
+/// [`OpcodeInfo::handler`](super::opcode::OpcodeInfo::handler) groups the
+/// opcodes that behave the same. `FPR4` / `FPR8` moves go through the x87
+/// stack and are Singles / Doubles (or Dates).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PCodeDataType {
     /// 8-bit unsigned integer (Byte). 1 byte, zero-extended to 4B on eval stack.
@@ -120,6 +128,20 @@ pub enum OpcodeSemantics {
     },
     /// Return from procedure.
     Return,
+    /// `GoSub`: pushes the return position on the evaluation stack and jumps.
+    GoSub,
+    /// `Return` from a `GoSub`: pops the return position and continues there.
+    GoSubReturn,
+    /// `Resume`, `Resume Next` or `Resume label`: leaves an error handler.
+    Resume,
+    /// `On Error GoTo`: sets the error handler; falls through.
+    OnError,
+    /// `Error n`: pops the error number and raises it; never falls through.
+    /// Control continues in the procedure's error handler, if one is active
+    /// (`On Error GoTo`), else the error unwinds to the caller.
+    Raise,
+    /// `End` and `Stop`: end the program; never fall through.
+    End,
     /// Stack manipulation (free, pop, push temp, etc.).
     Stack,
     /// Beginning-of-statement marker (`LargeBos`).
@@ -209,10 +231,39 @@ pub enum CallKind {
     ThisVCall,
     /// Import address call (`ImpAdCall*`).
     ImpAdCall,
-    /// Late-bound IDispatch call (`Late*`).
+    /// Late-bound IDispatch call (`Late*`, and `VarLateMem*` on a Variant).
     LateCall,
+    /// `RaiseEvent`: the event's handlers in the objects that sink it, called
+    /// with Variants by value.
+    Event,
     /// Other call type.
     Other,
+}
+
+/// The order a call's arguments are on the evaluation stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArgumentOrder {
+    /// The first argument on top: the compiler pushes the last one first,
+    /// as stdcall and COM vtable calls take them (`VCall*`, `ThisVCall*`,
+    /// `ImpAdCall*`).
+    FirstOnTop,
+    /// The last argument on top: the compiler pushes them in source order,
+    /// the order `IDispatch::Invoke` takes them (`DISPPARAMS` holds the last
+    /// argument first): late-bound calls and `RaiseEvent`
+    /// (`tests/fixtures/late`: `o.Add "a", 1` pushes `"a"`, then `1`).
+    LastOnTop,
+}
+
+impl CallKind {
+    /// Returns the order of the call's arguments on the evaluation stack;
+    /// `None` for [`Other`](Self::Other).
+    pub fn argument_order(self) -> Option<ArgumentOrder> {
+        match self {
+            Self::VCall | Self::ThisVCall | Self::ImpAdCall => Some(ArgumentOrder::FirstOnTop),
+            Self::LateCall | Self::Event => Some(ArgumentOrder::LastOnTop),
+            Self::Other => None,
+        }
+    }
 }
 
 #[cfg(test)]

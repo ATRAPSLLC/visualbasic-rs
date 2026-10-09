@@ -15,13 +15,16 @@ use crate::{
     addressmap::AddressMap,
     entrypoint,
     error::Error,
+    imports::ImportTable,
     project::{CodeEntryKind, PCodeMethod, VbObject},
     util::read_cstr,
     vb::{
+        comreg::ComRegData,
         external::{ExternalComponentIter, ExternalTableEntry},
         formdata::FormDataParser,
         guitable::{GuiTableEntry, GuiTableIter},
         header::VbHeader,
+        object::PublicObjectDescriptor,
         objecttable::ObjectTable,
         projectdata::ProjectData,
     },
@@ -36,20 +39,28 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum EntrypointKind {
-    /// P-Code procedure stub (`mov edx, <RTMI>; call ProcCallEngine` or
-    /// the leaner `xor eax,eax; mov edx, <RTMI>` variant). The VA points
-    /// at the stub; the procedure descriptor lives just past the P-Code
-    /// byte stream.
+    /// A P-Code procedure from an object's method table. The entry's `va` is
+    /// the first P-Code byte (data, not x86 code), `proc_dsc_va` the
+    /// procedure descriptor that follows the P-Code, and `stub_va` the x86
+    /// method link stub that enters it, for a class, form or UserControl
+    /// method.
     PCodeStub,
-    /// Native-compiled method body in the PE `.text` section.
+    /// A method table slot that points at neither a P-Code stub nor a
+    /// procedure descriptor, taken to be native code. No fixture yields one.
     NativeProc,
-    /// Native method discovered via a method-link JMP thunk (used by
-    /// native-compiled classes whose `methods_va` points into MSVBVM60).
+    /// An entry of the object's method link table (see
+    /// [`MethodLink`](crate::project::MethodLink)) that does not enter a
+    /// listed method: in the P-Code fixtures the accessor thunks of public
+    /// and `WithEvents` variables (x86 code that jumps into the runtime).
     NativeThunk,
-    /// Event handler connected to a control's event sink vtable.
+    /// The event stub in a control's event sink vtable; `method_index` is the
+    /// handler procedure it enters.
     EventHandler,
     /// `Sub Main` entry procedure pointed to by `VbHeader.sub_main_va`
-    /// (offset +0x2C). At most one of these per project.
+    /// (offset +0x2C). At most one of these per project. In the P-Code
+    /// fixtures `va` is a `mov edx, <ProcDscInfo>; mov ecx, <jmp [ProcCallEngine]>;
+    /// jmp ecx` stub of its own, which no method table slot points at; the
+    /// entry names the procedure by that `ProcDscInfo`.
     SubMain,
 }
 
@@ -82,24 +93,32 @@ pub struct CodeEntrypoint<'a> {
     pub name_hint: Cow<'a, str>,
     /// Index of the owning object (form/class/module) in the object
     /// table, or `None` for project-level entries. For
-    /// [`EntrypointKind::SubMain`] this is resolved to the owning module
-    /// when `lpSubMain` matches a known method entry, else `None`.
+    /// [`EntrypointKind::SubMain`] this is the owning module when the
+    /// procedure is found: the `ProcDscInfo` its P-Code stub loads is a
+    /// method's (all 18 P-Code fixtures with a `Sub Main`), or, for native
+    /// code, `lpSubMain` is a native method entry's `va`.
     pub object_index: Option<u16>,
-    /// Method-table slot within the owning object, or `None` for
-    /// non-method entries (event handlers, native thunks without a
-    /// corresponding dispatch slot). Resolved for [`EntrypointKind::SubMain`]
-    /// when its target matches a known method entry.
+    /// Method-table slot within the owning object: of the method, or of
+    /// the procedure an event handler's stub enters. `None` for
+    /// [`EntrypointKind::NativeThunk`]. Resolved for
+    /// [`EntrypointKind::SubMain`] under the same condition as
+    /// `object_index`.
     pub method_index: Option<u16>,
     /// `true` if this entry's code is P-Code. Always `true` for
-    /// [`EntrypointKind::PCodeStub`]; also `true` for a
-    /// [`EntrypointKind::SubMain`] whose target resolves to a P-Code method.
+    /// [`EntrypointKind::PCodeStub`]; `true` for an
+    /// [`EntrypointKind::SubMain`] when its procedure is a P-Code method.
     pub is_pcode: bool,
     /// Constant-pool base VA (`ObjectInfo.lpConstants`). Present for
     /// P-Code entries ([`EntrypointKind::PCodeStub`], or a P-Code `Sub Main`).
     pub data_const_va: Option<u32>,
-    /// VA of the P-Code call stub. Present for P-Code entries
-    /// ([`EntrypointKind::PCodeStub`], or a P-Code `Sub Main`).
+    /// The x86 stub that enters the code (see
+    /// [`CodeEntry::stub_va`](crate::project::CodeEntry::stub_va)): a class,
+    /// form or UserControl method's method link stub, a jump thunk's own
+    /// address, or, for a P-Code [`EntrypointKind::SubMain`], `lpSubMain`.
     pub stub_va: Option<u32>,
+    /// VA of the procedure's `ProcDscInfo`, for P-Code entries, event
+    /// handlers whose stub decodes and a P-Code `Sub Main`.
+    pub proc_dsc_va: Option<u32>,
     /// Size of the P-Code byte stream. Present for P-Code entries
     /// ([`EntrypointKind::PCodeStub`], or a P-Code `Sub Main`).
     pub pcode_size: Option<u16>,
@@ -110,13 +129,13 @@ pub struct CodeEntrypoint<'a> {
 #[non_exhaustive]
 pub enum DiagnosticSeverity {
     /// Routine/expected condition - surfaced for completeness, not a problem.
-    /// Example: a standard `.bas` module legitimately has no
-    /// `OptionalObjectInfo`; reporting that absence is informational.
+    /// Example: no `Sub Main` (`VbHeader.sub_main_va == 0`), or an object
+    /// with no method table (`methods_va == constants_va`, or a zero method
+    /// count).
     Info,
-    /// Anomaly worth attention but recoverable. Example:
-    /// `methods_va == constants_va` - the method table overlaps the
-    /// constants pool, so method iteration will yield nothing useful, but
-    /// the rest of the object can still be inspected.
+    /// Anomaly worth attention but recoverable. Example: a form or class
+    /// without an `OptionalObjectInfo`, or a [`CompilationMode::Mixed`]
+    /// project.
     Warning,
     /// Structural error - the affected substructure was unparseable and
     /// a downstream walker dropped it. Example: a control-table parse
@@ -153,7 +172,7 @@ pub struct ParseDiagnostic {
     pub object_index: Option<u16>,
     /// Short human-readable identifier for the affected structure
     /// (`"OptionalObjectInfo"`, `"PrivateObjectDescriptor"`,
-    /// `"method_table"`, `"sub_main"`).
+    /// `"method_table"`, `"sub_main"`, `"compilation_mode"`).
     pub site: &'static str,
     /// One-line description of the finding.
     pub message: Cow<'static, str>,
@@ -162,27 +181,25 @@ pub struct ParseDiagnostic {
 /// Whether a VB6 binary is P-Code, native, or mixed.
 ///
 /// Returned by [`VbProject::compilation_mode`]. Combines the project-level
-/// `lpNativeCode` flag with a per-object scan, so mixed-mode binaries
-/// (where the project header disagrees with at least one object) are
-/// surfaced explicitly rather than misclassified.
+/// `lpNativeCode` flag with a per-object scan of
+/// [`VbObject::has_pcode`](crate::project::VbObject::has_pcode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompilationMode {
-    /// Project flag indicates P-Code AND every object with methods uses
-    /// P-Code dispatch.
+    /// Project flag indicates P-Code AND at least one object's
+    /// [`has_pcode`](crate::project::VbObject::has_pcode) is `true` (all 13
+    /// P-Code fixtures).
     Pcode,
-    /// Project flag indicates native AND no object holds P-Code methods.
+    /// Project flag indicates native AND no object's `has_pcode` is `true`
+    /// (`flow-native`).
     Native,
-    /// The project flag and per-object scan disagree - e.g. a P-Code
-    /// project with native-compiled classes, or a native project where
-    /// individual objects still carry P-Code dispatch entries. Treat
-    /// each object's [`has_pcode`](crate::project::VbObject::has_pcode)
-    /// as authoritative for that object.
+    /// The project flag and the per-object scan disagree: a P-Code project
+    /// with no P-Code procedure, or a native one with some. No fixture is.
     Mixed,
 }
 
 /// A parsed VB6 project, borrowing from the original file bytes.
 ///
-/// This is the primary entry point for the library. It provides typed,
+/// This is the primary entry point for the library. It provides typed
 /// access to all structures within a VB6 executable.
 ///
 /// The `'a` lifetime ties the project to the underlying file buffer.
@@ -194,12 +211,12 @@ pub enum CompilationMode {
 /// let data = std::fs::read("sample.exe")?;
 /// let project = VbProject::from_bytes(&data)?;
 ///
-/// for obj in project.objects() {
+/// for obj in project.objects()? {
 ///     let obj = obj?;
 ///     println!("Object: {:?}", obj.name()?);
-///     for method in obj.pcode_methods() {
+///     for method in obj.pcode_methods()? {
 ///         let method = method?;
-///         for insn in method.instructions() {
+///         for insn in method.instructions()? {
 ///             println!("  {}", insn?);
 ///         }
 ///     }
@@ -220,6 +237,8 @@ pub struct VbProject<'a> {
     project_data: ProjectData<'a>,
     /// ObjectTable containing the array of public object descriptors.
     object_table: ObjectTable<'a>,
+    /// The PE imports, by import address table slot.
+    imports: ImportTable,
 }
 
 impl<'a> VbProject<'a> {
@@ -344,13 +363,32 @@ impl<'a> VbProject<'a> {
             context: "ObjectTable",
         })?;
 
+        let imports = pe
+            .header
+            .optional_header
+            .as_ref()
+            .and_then(|oh| oh.data_directories.get_import_table())
+            .map(|dir| ImportTable::parse(&map, dir.virtual_address))
+            .unwrap_or_default();
+
         Ok(Self {
             map,
             vb_header_va,
             vb_header,
             project_data,
             object_table,
+            imports,
         })
+    }
+
+    /// Returns the executable's imports, by import address table slot.
+    ///
+    /// Read from the PE import directory independently of goblin's import
+    /// parser, fail-soft: a malformed directory gives the imports read
+    /// before the defect.
+    #[inline]
+    pub fn imports(&self) -> &ImportTable {
+        &self.imports
     }
 
     /// Returns the VA of the [`VbHeader`] structure in the PE image.
@@ -363,6 +401,19 @@ impl<'a> VbProject<'a> {
     #[inline]
     pub fn vb_header(&self) -> &VbHeader<'a> {
         &self.vb_header
+    }
+
+    /// Returns the COM registration data
+    /// ([`VbHeader::com_register_data_va`]): the type library and one record
+    /// per public class, UserControl, UserDocument or PropertyPage. `None`
+    /// when the header has none or it does not read.
+    pub fn com_registration(&self) -> Option<ComRegData<'a>> {
+        let va = self.vb_header.com_register_data_va().ok()?;
+        if va == 0 {
+            return None;
+        }
+        let data = self.map.slice_from_va(va, ComRegData::HEADER_SIZE).ok()?;
+        ComRegData::parse(data, va).ok()
     }
 
     /// Returns a reference to the [`ProjectData`] structure.
@@ -393,11 +444,14 @@ impl<'a> VbProject<'a> {
         va.checked_sub(self.map.image_base()).map(u64::from)
     }
 
-    /// Returns the RVA of a P-Code method's callable entry stub.
+    /// Returns the RVA of a P-Code method's method table slot value.
     ///
     /// This converts [`PCodeMethod::stub_va`] using the PE image base held
     /// by this project, so callers do not need to thread `image_base`
-    /// through their VB6 parser path.
+    /// through their VB6 parser path. In every fixture that value is the
+    /// procedure descriptor, not callable code; the callable stub of a
+    /// class, form or UserControl method is in
+    /// [`CodeEntrypoint::stub_va`].
     #[inline]
     pub fn pcode_method_rva(&self, method: &PCodeMethod<'_>) -> Option<u64> {
         self.va_to_rva(method.stub_va())
@@ -436,21 +490,20 @@ impl<'a> VbProject<'a> {
     /// Classifies the binary's compilation mode by combining the project-level
     /// `lpNativeCode` flag with a per-object scan for P-Code methods.
     ///
-    /// - [`CompilationMode::Pcode`] - project flag says P-Code AND every
-    ///   object that has methods has P-Code methods (no native objects).
+    /// - [`CompilationMode::Pcode`] - project flag says P-Code AND at least
+    ///   one object's [`has_pcode`](crate::project::VbObject::has_pcode) is
+    ///   `true`.
     /// - [`CompilationMode::Native`] - project flag says native AND no
-    ///   object holds P-Code methods.
-    /// - [`CompilationMode::Mixed`] - the two signals disagree, e.g. a
-    ///   P-Code project with some native-compiled classes, or a native
-    ///   project where some objects still carry P-Code dispatch entries.
+    ///   object's `has_pcode` is `true`.
+    /// - [`CompilationMode::Mixed`] - the two signals disagree.
     ///
-    /// This is the signal to use when deciding whether to expect P-Code in
-    /// a given object - `is_pcode()` alone misclassifies mixed-mode binaries.
+    /// `has_pcode` asks the object's method table: a slot that points at
+    /// one of its `ProcDscInfo`s is a P-Code procedure.
     ///
     /// # Errors
     ///
-    /// Returns an error if the project-level flag or any object's
-    /// optional info cannot be read.
+    /// Returns an error if the project-level flag, an object or an object's
+    /// method table header cannot be read.
     pub fn compilation_mode(&self) -> Result<CompilationMode, Error> {
         let project_pcode = self.is_pcode()?;
         let mut any_pcode = false;
@@ -509,39 +562,65 @@ impl<'a> VbProject<'a> {
     ///
     /// Returns an error if the object count cannot be read.
     pub fn objects(&self) -> Result<ObjectIterator<'a, '_>, Error> {
+        // Each object needs a 0x30-byte descriptor in the object array: a
+        // count beyond what the file holds from the array on is corrupt.
+        let available = self
+            .map
+            .slice_from_va(self.object_table.object_array_va()?, 0)
+            .map_or(0, <[u8]>::len)
+            / PublicObjectDescriptor::SIZE;
         Ok(ObjectIterator {
             project: self,
             index: 0,
-            total: self.object_table.total_objects()?,
+            total: self
+                .object_table
+                .total_objects()?
+                .min(u16::try_from(available).unwrap_or(u16::MAX)),
         })
     }
 
-    /// Returns an iterator over external component references.
+    /// Returns an iterator over the project's external table
+    /// (`ProjectData.external_table_va()`, `external_count()`).
     ///
-    /// External components are COM/OCX libraries referenced by the project,
-    /// listed in `ProjectData.external_table_va()`.
+    /// One entry per distinct DLL function the `Declare` statements name
+    /// (`vtable`: 13 `Declare`s of `GetTickCount` and `MulDiv` give 2
+    /// entries) and one per referenced type library (`dispid`, `forms`).
+    /// The count is capped at the 8-byte entries the file holds from the
+    /// table on.
     ///
     /// # Errors
     ///
     /// Returns an error if the external table VA or count cannot be read.
     pub fn externals(&self) -> Result<ExternalIterator<'a, '_>, Error> {
+        let table_va = self.project_data.external_table_va()?;
+        let available =
+            self.map.slice_from_va(table_va, 0).map_or(0, <[u8]>::len) / ExternalTableEntry::SIZE;
         Ok(ExternalIterator {
             map: &self.map,
-            table_va: self.project_data.external_table_va()?,
+            table_va,
             index: 0,
-            total: self.project_data.external_count()?,
+            total: self
+                .project_data
+                .external_count()?
+                .min(u32::try_from(available).unwrap_or(u32::MAX)),
         })
     }
 
     /// Returns an iterator over OCX/ActiveX component entries.
     ///
     /// These are variable-length entries from `VBHeader.external_table_va`
-    /// describing referenced OCX controls (e.g., Tabctl32.ocx SSTab,
-    /// Comctl32.ocx StatusBar). Each entry has the OCX filename, ProgID,
-    /// class name, and event handler names.
+    /// (+0x50, count at +0x46), one per ActiveX control class the project
+    /// hosts: an OCX's control (`activex`: `MSWINSCK.OCX` Winsock, `MSINET.OCX`
+    /// Inet, `COMDLG32.OCX` CommonDialog) or one of the project's own
+    /// UserControls (`dispid`: ProgID `DispId.Dial`, class `Dial`, empty file
+    /// name). Each names the control's CLSID, events and default interfaces,
+    /// the events IIDs its hosted instances name, its declared event count
+    /// and its licence key (see
+    /// [`ExternalComponentEntry`](crate::vb::external::ExternalComponentEntry)).
     ///
-    /// This is separate from [`externals()`](Self::externals) which iterates
-    /// Declare function imports from `ProjectData.external_table_va`.
+    /// This is separate from [`externals()`](Self::externals), which
+    /// iterates `Declare` imports and type library references from
+    /// `ProjectData.external_table_va`.
     ///
     /// # Errors
     ///
@@ -553,9 +632,9 @@ impl<'a> VbProject<'a> {
         if table_va == 0 || count == 0 {
             return Ok(ExternalComponentIter::new(&[], 0));
         }
-        // Read enough data for the full table (estimate max entry size)
-        let max_size = (count as usize).saturating_mul(0x400); // 1KB per entry max estimate
-        let data = self.map.slice_from_va(table_va, max_size).unwrap_or(&[]);
+        // The entries are variable-length: hand the iterator everything up
+        // to the end of the file; each entry bounds itself by its size.
+        let data = self.map.slice_from_va(table_va, 0).unwrap_or(&[]);
         Ok(ExternalComponentIter::new(data, count))
     }
 
@@ -711,26 +790,27 @@ impl<'a> VbProject<'a> {
     ///
     /// Aggregates four sources into a single tagged stream:
     ///
-    /// 1. **Per-object method dispatch** - P-Code stubs and native methods
-    ///    from each object's [`code_entries`](crate::project::VbObject::code_entries).
-    /// 2. **Native method-link thunks** - JMP thunks that bridge COM vtable
-    ///    dispatch to native code bodies (also via `code_entries`).
+    /// 1. **Per-object method dispatch** - P-Code procedures and native
+    ///    methods from each object's
+    ///    [`code_entries`](crate::project::VbObject::code_entries), each
+    ///    once; a class, form or UserControl method carries its method link
+    ///    stub as `stub_va`.
+    /// 2. **Method link entries** - the links that do not enter a listed
+    ///    method: variable accessor thunks (also via `code_entries`).
     /// 3. **Event handlers** - connected control event handler VAs.
     /// 4. **`Sub Main`** - the project-level entry procedure from
-    ///    [`VbHeader::sub_main_va`], when non-zero.
+    ///    [`VbHeader::sub_main_va`], when non-zero, with the module and
+    ///    method of the procedure its stub enters.
     ///
-    /// Each entry carries a tagged [`EntrypointKind`] so consumers can
-    /// drive disassembler labelling in lockstep without missing a kind
-    /// when a new one is added in a future release. Compared to walking
-    /// objects → methods → events by hand, this collapses ~5 separate
-    /// loops into one stream and guarantees consistent name resolution.
+    /// Each entry carries a tagged [`EntrypointKind`]. A natively compiled
+    /// module has no method table (`flow-native`), so of its procedures only
+    /// `Sub Main` appears.
     ///
     /// # Form-data resolution
     ///
-    /// Event-handler names use the standard 24-event template (slot 0 =
-    /// `Click`, etc.) without form-data context. For richer names that
-    /// account for control-type-specific overrides (e.g. `Timer1.Timer`
-    /// instead of `Timer1.Click`), call
+    /// Event-handler names are resolved without form data: from the class
+    /// the control's GUID names, else `ControlName_EventNN`. For names from
+    /// the form binary's control type (e.g. `Timer1_Timer`), call
     /// [`VbObject::code_entries`](crate::project::VbObject::code_entries)
     /// per object with form data from
     /// [`gui_entries_with_form_data`](Self::gui_entries_with_form_data).
@@ -771,46 +851,61 @@ impl<'a> VbProject<'a> {
                     is_pcode: matches!(entry.kind, CodeEntryKind::PCode),
                     data_const_va: entry.data_const_va,
                     stub_va: entry.stub_va,
+                    proc_dsc_va: entry.proc_dsc_va,
                     pcode_size: entry.pcode_size,
                 });
             }
         }
 
-        // 4. Sub Main. `lpSubMain` (VbHeader +0x2C) is the *callable* address
-        //    the runtime invokes - for a P-Code module that is the dispatch
-        //    stub VA, for a native module the procedure VA. Both were already
-        //    collected as per-object entries above, so resolve the target by
-        //    matching that address rather than re-implementing stub detection:
-        //    a P-Code method's `stub_va` is the callable trampoline, while a
-        //    native entry has no stub and is reached at its `va`.
+        // 4. Sub Main. `lpSubMain` (VbHeader +0x2C) is the address the runtime
+        //    calls. For P-Code it is a stub of its own,
+        //    `mov edx, <ProcDscInfo>; mov ecx, <jmp [ProcCallEngine]>; jmp ecx`,
+        //    which names the procedure by its ProcDscInfo; for native code it
+        //    is the procedure itself.
         let sub_main = self.vb_header.sub_main_va()?;
         if sub_main != 0 && self.map.is_va_in_image(sub_main) {
-            let matched = out
-                .iter()
-                .find(|e| e.stub_va == Some(sub_main) || (e.stub_va.is_none() && e.va == sub_main));
-            let entry = match matched {
+            let proc_dsc_va =
+                self.map
+                    .slice_from_va(sub_main, 5)
+                    .ok()
+                    .and_then(|code| match code {
+                        [0xBA, a, b, c, d, ..] => Some(u32::from_le_bytes([*a, *b, *c, *d])),
+                        _ => None,
+                    });
+            let pcode = proc_dsc_va.and_then(|dsc| {
+                out.iter()
+                    .find(|e| e.kind == EntrypointKind::PCodeStub && e.proc_dsc_va == Some(dsc))
+            });
+            let entry = match pcode {
                 Some(e) => CodeEntrypoint {
                     va: sub_main,
                     kind: EntrypointKind::SubMain,
                     name_hint: Cow::Borrowed("Sub Main"),
                     object_index: e.object_index,
                     method_index: e.method_index,
-                    is_pcode: e.is_pcode,
+                    is_pcode: true,
                     data_const_va: e.data_const_va,
-                    stub_va: e.stub_va,
+                    stub_va: Some(sub_main),
+                    proc_dsc_va: e.proc_dsc_va,
                     pcode_size: e.pcode_size,
                 },
-                None => CodeEntrypoint {
-                    va: sub_main,
-                    kind: EntrypointKind::SubMain,
-                    name_hint: Cow::Borrowed("Sub Main"),
-                    object_index: None,
-                    method_index: None,
-                    is_pcode: false,
-                    data_const_va: None,
-                    stub_va: None,
-                    pcode_size: None,
-                },
+                None => {
+                    let native = out
+                        .iter()
+                        .find(|e| e.kind == EntrypointKind::NativeProc && e.va == sub_main);
+                    CodeEntrypoint {
+                        va: sub_main,
+                        kind: EntrypointKind::SubMain,
+                        name_hint: Cow::Borrowed("Sub Main"),
+                        object_index: native.and_then(|e| e.object_index),
+                        method_index: native.and_then(|e| e.method_index),
+                        is_pcode: false,
+                        data_const_va: None,
+                        stub_va: None,
+                        proc_dsc_va: None,
+                        pcode_size: None,
+                    }
+                }
             };
             out.push(entry);
         }
@@ -859,10 +954,11 @@ impl<'a> VbProject<'a> {
     }
 }
 
-/// Iterator over external component table entries.
+/// Iterator over the project's external table.
 ///
-/// Yields one [`ExternalTableEntry`] per COM/OCX library referenced by the
-/// project, walking the table starting at `ProjectData.external_table_va()?`.
+/// Yields one [`ExternalTableEntry`] per entry of the table at
+/// `ProjectData.external_table_va()`: a DLL function named by `Declare`
+/// statements, or a referenced type library.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct ExternalIterator<'a, 'p> {
     /// Address map for VA resolution.
@@ -935,12 +1031,10 @@ pub struct GuiEntryWithFormData<'a> {
 
 /// Iterator over GUI entries paired with their parsed form binary data.
 ///
-/// Created by [`VbProject::gui_entries_with_form_data`]. Each item is a
-/// [`Result`] because the underlying [`GuiTableIter`] does not surface
-/// per-entry parse errors as `Err` (it stops on first failure); the
-/// `Result` here propagates address-translation errors when fetching
-/// the form binary slice. The form-binary parse itself is best-effort
-/// and degrades to `None` on failure.
+/// Created by [`VbProject::gui_entries_with_form_data`]. Every item is
+/// `Ok`: the underlying [`GuiTableIter`] stops at its first unreadable
+/// entry, and a form binary that does not resolve or parse gives
+/// [`form_data`](GuiEntryWithFormData::form_data) `None`.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct GuiEntriesWithFormData<'a, 'p> {
     inner: GuiTableIter<'p>,

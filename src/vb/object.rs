@@ -14,34 +14,33 @@ use crate::{
 
 /// View over a PublicObjectDescriptor structure (0x30 bytes).
 ///
-/// Each entry in the object array describes one VB6 object (form, module,
-/// class). The compiler builds these in `BuildPerObject` (`sub_45899C`)
-/// and writes 0x4C-byte records to the compilation stream (0x30 struct
-/// + 0x1C bytes of linker tracking data).
+/// Each entry in the object array describes one VB6 object (module, class,
+/// form, UserControl).
 ///
 /// # Layout
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
 /// | 0x00 | 4 | `lpObjectInfo` (VA of [`ObjectInfo`]) |
-/// | 0x04 | 4 | Reserved (always 0xFFFFFFFF) |
-/// | 0x08 | 4 | `lpPublicBytes` (variable descriptor table) |
-/// | 0x0C | 4 | `lpStaticBytes` (always 0 in tested samples) |
-/// | 0x10 | 4 | `lpModulePublic` (.data VA, modules only; 0 for forms/classes) |
-/// | 0x14 | 4 | `lpModuleStatic` (always 0 in tested samples) |
+/// | 0x04 | 4 | Reserved (0xFFFFFFFF in every fixture) |
+/// | 0x08 | 4 | `lpPublicBytes` (descriptor table of the object's module-level variables) |
+/// | 0x0C | 4 | `lpStaticBytes` (descriptor table of the object's `Static` locals; 0 when it has none) |
+/// | 0x10 | 4 | `lpModulePublic` (.data VA of a module's variables; 0 for other objects) |
+/// | 0x14 | 4 | `lpModuleStatic` (.data VA of a module's `Static` block; 0 otherwise) |
 /// | 0x18 | 4 | `lpszObjectName` (null-terminated ANSI string VA) |
 /// | 0x1C | 4 | `dwMethodCount` |
-/// | 0x20 | 4 | `lpMethodNames` (VA; forms/classes only; 0 for modules) |
-/// | 0x24 | 4 | `oStaticVars` (always 0x0000FFFF - sentinel) |
+/// | 0x20 | 4 | `lpMethodNames` (VA; non-module objects only; 0 for modules) |
+/// | 0x24 | 4 | `oStaticVars` (offset of the `Static` block pointer; 0xFFFF when none) |
 /// | 0x28 | 4 | `fObjectType` (type flags, see below) |
-/// | 0x2C | 4 | Reserved (always 0) |
+/// | 0x2C | 4 | Reserved (0 in every fixture) |
 ///
 /// # fObjectType values
 ///
-/// | Low byte | Type | Full value (typical) |
+/// | Low byte | Type | Full value (in `tests/fixtures`) |
 /// |----------|------|---------------------|
 /// | `0x01` | Standard module (.bas) | `0x00018001` |
 /// | `0x03` | Class module (.cls) | `0x00118003` |
+/// | `0x03` | UserControl (.ctl) | `0x001DA003` (`dispid` Dial, `forms` Gauge) |
 /// | `0x83` | Form / UserDocument | `0x00018083` |
 #[derive(Clone, Copy, Debug)]
 pub struct PublicObjectDescriptor<'a> {
@@ -80,16 +79,23 @@ impl<'a> PublicObjectDescriptor<'a> {
         read_u32_le(self.bytes, 0x00)
     }
 
-    /// Reserved field at offset 0x04 (always -1).
+    /// Reserved field at offset 0x04 (0xFFFFFFFF in every fixture).
     #[inline]
     pub fn reserved(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x04)
     }
 
-    /// Public variable descriptor table VA at offset 0x08.
+    /// Variable descriptor table VA at offset 0x08.
     ///
-    /// Points to a [`PublicVarTable`](super::publicbytes::PublicVarTable)
-    /// structure with variable type codes and frame offsets.
+    /// The same table format for every object type: a 0x0C-byte header
+    /// whose `+0x02` is the size of the variable data block, then one
+    /// variable-length entry per module-level variable that needs
+    /// initialization or cleanup (`String`, `Variant`, `Object`, arrays,
+    /// UDTs; a `Long` has none), Private as well as Public. See
+    /// [`ClassFormPublicBytes`](super::publicbytes::ClassFormPublicBytes).
+    /// For a module, the runtime zero-fills
+    /// [`module_public_va`](Self::module_public_va) with the `+0x02` size
+    /// and walks the entries (MSVBVM60 6.00.8176 `0x660276C1`).
     #[inline]
     pub fn public_bytes_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x08)
@@ -97,26 +103,35 @@ impl<'a> PublicObjectDescriptor<'a> {
 
     /// Static variable descriptor table VA at offset 0x0C.
     ///
-    /// Always 0 in tested samples (no static var descriptors observed).
+    /// Same format as the table at [`public_bytes_va`](Self::public_bytes_va),
+    /// describing the object's `Static` locals; its `+0x02` is the size of
+    /// the static block. 0 when the object has no `Static` locals.
+    /// `tests/fixtures/statics`: module `Program` 0x00401778 (block size
+    /// 0x20), class `Holder` 0x004017B4 (0x08). For a module the runtime
+    /// zero-fills [`module_static_va`](Self::module_static_va) with that
+    /// size and walks the entries (6.00.8176 `0x6602773F`).
     #[inline]
     pub fn static_bytes_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x0C)
     }
 
-    /// Module public variables .data section VA at offset 0x10.
+    /// Module variable block .data section VA at offset 0x10.
     ///
-    /// Non-zero only for standard modules (.bas). Points to the actual
-    /// variable storage in the `.data` section, always 8 bytes after
-    /// `ObjectInfo.object_data_va` (the 8-byte gap is a runtime header).
-    /// Zero for forms and classes.
+    /// Non-zero only for standard modules (.bas); 0 for other objects.
+    /// Always 8 bytes after [`ObjectInfo::object_data_va`] in the
+    /// fixtures. `ProcCallEngine` pushes this VA as the `ebp+8` slot of a
+    /// module procedure (6.00.8176 `0x66104A9C`), which is the base of the
+    /// module's `FMem*` accesses.
     #[inline]
     pub fn module_public_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x10)
     }
 
-    /// Module static variables .data section VA at offset 0x14.
+    /// Module static block .data section VA at offset 0x14.
     ///
-    /// Always 0 in tested samples.
+    /// Non-zero only for a module with `Static` locals
+    /// (`tests/fixtures/statics` `Program`: 0x00402074); 0 otherwise,
+    /// including classes with `Static` locals.
     #[inline]
     pub fn module_static_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x14)
@@ -125,7 +140,7 @@ impl<'a> PublicObjectDescriptor<'a> {
     /// Object name string VA at offset 0x18.
     ///
     /// Points to a null-terminated ANSI string (e.g., `"Form1"`,
-    /// `"modUtil"`, `"Cls_Zip"`).
+    /// `"Program"`, `"Counter"`).
     #[inline]
     pub fn object_name_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x18)
@@ -133,28 +148,40 @@ impl<'a> PublicObjectDescriptor<'a> {
 
     /// Number of methods at offset 0x1C.
     ///
-    /// Includes all methods (event handlers, subs, functions, properties).
-    /// Range observed: 0–45.
+    /// One per `Sub`, `Function` and `Property` procedure (event handlers
+    /// included) in source order, plus, in a module, one per `Declare`
+    /// statement (`tests/fixtures/vtable`: 13 `Declare`s and 3 procedures,
+    /// count 16). Public variables of a class are not counted. Equal to
+    /// [`ObjectInfo::method_count`] in every P-Code fixture; in the native
+    /// build (`flow-native`) this is 25 while the `ObjectInfo` count is 0.
     #[inline]
     pub fn method_count(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x1C)
     }
 
-    /// Method names string table VA at offset 0x20.
+    /// Method names table VA at offset 0x20.
     ///
-    /// Points to an array of null-terminated ANSI method name strings.
-    /// Non-zero for forms and classes (COM-visible objects); always 0
-    /// for standard modules. When `method_count() == 0`, this value
-    /// may be uninitialized garbage.
+    /// Points to an array of [`method_count`](Self::method_count) VAs, each
+    /// to a null-terminated ANSI name. Public members, `Implements`
+    /// members and `WithEvents` handlers of a class are named; `Private`
+    /// and `Friend` procedures and a form's event handlers have 0 or
+    /// 0xFFFFFFFF instead of a VA (`tests/fixtures/types` `Kinds`:
+    /// 0xFFFFFFFF for `Friend Rec` and `Private Hidden`). Non-zero for every
+    /// non-module object; always 0 for standard modules. When
+    /// `method_count() == 0`, this value is not an address (`data` `Item`:
+    /// 0x020507A8).
     #[inline]
     pub fn method_names_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x20)
     }
 
-    /// Static variable copy offset at offset 0x24.
+    /// Offset of the `Static` block pointer at offset 0x24.
     ///
-    /// Always `0x0000FFFF` (sentinel for "no static vars") in all
-    /// tested samples.
+    /// The byte offset, within the module's data block (the `ebp+8` base)
+    /// or the class instance (`Me`), of the pointer to the object's
+    /// `Static` locals block. `0x0000FFFF` when the object has no `Static`
+    /// locals. `tests/fixtures/statics`: module `Program` 0x3C, class
+    /// `Holder` 0x40.
     #[inline]
     pub fn static_vars_offset(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x24)
@@ -164,22 +191,23 @@ impl<'a> PublicObjectDescriptor<'a> {
     ///
     /// Low byte determines the object type:
     /// - `0x01` = standard module (.bas)
-    /// - `0x03` = class module (.cls)
+    /// - `0x03` = class module (.cls) or UserControl (.ctl)
     /// - `0x83` = form / UserDocument
     ///
     /// See [`ObjectTypeFlags`](super::flags::ObjectTypeFlags) for bit
-    /// definitions. The compiler assembles these from the internal type
-    /// code at `*(*object + 0x37)` in `BuildPerObject`.
+    /// definitions.
     #[inline]
     pub fn object_type_raw(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x28)
     }
 
-    /// Returns `true` if this object has optional info (flag `0x01`).
+    /// Returns `true` if flag `0x01` is set.
     ///
-    /// Note: this flag is set for ALL object types in tested samples.
-    /// The actual presence of `OptionalObjectInfo` is determined
-    /// spatially (gap between `ObjectInfo` and constants table).
+    /// The flag does not say whether an [`OptionalObjectInfo`] exists: it is
+    /// set on every object in the fixtures, standard modules included, and
+    /// a module has none (its constants pool starts at `ObjectInfo + 0x38`).
+    /// The presence of `OptionalObjectInfo` is determined spatially (gap
+    /// between `ObjectInfo` and the constants pool).
     ///
     /// Returns `false` if the underlying type field cannot be read.
     #[inline]
@@ -187,7 +215,8 @@ impl<'a> PublicObjectDescriptor<'a> {
         self.object_type_raw().unwrap_or(0) & 0x01 != 0
     }
 
-    /// Returns `true` if this is a class module (low byte `0x03`).
+    /// Returns `true` if bit `0x02` is set and bit `0x80` is clear (low
+    /// byte `0x03`): a class module or a UserControl.
     ///
     /// Returns `false` if the underlying type field cannot be read.
     #[inline]
@@ -222,33 +251,33 @@ impl<'a> PublicObjectDescriptor<'a> {
 /// View over an ObjectInfo structure (0x38 bytes).
 ///
 /// Contains method table, constants pool, and links back to the parent
-/// structures. The first 12 bytes (wRefCount, wObjectIndex, lpObjectTable,
-/// lpIdeData) are set by the linker/runtime, not the compiler.
+/// structures.
 ///
-/// Runtime confirmation: `ProcCallEngine_Body` in MSVBVM60.DLL reads
-/// `lpObjectTable` (+0x04), `lpPublicObject` (+0x18), and
-/// `lpConstants` (+0x34) directly from this structure.
+/// `ProcCallEngine` (MSVBVM60 6.00.8176 `0x66104A99`) reads
+/// `lpPublicObject` (+0x18, `0x66104A9C`), `lpConstants` (+0x34,
+/// `0x66104ADC`) and `lpObjectTable` (+0x04, `0x66104AE2`) from this
+/// structure on every P-Code procedure entry.
 ///
 /// # Layout
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 2 | `wRefCount` (always 1 in compiled binaries) |
+/// | 0x00 | 2 | `wRefCount` (1 in every fixture) |
 /// | 0x02 | 2 | `wObjectIndex` (zero-based) |
 /// | 0x04 | 4 | `lpObjectTable` (back-pointer) |
-/// | 0x08 | 4 | `lpIdeData` (always 0 in compiled) |
+/// | 0x08 | 4 | `lpIdeData` (0 in every fixture) |
 /// | 0x0C | 4 | `lpPrivateObject` (0xFFFFFFFF for modules) |
-/// | 0x10 | 4 | Reserved (always 0xFFFFFFFF) |
-/// | 0x14 | 4 | Reserved (always 0) |
+/// | 0x10 | 4 | Reserved (0xFFFFFFFF in every fixture) |
+/// | 0x14 | 4 | Reserved (0 in every fixture) |
 /// | 0x18 | 4 | `lpPublicObject` (back-pointer to descriptor) |
 /// | 0x1C | 4 | `lpObjectData` (per-object .data section area) |
 /// | 0x20 | 2 | `wMethodCount` |
-/// | 0x22 | 2 | `wMethodCountIde` (always 0 in compiled) |
-/// | 0x24 | 4 | `lpMethods` (dispatch table VA) |
+/// | 0x22 | 2 | `wMethodCountIde` (0 in every fixture) |
+/// | 0x24 | 4 | `lpMethods` (VA of the array of [`ProcDscInfo`](super::procedure::ProcDscInfo) VAs) |
 /// | 0x28 | 2 | `wConstantsCount` |
-/// | 0x2A | 2 | `wMaxConstants` |
-/// | 0x2C | 4 | Reserved (always 0) |
-/// | 0x30 | 4 | Reserved (always 0) |
+/// | 0x2A | 2 | `wMaxConstants` (pool capacity) |
+/// | 0x2C | 4 | Reserved (0 in every fixture) |
+/// | 0x30 | 4 | Unknown: an address outside the image when the pool has entries, else 0 |
 /// | 0x34 | 4 | `lpConstants` (constants pool VA) |
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectInfo<'a> {
@@ -281,7 +310,7 @@ impl<'a> ObjectInfo<'a> {
         Ok(Self { bytes })
     }
 
-    /// Reference count at offset 0x00 (always 1 after compilation).
+    /// Reference count at offset 0x00 (1 in every fixture).
     #[inline]
     pub fn ref_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x00)
@@ -299,7 +328,7 @@ impl<'a> ObjectInfo<'a> {
         read_u32_le(self.bytes, 0x04)
     }
 
-    /// IDE data pointer at offset 0x08 (always 0 in compiled binaries).
+    /// IDE data pointer at offset 0x08 (0 in every fixture).
     #[inline]
     pub fn ide_data(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x08)
@@ -321,34 +350,45 @@ impl<'a> ObjectInfo<'a> {
 
     /// Per-object data area pointer at offset 0x1C.
     ///
-    /// Points to the module's runtime data area in the `.data` section.
+    /// Every object has one, in the `.data` section. On load the runtime
+    /// stores its per-object record in the first dword
+    /// (MSVBVM60 6.00.9848 `0x6602F870`). For a module, the module's
+    /// variable block ([`PublicObjectDescriptor::module_public_va`])
+    /// starts 8 bytes after it.
     #[inline]
     pub fn object_data_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x1C)
     }
 
-    /// Number of methods at offset 0x20.
+    /// Number of entries in the method table at offset 0x20.
+    ///
+    /// Equal to [`PublicObjectDescriptor::method_count`] in every P-Code
+    /// fixture, `Declare` slots of a module included; 0 in the native
+    /// build (`tests/fixtures/flow-native`), which has no method table.
     #[inline]
     pub fn method_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x20)
     }
 
-    /// IDE-only method count at offset 0x22 (zeroed in compiled binaries).
+    /// IDE-only method count at offset 0x22 (0 in every fixture).
     #[inline]
     pub fn method_count_ide(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x22)
     }
 
-    /// Virtual address of the method/dispatch table at offset 0x24.
+    /// Virtual address of the method table at offset 0x24.
     ///
-    /// This table contains pointers to `ProcDscInfo` (RTMI) structures
-    /// for each method. For P-Code methods, each entry is the address
-    /// of a `mov edx, <rtmi_addr>; call ProcCallEngine` stub.
-    ///
-    /// Note: the P-Code engine does NOT use this field at runtime for
-    /// method dispatch - it goes through ProcDscInfo structures directly.
-    /// This field is used during project loading to build dispatch tables.
-    /// When `method_count() == 0`, this value may be uninitialized garbage.
+    /// An array of [`method_count`](Self::method_count) dwords, one per
+    /// method in source order, each the VA of the method's
+    /// [`ProcDscInfo`](super::procedure::ProcDscInfo) (whose +0x00 points
+    /// back to this `ObjectInfo`). In a module the slots of `Declare`
+    /// statements hold no `ProcDscInfo` VA (`tests/fixtures/exprs`: 0 and
+    /// 0xFFFFFFFF; `vtable`, whose 13 `Declare` slots overlap other data:
+    /// small integers and the text `Vtable`). The runtime
+    /// builds an object's vtable from the method link table, not from this
+    /// one (see [`OptionalObjectInfo::basic_class_object_va`]). When
+    /// `method_count() == 0`, this value is not an address (`flow-native`
+    /// `Program`: 0x01FF8CA8).
     #[inline]
     pub fn methods_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x24)
@@ -360,7 +400,11 @@ impl<'a> ObjectInfo<'a> {
         read_u16_le(self.bytes, 0x28)
     }
 
-    /// Constants pool max size at offset 0x2A.
+    /// Constants pool capacity at offset 0x2A.
+    ///
+    /// The smallest power of two not below
+    /// [`constants_count`](Self::constants_count), at least 32, and 0 for an
+    /// empty pool (fixtures: 5 -> 32, 51 -> 64, 142 -> 256, 0 -> 0).
     #[inline]
     pub fn max_constants(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x2A)
@@ -371,11 +415,12 @@ impl<'a> ObjectInfo<'a> {
     /// Use [`ConstantPool::new`](super::constantpool::ConstantPool::new) to create
     /// a reader for resolving string and API references from this base address.
     ///
-    /// This is the most heavily used ObjectInfo field at runtime - the
-    /// P-Code engine reads it at the start of every method execution to
-    /// set up the constants pool base address. Also accessed via
-    /// [`ProcDscInfo::object_info_va`](super::procedure::ProcDscInfo::object_info_va)
-    /// → this struct → +0x34.
+    /// `ProcCallEngine` reads it on every P-Code procedure entry, through
+    /// [`ProcDscInfo::object_info_va`](super::procedure::ProcDscInfo::object_info_va),
+    /// and keeps it at `ebp-0x54` (6.00.8176 `0x66104ADC`). In a module the
+    /// pool starts at this `ObjectInfo` + 0x38; in other objects it follows
+    /// the [`OptionalObjectInfo`], and with no entries it is the VA of the
+    /// method table.
     #[inline]
     pub fn constants_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x34)
@@ -384,26 +429,35 @@ impl<'a> ObjectInfo<'a> {
     /// Returns `true` if this object carries a real method dispatch table.
     ///
     /// Two layouts mean it does not. A table address equal to
-    /// [`constants_va`](Self::constants_va) is the constants/variable pool, not a
-    /// table. A zero [`method_count`](Self::method_count) leaves
-    /// [`methods_va`](Self::methods_va) uninitialized, so whatever it holds is not
-    /// an address worth reading.
+    /// [`constants_va`](Self::constants_va) while the pool has entries is the
+    /// constants/variable pool, not a table; with an empty pool
+    /// ([`constants_count`](Self::constants_count) 0) the pool pointer simply
+    /// lands on the method table, as in an interface class whose methods
+    /// have no constants (`tests/fixtures/events` `Measure`,
+    /// `tests/fixtures/calls` `Shape`). A zero
+    /// [`method_count`](Self::method_count) leaves
+    /// [`methods_va`](Self::methods_va) uninitialized, so whatever it holds is
+    /// not an address worth reading.
     ///
     /// # Errors
     ///
-    /// Returns an error if the method count or either VA cannot be read.
+    /// Returns an error if the method count, the constants count or either
+    /// VA cannot be read.
     pub fn has_method_table(&self) -> Result<bool, Error> {
         let methods = self.methods_va()?;
-        Ok(methods != 0 && methods != self.constants_va()? && self.method_count()? > 0)
+        let overlaps_pool = methods == self.constants_va()? && self.constants_count()? > 0;
+        Ok(methods != 0 && !overlaps_pool && self.method_count()? > 0)
     }
 }
 
 /// View over an OptionalObjectInfo structure (0x40 bytes).
 ///
-/// Follows [`ObjectInfo`] in memory (at ObjectInfo + 0x38). Present when
-/// `PublicObjectDescriptor.fObjectType & 0x01`. Contains COM interface
-/// GUIDs, control array pointers, method dispatch offsets, and P-Code
-/// method counts.
+/// Follows [`ObjectInfo`] in memory (at ObjectInfo + 0x38). Present for
+/// classes, forms and UserControls (`fObjectType` bit `0x02`); a standard
+/// module has none even though its `fObjectType` has bit `0x01`, and its
+/// constants pool starts at ObjectInfo + 0x38 instead. Contains COM
+/// interface GUIDs, the control array, the method link table and what the
+/// runtime needs to build the object's vtable.
 ///
 /// # Accessor fallibility
 ///
@@ -422,40 +476,62 @@ impl<'a> ObjectInfo<'a> {
 /// |--------|------|-------|
 /// | 0x00 | 4 | `gui_guids_count` - GUI GUID table entry count |
 /// | 0x04 | 4 | `object_clsid_va` - VA of 16-byte object CLSID |
-/// | 0x08 | 4 | `null_08` - always 0 (reserved) |
+/// | 0x08 | 4 | `null_08` - 0 in every fixture (reserved) |
 /// | 0x0C | 4 | `gui_guid_table_va` - VA of GUID VA-pointer array |
 /// | 0x10 | 4 | `default_iid_count` - default IID table entry count |
 /// | 0x14 | 4 | `events_iid_table_va` - VA of event source IID table |
 /// | 0x18 | 4 | `events_iid_count` - event source IID count |
 /// | 0x1C | 4 | `default_iid_table_va` - VA of default IID VA-pointer array |
-/// | 0x20 | 4 | `control_count` - number of controls |
+/// | 0x20 | 4 | `control_count` - number of ControlInfo entries |
 /// | 0x24 | 4 | `controls_va` - VA of ControlInfo array |
-/// | 0x28 | 2 | `method_link_count` - method link entries |
-/// | 0x2A | 2 | `pcode_count` - P-Code method count (`0x1B7` is the linker-emitted native marker; see [`Self::PCODE_COUNT_NATIVE_SENTINEL`]) |
-/// | 0x2C | 2 | `initialize_event_offset` - dispatch vtable byte offset |
-/// | 0x2E | 2 | `terminate_event_offset` - dispatch vtable byte offset |
+/// | 0x28 | 2 | `method_link_count` - method link entries (the object's own vtable slots) |
+/// | 0x2A | 2 | `inherited_vtable_slots` - vtable slots between `IDispatch` and the method links (0 class, 439 form, 482 UserControl) |
+/// | 0x2C | 2 | `initialize_event_offset` - 0x0C for classes, 0x68 for forms and UserControls |
+/// | 0x2E | 2 | `terminate_event_offset` - `initialize_event_offset + 4` |
 /// | 0x30 | 4 | `method_link_table_va` - VA of method link table |
-/// | 0x34 | 4 | `basic_class_object_va` - VA of runtime dispatch vtable |
-/// | 0x38 | 4 | `null_38` - always 0 (reserved) |
-/// | 0x3C | 4 | `field_3c` - non-zero, linker-internal VA (not patchable) |
+/// | 0x34 | 4 | `basic_class_object_va` - VA of the runtime-built vtable block (.data) |
+/// | 0x38 | 4 | `null_38` - 0 in every fixture (reserved) |
+/// | 0x3C | 4 | `field_3c` - non-zero, an address outside the image |
 ///
 /// # GUID Tables
 ///
 /// The GUI GUID table at +0x0C is an array of `gui_guids_count` VA pointers,
-/// each pointing to a 16-byte GUID. These correspond to the GUIDs in the
-/// [`GuiTable`](super::guitable) entries. The default IID table at +0x1C
-/// uses the same format with `default_iid_count` entries. Both tables are
-/// adjacent in memory, typically near the constants pool.
+/// each pointing to a 16-byte GUID. For a form or UserControl the GUID is
+/// the one of its [`GuiTable`](super::guitable) entry; every class carries
+/// `{FCFB3D2A-A0FA-1068-A738-08002B3371B5}`. The default IID table at
+/// +0x1C uses the same format with `default_iid_count` entries. In every
+/// fixture the GUI GUID table directly follows the method table
+/// (`methods_va + 4 * method_count`), the default IID table follows it at
+/// +4, the event IID table at +8, and the ControlInfo array follows the
+/// event IID table.
+///
+/// # Vtable
+///
+/// At load the runtime fills the block at
+/// [`basic_class_object_va`](Self::basic_class_object_va) (MSVBVM60
+/// 6.00.8176 `0x66013971`): `+0x08` gets the `ObjectInfo` VA, the vtable
+/// starts at `+0x0C` with the 3 `IUnknown` and 4 `IDispatch` slots, then
+/// [`inherited_vtable_slots`](Self::inherited_vtable_slots) slots pointing at
+/// runtime stubs, then the `method_link_count` dwords copied from
+/// [`method_link_table_va`](Self::method_link_table_va). An object's own
+/// method at index `k` of the method link table is therefore at vtable
+/// offset `0x1C + 4 * (inherited_vtable_slots + k)`: `tests/fixtures/forms`
+/// `Board.Reset` (form, 439, link 0) is called at 0x6F8, `Gauge`'s link 2
+/// (UserControl, 482) at 0x7AC. The block is
+/// [`basic_class_object_size`](Self::basic_class_object_size) bytes long.
+///
+/// Nothing in this structure says whether the object is P-Code or native
+/// code: that is a property of its method table entries (see
+/// [`MethodEntry`](crate::project::MethodEntry)).
 ///
 /// # Initialize / Terminate Offsets
 ///
-/// The offsets at +0x2C and +0x2E are byte offsets into the dispatch vtable
-/// (at `basic_class_object_va + 0x28`). Divide by 4 to get the method slot:
-///
-/// - **Classes**: Initialize at slot 3 (offset 0x0C), Terminate at slot 4 (0x10)
-/// - **Forms/UserDocs**: Initialize at slot 26 (offset 0x68), Terminate at slot 27 (0x6C)
-///
-/// The slot index equals `ProcDscInfo.base_iface_slot_count + 1`.
+/// The offsets at +0x2C and +0x2E are 0x0C/0x10 for every class and
+/// 0x68/0x6C for every form and UserControl in the fixtures, whether or not
+/// the object has a `Class_Initialize`/`Form_Initialize` handler. They are
+/// not offsets into the object's own method link slots (`events` `Source`
+/// has 3 method links, and +0x28 + 0x0C from its block is the next
+/// object's block); what they index is unconfirmed.
 #[derive(Clone, Copy, Debug)]
 pub struct OptionalObjectInfo<'a> {
     /// Raw backing bytes borrowed from the PE file buffer.
@@ -490,8 +566,9 @@ impl<'a> OptionalObjectInfo<'a> {
     /// GUI GUID table entry count at offset 0x00.
     ///
     /// Number of VA pointers in the table at [`gui_guid_table_va`](Self::gui_guid_table_va).
-    /// Each entry is a VA pointing to a 16-byte GUID that corresponds to
-    /// a [`GuiTableEntry`](super::guitable::GuiTableEntry). Typically 1.
+    /// Each entry is a VA pointing to a 16-byte GUID; for a form or
+    /// UserControl it is the GUID of its
+    /// [`GuiTableEntry`](super::guitable::GuiTableEntry). 1 in every fixture.
     #[inline]
     pub fn gui_guids_count(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x00)
@@ -503,7 +580,7 @@ impl<'a> OptionalObjectInfo<'a> {
         read_u32_le(self.bytes, 0x04)
     }
 
-    /// Reserved field at offset 0x08 (always 0).
+    /// Reserved field at offset 0x08 (0 in every fixture).
     #[inline]
     pub fn null_08(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x08)
@@ -512,8 +589,9 @@ impl<'a> OptionalObjectInfo<'a> {
     /// VA of the GUI GUID VA-pointer table at offset 0x0C.
     ///
     /// Array of [`gui_guids_count`](Self::gui_guids_count) dword VAs, each
-    /// pointing to a 16-byte GUID. These GUIDs match the GUIDs in
-    /// [`GuiTable`](super::guitable) entries for this object.
+    /// pointing to a 16-byte GUID. For a form or UserControl the GUID
+    /// matches its [`GuiTable`](super::guitable) entry; every class has
+    /// `{FCFB3D2A-A0FA-1068-A738-08002B3371B5}`.
     #[inline]
     pub fn gui_guid_table_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x0C)
@@ -522,7 +600,7 @@ impl<'a> OptionalObjectInfo<'a> {
     /// Default IID table entry count at offset 0x10.
     ///
     /// Number of VA pointers in the table at [`default_iid_table_va`](Self::default_iid_table_va).
-    /// Typically 1 (one default dispatch IID per object).
+    /// 1 in every fixture (one default dispatch IID per object).
     #[inline]
     pub fn default_iid_count(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x10)
@@ -530,8 +608,9 @@ impl<'a> OptionalObjectInfo<'a> {
 
     /// VA of the events source IID table at offset 0x14.
     ///
-    /// When [`events_iid_count`](Self::events_iid_count) is 0 (no custom
-    /// events), this may share the same address as [`controls_va`](Self::controls_va).
+    /// The ControlInfo array follows the table directly, so when
+    /// [`events_iid_count`](Self::events_iid_count) is 0 this equals
+    /// [`controls_va`](Self::controls_va) (every such object in the fixtures).
     #[inline]
     pub fn events_iid_table_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x14)
@@ -539,8 +618,9 @@ impl<'a> OptionalObjectInfo<'a> {
 
     /// Event source IID count at offset 0x18.
     ///
-    /// Number of event source interfaces. Zero in all tested samples
-    /// (forms/classes without custom event sources).
+    /// Number of event source interfaces: 1 for an object that declares
+    /// `Event`s (`calls` `Counter`, `events` `Source`, `types` `Kinds`,
+    /// `forms` `Gauge`) and for the UserControl `dispid` `Dial`, 0 otherwise.
     #[inline]
     pub fn events_iid_count(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x18)
@@ -556,7 +636,12 @@ impl<'a> OptionalObjectInfo<'a> {
         read_u32_le(self.bytes, 0x1C)
     }
 
-    /// Number of controls in the control array at offset 0x20.
+    /// Number of [`ControlInfo`](super::control::ControlInfo) entries at offset 0x20.
+    ///
+    /// For a form, its controls plus the form itself (`controls` `Form1`,
+    /// two controls: 3). For a class, 1, plus 1 per `Implements` or
+    /// `WithEvents` member (`calls` `Square`, `events` `Ring` and
+    /// `Listener`: 2).
     #[inline]
     pub fn control_count(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x20)
@@ -572,131 +657,111 @@ impl<'a> OptionalObjectInfo<'a> {
     }
 
     /// Method link count at offset 0x28.
+    ///
+    /// The number of the object's own vtable slots, which the runtime copies
+    /// from [`method_link_table_va`](Self::method_link_table_va) into the
+    /// vtable (see [`OptionalObjectInfo`]). Equal to
+    /// [`ObjectInfo::method_count`] in the fixtures, plus 3 in a class with
+    /// an `Implements` or `WithEvents` member (`calls` `Square`: 3 methods,
+    /// 6 links; `events` `Ring` 25 and 28, `Listener` 5 and 8). `data`
+    /// `Item`, whose only member is `Public Name As String`, has 0 methods
+    /// and 2 links.
     #[inline]
     pub fn method_link_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x28)
     }
 
-    /// Native-compilation marker for the +0x2A field.
+    /// Number of inherited vtable slots at offset 0x2A.
     ///
-    /// A raw [`pcode_count_raw`](Self::pcode_count_raw) reading of `0x1B7`
-    /// (439 decimal) does *not* mean the object has 439 P-Code methods.
-    /// Empirically every natively-compiled VB6 object surveyed has this
-    /// exact value at +0x2A; no runtime path in `MSVBVM60.DLL_6.00.9848`
-    /// reads `wPCodeCount` and checks against `0x1B7`, so the runtime
-    /// itself does not enforce a sentinel - the value is a compiler /
-    /// linker default written when there is no P-Code dispatch table to
-    /// describe. The dispatch path iterates the actual method table at
-    /// `methods_va` instead, which is the authoritative source.
-    ///
-    /// Use [`pcode_count`](Self::pcode_count) /
-    /// [`is_native_sentinel`](Self::is_native_sentinel) to consume the
-    /// field correctly. Only inspect [`pcode_count_raw`](Self::pcode_count_raw)
-    /// when reverse-engineering the layout itself.
-    pub const PCODE_COUNT_NATIVE_SENTINEL: u16 = 0x1B7;
-
-    /// Raw P-Code method count at offset 0x2A - see
-    /// [`PCODE_COUNT_NATIVE_SENTINEL`](Self::PCODE_COUNT_NATIVE_SENTINEL).
-    ///
-    /// Returns the on-disk u16 verbatim. Almost every caller wants
-    /// [`pcode_count`](Self::pcode_count) instead, which folds the
-    /// native-compilation sentinel down to `0`.
+    /// The vtable slots between `IDispatch`'s and the object's own method
+    /// links: the runtime fills this many with pointers to its own stubs
+    /// (`0x66102ABC + 8 * i`) after the 7 `IUnknown`/`IDispatch` slots and
+    /// before the [`method_link_count`](Self::method_link_count) slots
+    /// copied from the method link table (MSVBVM60 6.00.8176 `0x66013976`),
+    /// and sizes the vtable copy with the sum of the two (`0x6603F516`).
+    /// For a designer object they are its designer's built-in interface
+    /// and its 256 control getters, `(cbSizeVft + 0x400 - 0x1C) / 4`: 439
+    /// for every Form and MDIForm, 482 for every UserControl, 469 for a
+    /// UserDocument and 445 for a PropertyPage in `tests/fixtures`; 0 for
+    /// every class. It is not a P-Code method count.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying bytes cannot be read.
     #[inline]
-    pub fn pcode_count_raw(&self) -> Result<u16, Error> {
+    pub fn inherited_vtable_slots(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x2A)
     }
 
-    /// P-Code method count at offset 0x2A, with the native-compilation
-    /// sentinel folded to `0`.
+    /// Size in bytes of the block at
+    /// [`basic_class_object_va`](Self::basic_class_object_va):
+    /// `0x28 + 4 * (inherited_vtable_slots + method_link_count)`.
     ///
-    /// The field at +0x2A normally counts the P-Code-bearing slots in
-    /// this object's method dispatch table. The VB6 linker writes the
-    /// magic value [`PCODE_COUNT_NATIVE_SENTINEL`](Self::PCODE_COUNT_NATIVE_SENTINEL)
-    /// (`0x1B7` = 439) to mark a natively compiled object that has no
-    /// P-Code at all; consumers that surface this count to UI / DB rows
-    /// must not display 439 as a method count, and predicates like
-    /// [`VbObject::has_pcode`](crate::project::VbObject::has_pcode)
-    /// must not return `true` for a sentinel reading.
+    /// For all 30 pairs of adjacent blocks in `tests/fixtures` the next block
+    /// starts there (`events` `Ring`, 28 links: 0x004044B4 + 0x98 =
+    /// `Source`'s 0x0040454C; `dispid` `Host`, a form, 439 + 5 links:
+    /// 0x00404418 + 0x718 = `Dial`'s 0x00404B30).
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying bytes cannot be read.
-    #[inline]
-    pub fn pcode_count(&self) -> Result<u16, Error> {
-        let raw = self.pcode_count_raw()?;
-        Ok(if raw == Self::PCODE_COUNT_NATIVE_SENTINEL {
-            0
-        } else {
-            raw
-        })
+    /// Returns an error if either count cannot be read.
+    pub fn basic_class_object_size(&self) -> Result<u32, Error> {
+        // Two u16 counts: the sum times 4 plus 0x28 cannot overflow a u32.
+        let slots = u32::from(self.inherited_vtable_slots()?)
+            .saturating_add(u32::from(self.method_link_count()?));
+        Ok(slots.saturating_mul(4).saturating_add(0x28))
     }
 
-    /// Returns `true` when +0x2A holds the native-compilation sentinel.
+    /// Initialize event offset at 0x2C.
     ///
-    /// Equivalent to `pcode_count_raw()? == PCODE_COUNT_NATIVE_SENTINEL`,
-    /// but exposes the meaning as a predicate so callers don't have to
-    /// hard-code the magic value at every site.
+    /// - **Classes**: 0x0C
+    /// - **Forms and UserControls**: 0x68
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the underlying bytes cannot be read.
-    #[inline]
-    pub fn is_native_sentinel(&self) -> Result<bool, Error> {
-        Ok(self.pcode_count_raw()? == Self::PCODE_COUNT_NATIVE_SENTINEL)
-    }
-
-    /// Byte offset to the Initialize event in the dispatch vtable at 0x2C.
-    ///
-    /// This is a byte offset into the dispatch vtable at `basic_class_object_va + 0x28`.
-    /// Divide by 4 to get the zero-based method slot index.
-    ///
-    /// - **Classes**: 0x0C (slot 3, after IUnknown)
-    /// - **Forms/UserDocs**: 0x68 (slot 26, after base interface methods)
-    ///
-    /// Related: `ProcDscInfo.base_iface_slot_count = (initialize_event_offset / 4) - 1`.
+    /// The same in every object of a kind in the fixtures, with or
+    /// without an `Initialize` handler. It does not index the object's own
+    /// method link slots (see [`OptionalObjectInfo`]); what it indexes is
+    /// unconfirmed.
     #[inline]
     pub fn initialize_event_offset(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x2C)
     }
 
-    /// Byte offset to the Terminate event in the dispatch vtable at 0x2E.
+    /// Terminate event offset at 0x2E.
     ///
-    /// Always `initialize_event_offset + 4` (next slot after Initialize).
+    /// `initialize_event_offset + 4` in every fixture.
     #[inline]
     pub fn terminate_event_offset(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x2E)
     }
 
     /// VA of the method link table at offset 0x30.
+    ///
+    /// [`method_link_count`](Self::method_link_count) dwords that the
+    /// runtime copies into the object's vtable (MSVBVM60 6.00.8176
+    /// `0x660139D5`).
     #[inline]
     pub fn method_link_table_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x30)
     }
 
-    /// Per-object dispatch vtable VA at offset 0x34.
+    /// Per-object vtable block VA at offset 0x34.
     ///
     /// Points to compiler-allocated .data section space (zeroed on disk).
-    /// At runtime, MSVBVM60 populates this with a dispatch vtable:
+    /// At load MSVBVM60 fills it (6.00.8176 `0x66013971`):
     ///
-    /// - **0x28-byte header** (IUnknown + class metadata)
-    /// - **method_count × 4 bytes** (one dispatch pointer per method)
+    /// - `+0x08`: the `ObjectInfo` VA
+    /// - `+0x0C`: the vtable, 7 `IUnknown`/`IDispatch` slots, then
+    ///   [`inherited_vtable_slots`](Self::inherited_vtable_slots) runtime
+    ///   stub slots, then [`method_link_count`](Self::method_link_count)
+    ///   slots copied from the method link table
     ///
-    /// For classes: total size = `0x28 + method_count * 4` (confirmed
-    /// across 4 class objects).
-    /// For forms: larger allocation that includes control event dispatch.
-    ///
-    /// The runtime resolves this via an array at `ExecProj+0x22C`
-    /// indexed by `ObjectInfo.wObjectIndex`.
+    /// Its size is [`basic_class_object_size`](Self::basic_class_object_size).
     #[inline]
     pub fn basic_class_object_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x34)
     }
 
-    /// Reserved field at offset 0x38 (always 0).
+    /// Reserved field at offset 0x38 (0 in every fixture).
     #[inline]
     pub fn null_38(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x38)
@@ -704,9 +769,9 @@ impl<'a> OptionalObjectInfo<'a> {
 
     /// Linker-internal field at offset 0x3C.
     ///
-    /// Non-zero in all tested samples, but contains an address outside the
-    /// PE image range - appears to be an unpatched linker-internal VA from
-    /// the VBA6.DLL compilation environment. Not read by the runtime.
+    /// Non-zero in every fixture, and an address outside the PE image
+    /// (e.g. 0x0204DF10 in `calls`). [`ObjectInfo`] +0x30 holds values of
+    /// the same kind.
     #[inline]
     pub fn field_3c(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x3C)
@@ -990,8 +1055,18 @@ mod tests {
                 .unwrap()
         );
 
-        // The "table" at the constants pool is the pool.
+        // An empty pool's pointer lands on the method table (an interface
+        // class whose methods have no constants: events fixture `Measure`).
         data[0x24..0x28].copy_from_slice(&0x00405000u32.to_le_bytes());
+        assert!(
+            ObjectInfo::parse(&data)
+                .unwrap()
+                .has_method_table()
+                .unwrap()
+        );
+
+        // With entries in the pool, the "table" at the pool is the pool.
+        data[0x28..0x2A].copy_from_slice(&2u16.to_le_bytes()); // constants_count
         assert!(
             !ObjectInfo::parse(&data)
                 .unwrap()
@@ -1012,29 +1087,14 @@ mod tests {
     #[test]
     fn test_optional_object_info_parse() {
         let mut data = vec![0u8; OptionalObjectInfo::SIZE];
-        data[0x2A..0x2C].copy_from_slice(&3u16.to_le_bytes()); // pcode_count
         data[0x20..0x24].copy_from_slice(&7u32.to_le_bytes()); // control_count
+        data[0x28..0x2A].copy_from_slice(&5u16.to_le_bytes()); // method_link_count
+        data[0x2A..0x2C].copy_from_slice(&439u16.to_le_bytes()); // a form's inherited slots
         let opt = OptionalObjectInfo::parse(&data).unwrap();
-        assert_eq!(opt.pcode_count_raw().unwrap(), 3);
-        assert_eq!(opt.pcode_count().unwrap(), 3);
-        assert!(!opt.is_native_sentinel().unwrap());
+        assert_eq!(opt.inherited_vtable_slots().unwrap(), 439);
         assert_eq!(opt.control_count().unwrap(), 7);
-    }
-
-    #[test]
-    fn test_optional_object_info_native_sentinel() {
-        let mut data = vec![0u8; OptionalObjectInfo::SIZE];
-        // Linker writes 0x1B7 (439) at +0x2A on natively compiled objects
-        // - see `OptionalObjectInfo::PCODE_COUNT_NATIVE_SENTINEL`.
-        data[0x2A..0x2C]
-            .copy_from_slice(&OptionalObjectInfo::PCODE_COUNT_NATIVE_SENTINEL.to_le_bytes());
-        let opt = OptionalObjectInfo::parse(&data).unwrap();
-        assert_eq!(
-            opt.pcode_count_raw().unwrap(),
-            OptionalObjectInfo::PCODE_COUNT_NATIVE_SENTINEL
-        );
-        assert_eq!(opt.pcode_count().unwrap(), 0);
-        assert!(opt.is_native_sentinel().unwrap());
+        // dispid's Host: 0x28 + 4 * (439 + 5).
+        assert_eq!(opt.basic_class_object_size().unwrap(), 0x718);
     }
 
     #[test]

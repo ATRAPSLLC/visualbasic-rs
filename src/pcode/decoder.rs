@@ -13,10 +13,15 @@ use std::fmt;
 
 use crate::{
     error::Error,
-    pcode::opcode::{self, OpcodeInfo},
-    pcode::operand::{self, Operand},
-    pcode::semantics::PCodeDataType,
-    util::read_u16_le,
+    pcode::{
+        calltarget::CallSignature,
+        movement::Movement,
+        opcode::{self, OpcodeInfo, PrLoad, StackRule},
+        operand::{self, Operand},
+        semantics::{OpcodeSemantics, PCodeDataType},
+        stackeffect::{Pop, PrSource, Push, StackEffect},
+    },
+    util::{read_i16_le, read_u16_le},
 };
 
 /// Maximum sentinel raw length when an instruction's byte span exceeds `u8::MAX`.
@@ -66,20 +71,22 @@ impl Instruction {
         self.info.data_type
     }
 
-    /// Returns the inferred type of the operand at slot `index`, if any.
+    /// Returns the VB type the instruction fixes
+    /// ([`OpcodeInfo::value_type`]): an operation's operand type, a
+    /// conversion's target, an x87 move's float type; `None` for a move that
+    /// names only a width, whose type comes from where its value goes.
+    #[inline]
+    pub fn value_type(&self) -> Option<PCodeDataType> {
+        self.info.value_type
+    }
+
+    /// Returns the opcode's [`data_type`](Self::data_type) for an operand
+    /// slot that holds an operand.
     ///
-    /// Today this projects the parent opcode's
-    /// [`data_type`](Self::data_type) for every operand slot - VB6 P-Code
-    /// opcodes are monomorphic in their operand kinds (a `LitI4` always
-    /// produces `I4`, an `FStR8` always stores `R8`), so the per-operand
-    /// type equals the per-instruction type when one is defined. The
-    /// per-slot signature is preserved so future revisions can refine it
-    /// to per-operand types (for example, `Convert { from, to }` opcodes
-    /// where the source operand has a different type than the result).
-    ///
-    /// Returns `None` for out-of-range `index`, for empty operand slots,
-    /// and for opcodes whose [`OpcodeInfo::data_type`] is `None`
-    /// (control flow, stack manipulation, debug markers).
+    /// The opcode tables type the instruction, not each operand: this is
+    /// the instruction's type for every operand present. Returns `None` for
+    /// an out-of-range `index`, an empty slot, and an opcode with no
+    /// [`OpcodeInfo::data_type`].
     #[inline]
     pub fn operand_type(&self, index: usize) -> Option<PCodeDataType> {
         // Validate the slot exists and carries an operand.
@@ -113,29 +120,323 @@ impl Instruction {
         }
     }
 
-    /// Classifies a `Resume` / `OnErrorGoto` instruction's signed operand into
-    /// the source-level error-flow construct it encodes.
+    /// Returns the code offsets this instruction can transfer control to.
     ///
-    /// These opcodes carry a `%l` operand that is a **signed** `i16`: positive
-    /// values are P-Code offsets (a label/handler target), while the sentinels
-    /// `-1` (`0xFFFF`) and `-2` (`0xFFFE`) select the `Next` / bare / disable
-    /// forms. Verified against the runtime `op_Lead2_Resume` (Resume) and
-    /// `op_OnErrorGoto` (handler-address math) in MSVBVM60.DLL.
+    /// Covers `%l` operands - except the sentinels of `OnErrorGoto` (`0`,
+    /// `0xFFFF`, `0xFFFE`) and `Resume` (`0xFFFF`, `0xFFFE`), which are no
+    /// offsets (see
+    /// [`error_flow`](Self::error_flow)) - and the entries of an `On ... GoTo`
+    /// jump table, read from `code`, the procedure's P-Code the instruction
+    /// was decoded from.
+    pub fn jump_targets<'a>(&'a self, code: &'a [u8]) -> impl Iterator<Item = u16> + 'a {
+        let semantics = self.info.semantics;
+        let sentinel = move |target: u16| match semantics {
+            OpcodeSemantics::OnError => target == 0 || target >= 0xFFFE,
+            OpcodeSemantics::Resume => target >= 0xFFFE,
+            _ => false,
+        };
+        self.operands.iter().flatten().flat_map(
+            move |operand| -> Box<dyn Iterator<Item = u16> + 'a> {
+                match *operand {
+                    Operand::JumpTarget(t) if !sentinel(t) => Box::new(std::iter::once(t)),
+                    Operand::JumpTable { at, count } => Box::new(
+                        (0..usize::from(count))
+                            .map(move |i| usize::from(at).saturating_add(i.saturating_mul(2)))
+                            .filter_map(move |pos| read_u16_le(code, pos).ok()),
+                    ),
+                    _ => Box::new(std::iter::empty()),
+                }
+            },
+        )
+    }
+
+    /// Returns what the instruction does to the evaluation stack, the x87
+    /// stack and Pr.
+    ///
+    /// The fixed part comes from the opcode table
+    /// ([`OpcodeInfo::popped`]); the operand-dependent part
+    /// ([`OpcodeInfo::stack`]) from the operands: 4-slot Variants for a
+    /// late-bound call's arguments, one slot per array index, two per
+    /// `ReDim` dimension. A call's arguments come from `call`, the
+    /// [`CallSignature`] of its callee:
+    ///
+    /// - `VCall*` / `ThisVCall*` ([`StackRule::Callee`]): the callee's
+    ///   argument widths, else its slot count ([`Pop::Slots`]), else
+    ///   [`Pop::Unknown`];
+    /// - `ImpAdCall*` ([`StackRule::ArgBytes`]): the operand's byte count,
+    ///   exact whatever the callee, split into the callee's argument widths
+    ///   when they add up to it.
+    ///
+    /// A call that leaves the x87 stack to its callee
+    /// ([`OpcodeInfo::fpu_callee`]) pushes an x87 value when
+    /// [`CallSignature::float_result`] is `Some(true)`, nothing when it is
+    /// `Some(false)`, and [`Push::MaybeX87`] without a signature.
+    ///
+    /// A `GoSub` pushes the return position (one slot) that its `Return`
+    /// pops, so inside a `GoSub` body the stack is one slot deeper than at
+    /// the `GoSub`.
+    pub fn stack_effect(&self, call: Option<&CallSignature<'_>>) -> StackEffect {
+        let info = self.info;
+        let rule: Vec<Pop> = match info.stack {
+            StackRule::Fixed => Vec::new(),
+            StackRule::Callee => match call {
+                Some(CallSignature {
+                    arg_widths: Some(widths),
+                    ..
+                }) => widths.iter().map(|&w| Pop::Eval(w)).collect(),
+                Some(CallSignature {
+                    arg_slots: Some(slots),
+                    ..
+                }) => vec![Pop::Slots(*slots)],
+                _ => vec![Pop::Unknown],
+            },
+            StackRule::ArgBytes { operand } => match self.operands.get(usize::from(operand)) {
+                Some(Some(Operand::ExternalCall { arg_bytes, .. })) => {
+                    let slots = arg_bytes / 4;
+                    match call.and_then(|c| c.arg_widths.as_ref()) {
+                        Some(widths)
+                            if widths.iter().map(|&w| u16::from(w)).sum::<u16>() == slots =>
+                        {
+                            widths.iter().map(|&w| Pop::Eval(w)).collect()
+                        }
+                        _ => vec![Pop::Slots(slots)],
+                    }
+                }
+                _ => vec![Pop::Unknown],
+            },
+            StackRule::Variants { operand } => self.repeat(operand, 1, Pop::Eval(4)),
+            StackRule::Count { operand } => self.repeat(operand, 1, Pop::Eval(1)),
+            StackRule::Pairs { operand } => self.repeat(operand, 2, Pop::Eval(1)),
+            StackRule::PairsAtLeastOne { operand } => match self.count_operand(operand) {
+                Some(n) => vec![Pop::Eval(1); usize::from(n.max(1)).saturating_mul(2)],
+                None => vec![Pop::Unknown],
+            },
+            StackRule::Bytes { operand } => match self.count_operand(operand) {
+                Some(bytes) => vec![Pop::Slots(bytes.saturating_sub(4) / 4)],
+                None => vec![Pop::Unknown],
+            },
+        };
+        let at = usize::from(info.rule_at).min(info.popped.len());
+        let (before, after) = info.popped.split_at(at);
+        let popped = before
+            .iter()
+            .copied()
+            .chain(rule)
+            .chain(after.iter().copied())
+            .collect();
+        let pushed = if info.pushes > 0 {
+            Some(Push::Eval(u8::try_from(info.pushes).unwrap_or(0)))
+        } else if info.fpu_push > 0 {
+            Some(Push::X87)
+        } else if info.fpu_callee {
+            match call.and_then(|c| c.float_result) {
+                Some(true) => Some(Push::X87),
+                Some(false) => None,
+                None => Some(Push::MaybeX87),
+            }
+        } else {
+            None
+        };
+        StackEffect {
+            popped,
+            pushed,
+            receiver: info.receiver,
+            pr: self.pr_source(),
+        }
+    }
+
+    /// Returns where the instruction loads Pr, the object register, from,
+    /// with the operands that locate the object; `None` if it does not load
+    /// Pr ([`OpcodeInfo::pr_load`]).
+    pub fn pr_source(&self) -> Option<PrSource> {
+        let operand = |index: usize| self.operands.get(index).copied().flatten();
+        let frame = |index: usize| match operand(index) {
+            Some(Operand::StackVar(offset)) => Some(offset),
+            _ => None,
+        };
+        let int16 = |index: usize| match operand(index) {
+            Some(Operand::Int16(value)) => Some(value),
+            _ => None,
+        };
+        let pool = |index: usize| match operand(index) {
+            Some(Operand::ConstPoolIndex(value)) => Some(value),
+            _ => None,
+        };
+        Some(match self.info.pr_load? {
+            PrLoad::Frame => PrSource::Frame { offset: frame(0)? },
+            PrLoad::Me => PrSource::Me,
+            PrLoad::Pool => PrSource::Pool { index: pool(0)? },
+            PrLoad::FrameIndirect => PrSource::FrameIndirect { offset: frame(0)? },
+            PrLoad::PrMember => PrSource::PrMember {
+                offset: int16(0)?.cast_unsigned(),
+            },
+            PrLoad::FrameMember => PrSource::FrameMember {
+                frame: frame(0)?,
+                offset: int16(1)?.cast_unsigned(),
+            },
+            PrLoad::ArrayElement => PrSource::ArrayElement,
+            PrLoad::Variant => PrSource::Variant,
+            PrLoad::NewIfNull => PrSource::NewIfNull { class: pool(0)? },
+            PrLoad::WithMember => PrSource::WithMember { offset: int16(0)? },
+            PrLoad::LateGet => PrSource::LateGet {
+                dispid: match operand(1) {
+                    Some(Operand::Int32(value)) => value,
+                    _ => return None,
+                },
+                object: frame(2)?,
+                temp: frame(0)?,
+            },
+        })
+    }
+
+    /// Returns operand `index` as a count: an unsigned `%2` or `%1`.
+    fn count_operand(&self, index: u8) -> Option<u16> {
+        match self.operands.get(usize::from(index))? {
+            Some(Operand::Int16(n)) => u16::try_from(*n).ok(),
+            Some(Operand::Byte(n)) => Some(u16::from(*n)),
+            _ => None,
+        }
+    }
+
+    /// `per` copies of `pop` for each unit of count operand `index`.
+    fn repeat(&self, index: u8, per: usize, pop: Pop) -> Vec<Pop> {
+        match self.count_operand(index) {
+            Some(n) => vec![pop; usize::from(n).saturating_mul(per)],
+            None => vec![Pop::Unknown],
+        }
+    }
+
+    /// Returns what a load, store or literal instruction moves, with its
+    /// operands resolved ([`Movement::of`]); `None` for other instructions.
+    pub fn movement(&self) -> Option<Movement> {
+        Movement::of(self)
+    }
+
+    /// Returns every frame slot (offset from ebp) the instruction names, in
+    /// order: its `%a` operands and the slots of an `FFree*` payload
+    /// ([`Operand::FrameList`], read from `code`, the procedure's P-Code).
+    ///
+    /// A `GetRecOwner*` / `PutRecOwner*` payload is an inline record
+    /// descriptor the runtime reads (its address is passed to the helper),
+    /// not frame slots; no fixture emits those opcodes.
+    pub fn frame_slots(&self, code: &[u8]) -> Vec<i16> {
+        let mut slots = Vec::new();
+        for operand in self.operands.iter().flatten() {
+            match *operand {
+                Operand::StackVar(offset) => slots.push(offset),
+                Operand::FrameList { at, count } => slots.extend(
+                    (0..usize::from(count))
+                        .map_while(|i| usize::from(at).checked_add(i.checked_mul(2)?))
+                        .map_while(|pos| read_i16_le(code, pos).ok()),
+                ),
+                _ => {}
+            }
+        }
+        slots
+    }
+
+    /// Returns how an `ExitProc*` instruction returns its procedure's result
+    /// ([`ProcedureReturn`]); `None` for any other instruction.
+    pub fn procedure_return(&self) -> Option<ProcedureReturn> {
+        /// The interpreter's slots end here; the locals start below.
+        const TOP: i16 = -0x84;
+        // The copy (0x6610640a) aligns its source down to an even address.
+        let even = |offset: i16| offset & !1;
+        let operand = |index: usize| match self.operands.get(index).copied().flatten() {
+            Some(Operand::Int16(value) | Operand::StackVar(value)) => Some(value),
+            _ => None,
+        };
+        // A width code: 1, 2, 4, else 8 bytes.
+        let width = |code: i16| match code {
+            1 => 1u8,
+            2 => 2,
+            4 => 4,
+            _ => 8,
+        };
+        let register = |from: i16, bytes: u8| ProcedureReturn::Register {
+            from,
+            bytes,
+            signed: false,
+        };
+        Some(match self.info.mnemonic {
+            "ExitProc" | "ExitProcStr" => register(-0x88, 4),
+            "ExitProcI2" => ProcedureReturn::Register {
+                from: -0x86,
+                bytes: 2,
+                signed: true,
+            },
+            "ExitProcUI1" => register(-0x86, 1),
+            "ExitProcCy" => register(-0x8C, 8),
+            "ExitProcR4" => ProcedureReturn::X87 {
+                from: -0x88,
+                bytes: 4,
+            },
+            "ExitProcR8" => ProcedureReturn::X87 {
+                from: -0x8C,
+                bytes: 8,
+            },
+            "ExitProcHresult" => ProcedureReturn::Hresult,
+            "ExitProcCbStack" => {
+                let bytes = width(operand(0)?);
+                register(TOP.saturating_sub(i16::from(bytes)), bytes)
+            }
+            "ExitProcFrameCbStack" => register(operand(0)?, width(operand(1)?)),
+            "ExitProcCbHresult" => {
+                let bytes = operand(1)?;
+                ProcedureReturn::CopyToRetval {
+                    from: even(TOP.saturating_sub(bytes)),
+                    bytes: bytes.cast_unsigned(),
+                    retval_arg: operand(0)?,
+                }
+            }
+            "ExitProcFrameCbHresult" => ProcedureReturn::CopyToRetval {
+                from: even(operand(0)?),
+                bytes: operand(2)?.cast_unsigned(),
+                retval_arg: operand(1)?,
+            },
+            "ExitProcCb" => {
+                let bytes = operand(0)?;
+                ProcedureReturn::CopyToHidden {
+                    from: even(TOP.saturating_sub(bytes)),
+                    bytes: bytes.cast_unsigned(),
+                }
+            }
+            "ExitProcFrameCb" => ProcedureReturn::CopyToHidden {
+                from: even(operand(0)?),
+                bytes: operand(1)?.cast_unsigned(),
+            },
+            _ => return None,
+        })
+    }
+
+    /// Classifies a `Resume` / `OnErrorGoto` instruction's operand into the
+    /// error-flow construct it encodes.
+    ///
+    /// The operand is a P-Code offset (a label) or a sentinel. Read from the
+    /// handlers (6.00.8176): `OnErrorGoto` (0x66105e46) first zeroes `Erl`
+    /// (runtime context + 0x98) and resets the error object at context +
+    /// 0x78 (0x66003b2f), then sets the handler `[ebp-0x40]` to
+    /// the label, to -1 for `0xFFFF` (`On Error Resume Next`) or to 0 for
+    /// `0xFFFE` (`On Error GoTo 0`); operand `0` instead clears the
+    /// statement an active handler is handling (`[ebp-0x3C]`) and keeps the
+    /// handler. `Resume` takes a label, `0xFFFF` (`Resume Next`) or `0xFFFE`
+    /// (`Resume`).
     ///
     /// Returns `None` for any other opcode. Prefer this over reading the raw
-    /// [`Operand::JumpTarget`], which renders a sentinel as a bogus `loc_FFFF`.
+    /// [`Operand::JumpTarget`], which renders a sentinel as `loc_FFFF`.
     pub fn error_flow(&self) -> Option<ErrorFlow> {
         let target = match self.operands.first() {
             Some(Some(Operand::JumpTarget(v))) => *v,
             _ => return None,
         };
-        match self.info.mnemonic {
-            "OnErrorGoto" => Some(match target {
+        match self.info.semantics {
+            OpcodeSemantics::OnError => Some(match target {
                 0xFFFF => ErrorFlow::OnErrorResumeNext,
                 0xFFFE => ErrorFlow::OnErrorGotoZero,
+                0 => ErrorFlow::OnErrorClearActive,
                 label => ErrorFlow::OnErrorGoto(label),
             }),
-            "Resume" => Some(match target {
+            OpcodeSemantics::Resume => Some(match target {
                 0xFFFF => ErrorFlow::ResumeNext,
                 0xFFFE => ErrorFlow::Resume,
                 label => ErrorFlow::ResumeLabel(label),
@@ -145,10 +446,67 @@ impl Instruction {
     }
 }
 
+/// How an `ExitProc*` instruction returns its procedure's result, read from
+/// the handlers (6.00.8176). Returned by
+/// [`Instruction::procedure_return`].
+///
+/// The result never comes from the evaluation stack: a function stores it in
+/// its frame (a 2-byte one at `ebp-0x86`, a 4-byte one at `ebp-0x88`, an
+/// 8-byte one at `ebp-0x8C`, a Variant at `ebp-0x94`: the top of the locals,
+/// just below the interpreter's slots that end at `ebp-0x84`), and the
+/// `ExitProc*` form says where to take it from and how to hand it back. A
+/// `Sub` ends with `ExitProc`, whose `eax` is then unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcedureReturn {
+    /// In `eax` (1, 2 or 4 bytes, extended) or `edx:eax` (8 bytes), loaded
+    /// from frame offset `from`.
+    Register {
+        /// Frame offset (from ebp) of the value.
+        from: i16,
+        /// Its size in bytes.
+        bytes: u8,
+        /// `true` if a 2-byte value is sign-extended (`ExitProcI2`).
+        signed: bool,
+    },
+    /// On the x87 stack (`fld`), from frame offset `from`: a Single (4
+    /// bytes), a Double or Date (8).
+    X87 {
+        /// Frame offset (from ebp) of the value.
+        from: i16,
+        /// Its size in bytes.
+        bytes: u8,
+    },
+    /// `eax` = 0 (`S_OK`) and nothing else: a method with no result, or one
+    /// whose result went through its `[out, retval]` pointer before.
+    Hresult,
+    /// `bytes` copied from frame offset `from` to the `[out, retval]`
+    /// pointer the caller passed in argument `retval_arg` (an offset from
+    /// ebp); `eax` = 0 (`S_OK`) (`ExitProcCbHresult`,
+    /// `ExitProcFrameCbHresult`).
+    CopyToRetval {
+        /// Frame offset (from ebp) of the value.
+        from: i16,
+        /// Bytes copied.
+        bytes: u16,
+        /// Offset from ebp of the argument holding the pointer.
+        retval_arg: i16,
+    },
+    /// `bytes` copied from frame offset `from` to the hidden result pointer
+    /// the caller passed as the first argument (`ebp+0xC`), which `eax`
+    /// returns (`ExitProcCb`, `ExitProcFrameCb`: a module function returning
+    /// a Variant or a record).
+    CopyToHidden {
+        /// Frame offset (from ebp) of the value.
+        from: i16,
+        /// Bytes copied.
+        bytes: u16,
+    },
+}
+
 /// Source-level error-handling construct recovered from a `Resume` or
 /// `OnErrorGoto` instruction by [`Instruction::error_flow`].
 ///
-/// VB6 encodes the three `On Error` and three `Resume` source forms in a single
+/// VB6 encodes the `On Error` and `Resume` forms in one
 /// signed `i16` operand; this enum makes the encoding legible (and keeps the
 /// disassembler from printing a sentinel as `loc_FFFF`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +517,10 @@ pub enum ErrorFlow {
     OnErrorResumeNext,
     /// `On Error GoTo 0` - disables error handling; operand `-2` (`0xFFFE`).
     OnErrorGotoZero,
+    /// Operand `0`: resets the error state and the statement an active
+    /// handler is handling, keeping the installed handler. No fixture's source compiles
+    /// to it.
+    OnErrorClearActive,
     /// `Resume <label>` - resumes at the given P-Code offset.
     ResumeLabel(u16),
     /// `Resume Next` - resumes after the faulting statement; operand `-1` (`0xFFFF`).
@@ -173,6 +535,7 @@ impl fmt::Display for ErrorFlow {
             Self::OnErrorGoto(label) => write!(f, "On Error GoTo loc_{label:04X}"),
             Self::OnErrorResumeNext => f.write_str("On Error Resume Next"),
             Self::OnErrorGotoZero => f.write_str("On Error GoTo 0"),
+            Self::OnErrorClearActive => f.write_str("On Error (clear the active error)"),
             Self::ResumeLabel(label) => write!(f, "Resume loc_{label:04X}"),
             Self::ResumeNext => f.write_str("Resume Next"),
             Self::Resume => f.write_str("Resume"),
@@ -203,6 +566,9 @@ pub struct InstructionIterator<'a> {
     pos: usize,
     /// Total expected length (from `ProcDscInfo.wProcSize`).
     limit: usize,
+    /// The furthest offset a jump decoded so far targets: the code reaches at
+    /// least that far, whatever terminators come before it.
+    furthest_target: usize,
 }
 
 impl<'a> InstructionIterator<'a> {
@@ -220,6 +586,7 @@ impl<'a> InstructionIterator<'a> {
             bytes: pcode_bytes,
             pos: 0,
             limit,
+            furthest_target: 0,
         }
     }
 
@@ -232,7 +599,7 @@ impl<'a> InstructionIterator<'a> {
     /// Returns `true` if every byte from `start` to the stream limit is `0x00`.
     ///
     /// VB6 pads each procedure's P-Code stream to a 4-byte boundary with zero
-    /// bytes, so `proc_size` can include 1–3 trailing pad bytes after the final
+    /// bytes, so `proc_size` can include 1 to 3 trailing pad bytes after the final
     /// terminator. A partial "instruction" made entirely of those pad bytes
     /// (e.g. a lone `0x00`, which would otherwise look like a truncated
     /// `LargeBos`) is not a decode error - it is the end of the real stream.
@@ -349,14 +716,35 @@ impl Iterator for InstructionIterator<'_> {
                     size: byte_count,
                 }));
             }
+            // A payload with a stated layout (the named late-bound calls) decodes
+            // to its operands, and must fill the payload exactly; one without
+            // stays an opaque byte list.
+            if info.operand_format.is_empty() {
+                operands = [
+                    Some(Operand::VariableLength { byte_count }),
+                    None,
+                    None,
+                    None,
+                ];
+            } else {
+                let mut payload = self.pos;
+                operands = match operand::decode_operands(
+                    info.operand_format,
+                    self.bytes,
+                    &mut payload,
+                    payload_end,
+                ) {
+                    Ok(operands) => operands,
+                    Err(e) => return Some(Err(e)),
+                };
+                if payload != payload_end {
+                    return Some(Err(Error::InvalidVariableLengthSize {
+                        opcode_name: info.mnemonic,
+                        size: byte_count,
+                    }));
+                }
+            }
             self.pos = payload_end;
-
-            operands = [
-                Some(Operand::VariableLength { byte_count }),
-                None,
-                None,
-                None,
-            ];
         } else if info.size > 0 {
             // Fixed-size instruction: decode operands according to format string.
             // The 'size' includes the opcode byte itself (but not the lead byte).
@@ -392,12 +780,30 @@ impl Iterator for InstructionIterator<'_> {
         let raw_len = u8::try_from(self.pos.saturating_sub(start)).unwrap_or(RAW_LEN_SATURATION);
         let offset_u16 = u16::try_from(start).unwrap_or(u16::MAX);
 
-        Some(Ok(Instruction {
+        // The compiler pads a procedure's code to a multiple of four bytes,
+        // usually with zeros but not always (a `ParamArray` method can end
+        // `ExitProcCbHresult` then `00 ff ff`). Fewer than four bytes after a
+        // terminator are that padding, unless a jump reaches them; four or
+        // more are code, reachable or not (a `Function` with `GoSub`s ends
+        // with its `Return`s, then the `ExitProc` of `End Function` that
+        // nothing reaches).
+        let instruction = Instruction {
             offset: offset_u16,
             raw_len,
             info,
             operands,
-        }))
+        };
+        for target in instruction.jump_targets(self.bytes) {
+            self.furthest_target = self.furthest_target.max(usize::from(target));
+        }
+        if info.is_terminator()
+            && self.limit.saturating_sub(self.pos) < 4
+            && self.pos > self.furthest_target
+        {
+            self.limit = self.pos;
+        }
+
+        Some(Ok(instruction))
     }
 }
 
@@ -516,9 +922,10 @@ mod tests {
         assert_eq!(insns[0].info.mnemonic, "FFreeVar");
         assert_eq!(
             insns[0].operands[0],
-            Some(Operand::VariableLength { byte_count: 6 })
+            Some(Operand::FrameList { at: 3, count: 3 })
         );
         assert_eq!(insns[0].raw_len, 9); // 1 + 2 + 6
+        assert_eq!(insns[0].frame_slots(&bytes), vec![-0x90, -0x98, -0xA0]);
     }
 
     #[test]
@@ -661,7 +1068,7 @@ mod tests {
 
     #[test]
     fn test_position_tracking() {
-        let bytes = [0x14, 0x14]; // Two ExitProc
+        let bytes = [0xAA, 0x14]; // AddI4, ExitProc
         let mut iter = InstructionIterator::new(&bytes, bytes.len() as u16);
         assert_eq!(iter.position(), 0);
         let _ = iter.next();
@@ -669,6 +1076,48 @@ mod tests {
         let _ = iter.next();
         assert_eq!(iter.position(), 2);
         assert!(iter.next().is_none());
+    }
+
+    /// The code ends after a terminator no jump reaches past, whatever bytes
+    /// pad the procedure after it: `ExitProc` then `00 ff ff` is one
+    /// instruction, where decoding on read the padding as a truncated
+    /// `LargeBos`.
+    #[test]
+    fn decoding_stops_after_the_last_reachable_terminator() {
+        let bytes = [0x14, 0x00, 0xFF, 0xFF];
+        let decoded: Vec<_> = InstructionIterator::new(&bytes, bytes.len() as u16).collect();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded.iter().all(Result::is_ok));
+    }
+
+    /// Four or more bytes after a terminator are code: a `Function` with
+    /// `GoSub`s ends `Return` (`FC C9`), then the `ExitProc` of `End
+    /// Function` nothing reaches, then three bytes of padding
+    /// (`tests/fixtures/flow`).
+    #[test]
+    fn decoding_continues_past_a_terminator_before_four_bytes() {
+        let bytes = [0xFC, 0xC9, 0x14, 0xFF, 0xFF, 0xFF];
+        let decoded: Vec<Instruction> = InstructionIterator::new(&bytes, bytes.len() as u16)
+            .collect::<Result<_, _>>()
+            .expect("decodes");
+        let mnemonics: Vec<&str> = decoded.iter().map(|i| i.info.mnemonic).collect();
+        assert_eq!(mnemonics, vec!["Return", "ExitProc"]);
+    }
+
+    /// Code a jump reaches is decoded past a terminator: `Branch +5; ExitProc;
+    /// ... ExitProc` decodes the second `ExitProc` the branch targets.
+    #[test]
+    fn decoding_continues_past_a_terminator_a_jump_reaches() {
+        // Branch loc_0004; ExitProc; ExitProc
+        let bytes = [0x1E, 0x04, 0x00, 0x14, 0x14];
+        let decoded: Vec<Instruction> = InstructionIterator::new(&bytes, bytes.len() as u16)
+            .collect::<Result<_, _>>()
+            .expect("decodes");
+        let offsets: Vec<u16> = decoded
+            .iter()
+            .map(|instruction| instruction.offset)
+            .collect();
+        assert_eq!(offsets, vec![0, 3, 4]);
     }
 
     #[test]

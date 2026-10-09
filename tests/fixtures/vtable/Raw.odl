@@ -1,0 +1,40 @@
+// A type library VB6 can reference but no VB6 source can declare: a vtable
+// interface whose methods return their values directly, without an HRESULT.
+// Calls on it compile to the typed VCall* forms.
+//
+// Built with MKTYPLIB from Visual Studio 6.0 (see the fixtures README):
+//
+//     MKTYPLIB /nocpp /win32 /tlb Raw.tlb Raw.odl
+
+[
+    uuid(5D1E7A10-6C2B-4E1A-9B7F-3A2C1D0E0F01),
+    version(1.0),
+    helpstring("VB6 fixture: non-HRESULT vtable calls")
+]
+library RawLib
+{
+    importlib("stdole2.tlb");
+
+    [
+        odl,
+        uuid(5D1E7A10-6C2B-4E1A-9B7F-3A2C1D0E0F02)
+    ]
+    interface IRaw : IUnknown
+    {
+        unsigned char GetByte(void);
+        short GetShort(void);
+        long GetLong(void);
+        float GetSingle(void);
+        double GetDouble(void);
+        CURRENCY GetCurrency(void);
+        DATE GetDate(void);
+        BSTR GetString(void);
+        boolean GetBool(void);
+        VARIANT GetVariant(void);
+        IUnknown * GetUnknown(void);
+        IRaw * GetSelf(void);
+        void Put([in] long a, [in] double b, [in] BSTR s);
+        long Combine([in] short a, [in] long b, [in] float c, [in] double d);
+        HRESULT Checked([in] long a, [out, retval] long * r);
+    };
+};

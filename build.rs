@@ -17,6 +17,47 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+/// Splits one CSV line into its fields, honouring double-quoted fields (a
+/// quoted field may hold commas; `""` inside one is a quote).
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            _ => field.push(c),
+        }
+    }
+    fields.push(field);
+    fields
+}
+
+/// One row of `data/opcodes.csv`.
+#[derive(Clone)]
+struct OpcodeEntry {
+    size: i8,
+    mnemonic: String,
+    operand_format: String,
+    pops: i8,
+    pushes: i8,
+    fpu_pops: u8,
+    fpu_push: u8,
+    fpu_callee: bool,
+    stack: String,
+    popped: String,
+    object: String,
+    movement: String,
+    category: String,
+    handler: u32,
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=data/opcodes.csv");
     println!("cargo:rerun-if-changed=data/vb6_control_guids.csv");
@@ -29,19 +70,6 @@ fn main() {
     let csv_content = fs::read_to_string(csv_path).expect("Failed to read data/opcodes.csv");
 
     // Parse CSV into (table, opcode) -> OpcodeEntry
-    #[derive(Clone)]
-    struct OpcodeEntry {
-        size: i8,
-        mnemonic: String,
-        operand_format: String,
-        pops: i8,
-        pushes: i8,
-        fpu_pops: u8,
-        fpu_push: u8,
-        mem_read: u8,
-        mem_write: u8,
-        category: String,
-    }
 
     let mut entries: HashMap<(u8, u8), OpcodeEntry> = HashMap::new();
 
@@ -55,8 +83,10 @@ fn main() {
             continue;
         }
 
-        // Parse: table,opcode,size,mnemonic,operand_format,pops,pushes,fpu_pops,fpu_push,mem_read,mem_write,category,handler,notes
-        let parts: Vec<&str> = line.splitn(14, ',').collect();
+        // Parse: table,opcode,size,mnemonic,operand_format,pops,pushes,fpu_pops,fpu_push,
+        // stack,popped,object,movement,category,handler_8176,handler_9848,notes
+        let fields = split_csv_line(line);
+        let parts: Vec<&str> = fields.iter().map(String::as_str).collect();
         if parts.len() < 5 {
             panic!("too few columns at line {}", line_num + 1);
         }
@@ -88,22 +118,37 @@ fn main() {
             .get(7)
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
-        let fpu_push: u8 = parts
-            .get(8)
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        let mem_read: u8 = parts
+        let fpu_push_text = parts.get(8).map(|s| s.trim()).unwrap_or("");
+        let fpu_callee = fpu_push_text == "c";
+        let fpu_push: u8 = if fpu_callee {
+            0
+        } else {
+            fpu_push_text.parse().unwrap_or(0)
+        };
+        let stack = parts
             .get(9)
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        let mem_write: u8 = parts
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let popped = parts
             .get(10)
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        let category = parts
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let object = parts
             .get(11)
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
+        let movement = parts
+            .get(12)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let category = parts
+            .get(13)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let handler = parts
+            .get(14)
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
 
         entries.insert(
             (table, opcode),
@@ -115,9 +160,13 @@ fn main() {
                 pushes,
                 fpu_pops,
                 fpu_push,
-                mem_read,
-                mem_write,
+                fpu_callee,
+                stack,
+                popped,
+                object,
+                movement,
                 category,
+                handler,
             },
         );
     }
@@ -166,14 +215,19 @@ fn main() {
                 pushes: 0,
                 fpu_pops: 0,
                 fpu_push: 0,
-                mem_read: 0,
-                mem_write: 0,
+                fpu_callee: false,
+                stack: String::new(),
+                popped: String::new(),
+                object: String::new(),
+                movement: String::new(),
                 category: String::new(),
+                handler: 0,
             };
             let entry = entries.get(&(table_idx as u8, opcode)).unwrap_or(&default);
 
             let semantics_str = classify_semantics(&entry.mnemonic, &entry.category);
             let data_type_str = classify_data_type(&entry.mnemonic);
+            let value_type_str = classify_value_type(&entry.mnemonic, &entry.category);
             let fpu_inplace = classify_fpu_inplace(
                 &entry.mnemonic,
                 &entry.category,
@@ -181,13 +235,16 @@ fn main() {
                 entry.fpu_push,
             );
 
+            let stack_str = classify_stack_rule(&entry.stack, table_idx, opcode);
+            let (receiver_str, pr_load) = classify_object(&entry.object, table_idx, opcode);
+            let (popped, rule_at) = parse_popped(entry, table_idx, opcode);
             writeln!(
                 out,
-                "    OpcodeInfo {{ table: {}, index: 0x{:02X}, size: {}, mnemonic: {:?}, operand_format: {:?}, pops: {}, pushes: {}, fpu_pops: {}, fpu_push: {}, fpu_inplace: {}, mem_read: {}, mem_write: {}, category: {:?}, semantics: {}, data_type: {} }},",
+                "    OpcodeInfo {{ table: {}, index: 0x{:02X}, size: {}, mnemonic: {:?}, operand_format: {:?}, pops: {}, pushes: {}, popped: {}, rule_at: {}, fpu_pops: {}, fpu_push: {}, fpu_callee: {}, fpu_inplace: {}, stack: {}, receiver: {}, pr_load: {}, movement: {:?}, category: {:?}, semantics: {}, data_type: {}, value_type: {}, handler: {:#010X} }},",
                 variant, opcode, entry.size, entry.mnemonic, entry.operand_format,
-                entry.pops, entry.pushes, entry.fpu_pops, entry.fpu_push, fpu_inplace,
-                entry.mem_read, entry.mem_write, entry.category,
-                semantics_str, data_type_str
+                entry.pops, entry.pushes, popped, rule_at, entry.fpu_pops, entry.fpu_push,
+                entry.fpu_callee, fpu_inplace, stack_str, receiver_str, pr_load, entry.movement,
+                entry.category, semantics_str, data_type_str, value_type_str, entry.handler
             )
             .unwrap();
         }
@@ -307,6 +364,57 @@ fn main() {
     generate_msvbvm60_exports(&out_dir);
 }
 
+/// Parses the `popped` column into `Pop` initializers, last operand first,
+/// and the position of the `*` marking the operand-dependent run (0 when
+/// absent).
+///
+/// Panics when the evaluation-stack widths do not sum to `pops`, the `f`s do
+/// not count `fpu_pops`, a `*` disagrees with the `stack` column, or the
+/// opcode would push onto both stacks.
+fn parse_popped(entry: &OpcodeEntry, table: usize, opcode: u8) -> (String, usize) {
+    let mut pops = Vec::new();
+    let mut slots = 0i32;
+    let mut fpu = 0u8;
+    let mut rule_at = None;
+    for token in entry.popped.split_whitespace() {
+        match token {
+            "*" => rule_at = Some(pops.len()),
+            "f" => {
+                fpu += 1;
+                pops.push("Pop::X87".to_string());
+            }
+            _ => {
+                let width = token.parse::<u8>().unwrap_or_else(|_| {
+                    panic!("{table},0x{opcode:02X}: bad popped token {token:?}")
+                });
+                slots += i32::from(width);
+                pops.push(format!("Pop::Eval({width})"));
+            }
+        }
+    }
+    let implemented = entry.size != 0 && entry.mnemonic != "InvalidExcode";
+    if implemented && (slots != i32::from(entry.pops) || fpu != entry.fpu_pops) {
+        panic!(
+            "{table},0x{opcode:02X} {}: popped {:?} is {slots} slots and {fpu} x87 values, \
+             pops {} and fpu_pops {}",
+            entry.mnemonic, entry.popped, entry.pops, entry.fpu_pops
+        );
+    }
+    if implemented && rule_at.is_some() != !entry.stack.is_empty() {
+        panic!(
+            "{table},0x{opcode:02X} {}: popped {:?} disagrees with stack {:?}",
+            entry.mnemonic, entry.popped, entry.stack
+        );
+    }
+    if implemented && entry.pushes > 0 && (entry.fpu_push > 0 || entry.fpu_callee) {
+        panic!(
+            "{table},0x{opcode:02X} {}: pushes onto both stacks",
+            entry.mnemonic
+        );
+    }
+    (format!("&[{}]", pops.join(", ")), rule_at.unwrap_or(0))
+}
+
 /// Generates `vb6_data_generated.rs` containing control GUIDs, event templates,
 /// and constant name tables.
 fn generate_vb6_data(out_dir: &str) {
@@ -318,14 +426,16 @@ fn generate_vb6_data(out_dir: &str) {
     generate_vb6_constants(&mut out);
 }
 
-/// Generates exact CLSID-to-name lookup for VB6 intrinsic controls.
+/// Generates the GUID-to-control-class lookup for the GUIDs a ControlInfo
+/// names (the control's events interface, its control-array variant, its
+/// coclass).
 fn generate_control_guids(out: &mut fs::File) {
     let guid_csv = fs::read_to_string("data/vb6_control_guids.csv")
         .expect("Failed to read data/vb6_control_guids.csv");
 
     writeln!(
         out,
-        "/// Exact CLSID-to-name lookup for VB6 intrinsic controls."
+        "/// Exact GUID-to-class lookup for VB6 intrinsic controls and designers."
     )
     .unwrap();
     writeln!(out, "/// Generated from data/vb6_control_guids.csv.").unwrap();
@@ -336,16 +446,17 @@ fn generate_control_guids(out: &mut fs::File) {
     .unwrap();
     writeln!(out, "    static TABLE: &[([u8; 16], &str)] = &[").unwrap();
 
-    for (i, line) in guid_csv.lines().enumerate() {
-        if i == 0 || line.trim().is_empty() {
+    for line in guid_csv.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line == "guid,name" {
             continue;
         }
         let mut parts = line.splitn(2, ',');
-        let clsid_str = parts.next().expect("missing clsid").trim();
+        let guid_str = parts.next().expect("missing guid").trim();
         let name = parts.next().expect("missing name").trim();
 
-        // Parse GUID string: "33AD4ED0-6699-11CF-B70C-00AA0060D393"
-        let guid_bytes = parse_guid_string(clsid_str);
+        // Parse GUID string: "33AD4EE2-6699-11CF-B70C-00AA0060D393"
+        let guid_bytes = parse_guid_string(guid_str);
         writeln!(
             out,
             "        ([{}], {:?}),",
@@ -369,103 +480,47 @@ fn generate_control_guids(out: &mut fs::File) {
     writeln!(out).unwrap();
 }
 
-/// Generates event template arrays for intrinsic controls.
+/// Generates the event names of each control class by event sink slot.
 fn generate_event_templates(out: &mut fs::File) {
     let events_csv =
         fs::read_to_string("data/vb6_events.csv").expect("Failed to read data/vb6_events.csv");
 
-    let mut standard_events: Vec<(usize, String)> = Vec::new();
-    let mut form_events: Vec<(usize, String)> = Vec::new();
-    let mut timer_events: Vec<(usize, String)> = Vec::new();
-    let mut usercontrol_events: Vec<(usize, String)> = Vec::new();
-
-    for (i, line) in events_csv.lines().enumerate() {
-        if i == 0 || line.trim().is_empty() {
+    // Control classes in first-seen order, each with its (slot, name) rows.
+    let mut classes: Vec<(String, Vec<(u16, String)>)> = Vec::new();
+    for line in events_csv.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line == "control,slot,name" {
             continue;
         }
         let mut parts = line.splitn(3, ',');
-        let template = parts.next().expect("missing template").trim();
-        let slot: usize = parts
+        let class = parts.next().expect("missing control").trim().to_string();
+        let slot: u16 = parts
             .next()
             .expect("missing slot")
             .trim()
             .parse()
             .expect("bad slot");
         let name = parts.next().expect("missing name").trim().to_string();
-
-        match template {
-            "standard" => standard_events.push((slot, name)),
-            "form" => form_events.push((slot, name)),
-            "timer" => timer_events.push((slot, name)),
-            "usercontrol" => usercontrol_events.push((slot, name)),
-            _ => panic!("unknown event template: {template}"),
+        match classes.iter_mut().find(|(c, _)| *c == class) {
+            Some((_, rows)) => rows.push((slot, name)),
+            None => classes.push((class, vec![(slot, name)])),
         }
     }
 
-    standard_events.sort_by_key(|(s, _)| *s);
-    form_events.sort_by_key(|(s, _)| *s);
-    timer_events.sort_by_key(|(s, _)| *s);
-    usercontrol_events.sort_by_key(|(s, _)| *s);
-
     writeln!(
         out,
-        "/// Standard 24-event template for intrinsic controls."
+        "/// Event names by control class: `(class, [(sink slot, event name)])`."
     )
     .unwrap();
     writeln!(out, "/// Generated from data/vb6_events.csv.").unwrap();
-    writeln!(
-        out,
-        "pub static STANDARD_EVENTS: [&str; {}] = [",
-        standard_events.len()
-    )
-    .unwrap();
-    for (_, name) in &standard_events {
-        writeln!(out, "    {name:?},").unwrap();
-    }
-    writeln!(out, "];").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "/// Form lifecycle event template.").unwrap();
-    writeln!(
-        out,
-        "pub static FORM_EVENTS: [&str; {}] = [",
-        form_events.len()
-    )
-    .unwrap();
-    for (_, name) in &form_events {
-        writeln!(out, "    {name:?},").unwrap();
-    }
-    writeln!(out, "];").unwrap();
-    writeln!(out).unwrap();
-
-    // Timer overrides: slot 0 = "Timer" instead of "Click"
-    writeln!(out, "/// Timer event overrides (slot, name).").unwrap();
-    writeln!(out, "pub static TIMER_EVENTS: &[(usize, &str)] = &[",).unwrap();
-    for (slot, name) in &timer_events {
-        writeln!(out, "    ({slot}, {name:?}),").unwrap();
-    }
-    writeln!(out, "];").unwrap();
-    writeln!(out).unwrap();
-
-    // UserControl extra events (slots 24+ beyond standard template)
-    writeln!(
-        out,
-        "/// UserControl extra events beyond the standard 24-event template."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "/// Slot numbers are relative (0 = slot 24 in the vtable)."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "pub static USERCONTROL_EVENTS: [&str; {}] = [",
-        usercontrol_events.len()
-    )
-    .unwrap();
-    for (_, name) in &usercontrol_events {
-        writeln!(out, "    {name:?},").unwrap();
+    writeln!(out, "pub static EVENTS: &[(&str, &[(u16, &str)])] = &[").unwrap();
+    for (class, mut rows) in classes {
+        rows.sort_by_key(|(slot, _)| *slot);
+        writeln!(out, "    ({class:?}, &[").unwrap();
+        for (slot, name) in rows {
+            writeln!(out, "        ({slot}, {name:?}),").unwrap();
+        }
+        writeln!(out, "    ]),").unwrap();
     }
     writeln!(out, "];").unwrap();
     writeln!(out).unwrap();
@@ -564,7 +619,7 @@ fn normalize_operand_format(raw: &str) -> String {
         if chars[i] == '%' && i + 1 < chars.len() {
             let spec = chars[i + 1];
             match spec {
-                '1' | '2' | '4' | 'a' | 's' | 'l' | 'c' | 'v' | 'x' | '}' => {
+                '1' | '2' | '4' | 'a' | 's' | 'l' | 'c' | 'v' | 'x' | 'N' | 'D' | 'L' | 'F' => {
                     result.push(format!("%{spec}"));
                     i += 2;
                     continue;
@@ -634,10 +689,10 @@ fn generate_control_properties(out_dir: &str) {
                 (4, 0) => "Byte",
                 (5, 0) => "Long",                              // OLE_COLOR
                 (6, 0) => "Byte",                              // Enum
-                (6, 3) => "Long",                              // Byte + 3B callback (ScaleMode)
+                (6, 3) => "Scale",                             // ScaleMode + scale state
                 (7, 0) => "Long",                              // Single
                 (8, 0) | (9, 0) | (10, 0) | (11, 0) => "Long", // Twips
-                (8, 4) => "LongPair",                          // Left + Top callback
+                (8, 4) => "Bounds",                            // Left, Top, Width, Height
                 (8, 12) => "Size16",                           // ClientSize + 12B callback
                 (13, 0) => "TagStr",
                 (20, _) => "Font", // 11B + nameLen callback
@@ -684,7 +739,7 @@ fn generate_control_properties(out_dir: &str) {
     )
     .unwrap();
     writeln!(out, "    pub ser_type: u8,").unwrap();
-    writeln!(out, "    /// Extra callback bytes (0=none, 3=ScaleMode, 4=LeftTop, 12=ClientSize, -1=Font nameLen).").unwrap();
+    writeln!(out, "    /// Extra callback bytes (0=none, 3=ScaleMode's scale state, 4=Bounds, 12=ClientSize, -1=Font nameLen).").unwrap();
     writeln!(out, "    pub callback_bytes: i8,").unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
@@ -804,17 +859,33 @@ fn generate_control_properties(out_dir: &str) {
 /// Detected via: unary category + FPU data type suffix + no explicit
 /// fpu push/pop (the push/pop are implicit, cancelling out).
 fn classify_fpu_inplace(mnemonic: &str, category: &str, fpu_pops: u8, fpu_push: u8) -> bool {
-    // Only unary and arithmetic categories can modify TOS in place
-    if category != "unary" && category != "arith" {
+    // Only unary, arithmetic and conversion categories rewrite ST0 in place
+    if category != "unary" && category != "arith" && category != "convert" {
         return false;
     }
-    // Must not have explicit FPU push/pop (those are stack-changing)
-    if fpu_pops != 0 || fpu_push != 0 {
+    // In place: consumes ST0 and produces one value where it was
+    if fpu_pops != 1 || fpu_push != 1 {
         return false;
     }
     // Must operate on an FPU data type
     let dt = extract_data_type_suffix(mnemonic);
     matches!(dt, Some("R4" | "R8" | "FPR4" | "FPR8" | "Date"))
+}
+
+/// The VB type an instruction's handler and the compiler fix, as a
+/// `Some(PCodeDataType::X)` / `None` expression: an operation's operand type
+/// (arithmetic, unary, comparison), a conversion's target type, an x87 move's
+/// float type, a string or Variant literal's type; `None` for a move whose
+/// suffix names only a width.
+fn classify_value_type(mnemonic: &str, category: &str) -> String {
+    match category {
+        "arith" | "unary" | "compare" => classify_data_type(mnemonic),
+        "convert" => classify_convert_types(mnemonic).1,
+        "load_lit" if mnemonic == "LitStr" => "Some(PCodeDataType::Str)".to_string(),
+        "load_lit" if mnemonic.starts_with("LitVar") => "Some(PCodeDataType::Var)".to_string(),
+        _ if mnemonic.contains("FPR4") || mnemonic.contains("FPR8") => classify_data_type(mnemonic),
+        _ => "None".to_string(),
+    }
 }
 
 fn classify_data_type(mnemonic: &str) -> String {
@@ -898,6 +969,68 @@ fn extract_data_type_suffix(mnemonic: &str) -> Option<&'static str> {
 
 /// Classifies an opcode into an `OpcodeSemantics` variant.
 /// Returns a Rust expression string for code generation.
+/// Parses the `object` column into a `Receiver` initializer and whether the
+/// opcode writes Pr.
+fn classify_object(object: &str, table: usize, opcode: u8) -> (String, String) {
+    let mut receiver = "Receiver::None";
+    let mut pr_load = "None".to_string();
+    for token in object.split_whitespace() {
+        match token {
+            "pr" => receiver = "Receiver::Pr",
+            "me" => receiver = "Receiver::Me",
+            "tos" => receiver = "Receiver::Popped",
+            _ => {
+                let source = token.strip_prefix(">pr:").unwrap_or_else(|| {
+                    panic!("unknown object token {token:?} at {table},{opcode:#04x}")
+                });
+                let variant = match source {
+                    "frame" => "Frame",
+                    "me" => "Me",
+                    "pool" => "Pool",
+                    "indirect" => "FrameIndirect",
+                    "member" => "PrMember",
+                    "frame_member" => "FrameMember",
+                    "array" => "ArrayElement",
+                    "variant" => "Variant",
+                    "new" => "NewIfNull",
+                    "with" => "WithMember",
+                    "late" => "LateGet",
+                    _ => panic!("unknown Pr source {source:?} at {table},{opcode:#04x}"),
+                };
+                pr_load = format!("Some(PrLoad::{variant})");
+            }
+        }
+    }
+    (receiver.to_string(), pr_load)
+}
+
+/// Parses the `stack` column into a `StackRule` initializer.
+fn classify_stack_rule(rule: &str, table: usize, opcode: u8) -> String {
+    if rule.is_empty() {
+        return "StackRule::Fixed".to_string();
+    }
+    if rule == "callee" {
+        return "StackRule::Callee".to_string();
+    }
+    let (name, arg) = rule
+        .strip_suffix(')')
+        .and_then(|r| r.split_once('('))
+        .unwrap_or_else(|| panic!("bad stack rule {rule:?} at {table},{opcode:#04x}"));
+    let operand: u8 = arg
+        .parse()
+        .unwrap_or_else(|_| panic!("bad stack rule operand {rule:?} at {table},{opcode:#04x}"));
+    let variant = match name {
+        "arg_bytes" => "ArgBytes",
+        "variants" => "Variants",
+        "count" => "Count",
+        "pairs" => "Pairs",
+        "pairs1" => "PairsAtLeastOne",
+        "bytes" => "Bytes",
+        _ => panic!("unknown stack rule {rule:?} at {table},{opcode:#04x}"),
+    };
+    format!("StackRule::{variant} {{ operand: {operand} }}")
+}
+
 fn classify_semantics(mnemonic: &str, category: &str) -> String {
     match category {
         "load_frame" => "OpcodeSemantics::Load { source: LoadSource::Frame }".to_string(),
@@ -920,15 +1053,14 @@ fn classify_semantics(mnemonic: &str, category: &str) -> String {
             let (from, to) = classify_convert_types(mnemonic);
             format!("OpcodeSemantics::Convert {{ from: {from}, to: {to} }}")
         }
-        "branch" => {
-            let conditional = mnemonic.contains("BranchF")
-                || mnemonic.contains("BranchT")
-                || mnemonic.starts_with("Next")
-                || mnemonic.starts_with("For")
-                || mnemonic.starts_with("ExitFor")
-                || mnemonic.starts_with("On");
-            format!("OpcodeSemantics::Branch {{ conditional: {conditional} }}")
-        }
+        "branch" => "OpcodeSemantics::Branch { conditional: false }".to_string(),
+        "branch_cond" => "OpcodeSemantics::Branch { conditional: true }".to_string(),
+        "gosub" => "OpcodeSemantics::GoSub".to_string(),
+        "return_gosub" => "OpcodeSemantics::GoSubReturn".to_string(),
+        "resume" => "OpcodeSemantics::Resume".to_string(),
+        "on_error" => "OpcodeSemantics::OnError".to_string(),
+        "raise" => "OpcodeSemantics::Raise".to_string(),
+        "end" => "OpcodeSemantics::End".to_string(),
         "call" => {
             let kind = if mnemonic.starts_with("ThisVCall") {
                 "ThisVCall"
@@ -936,8 +1068,10 @@ fn classify_semantics(mnemonic: &str, category: &str) -> String {
                 "VCall"
             } else if mnemonic.starts_with("ImpAdCall") {
                 "ImpAdCall"
-            } else if mnemonic.starts_with("Late") {
+            } else if mnemonic.starts_with("Late") || mnemonic.starts_with("VarLate") {
                 "LateCall"
+            } else if mnemonic == "RaiseEvent" {
+                "Event"
             } else {
                 "Other"
             };
@@ -1079,6 +1213,7 @@ fn map_calling_conv(s: &str) -> &'static str {
         "stdcall" => "CallingConv::Stdcall",
         "cdecl" => "CallingConv::Cdecl",
         "special" => "CallingConv::Special",
+        "unknown" => "CallingConv::Unknown",
         other => panic!("unknown calling convention: {other}"),
     }
 }
@@ -1112,6 +1247,7 @@ fn map_param_type(s: &str) -> &'static str {
         "Int16Ptr" => "VbParamType::Int16Ptr",
         "UInt8Ptr" => "VbParamType::UInt8Ptr",
         "Int64Ptr" => "VbParamType::Int64Ptr",
+        "unknown" => "VbParamType::Unknown",
         other => panic!("unknown param type: {other}"),
     }
 }

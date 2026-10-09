@@ -2,8 +2,9 @@
 //!
 //! VB6 controls fire events (Click, DblClick, KeyPress, etc.) through COM
 //! connection point interfaces. Each control has an [`EventSinkVtable`] that
-//! maps event slots to handler methods. The handler VAs point to either
-//! P-Code [`EventHandlerThunk`]s or native [`NativeEventThunk`]s.
+//! maps event slots to handler methods. The handler VAs point to P-Code
+//! [`EventHandlerThunk`]s (every fixture) or, by the crate's reading of
+//! natively compiled controls, [`NativeEventThunk`]s (no fixture has one).
 
 use std::fmt;
 
@@ -11,32 +12,40 @@ use crate::{addressmap::AddressMap, error::Error, util::read_u32_le};
 
 /// Parsed P-Code event handler thunk (20-byte dual-entry method stub).
 ///
-/// VB6 methods use a compact 0x14-byte stub with **two entry points**:
+/// A method that handles an event has a 0x14-byte stub with **two entry
+/// points**:
 ///
 /// ```text
-/// +0x00  B8 XX XX XX XX   mov eax, event_dispatch_id  <- event sink entry
-/// +0x05  66 3D            cmp ax, imm16 (overlaps +0x07)
-/// +0x07  33 C0            xor eax, eax                <- method table entry
+/// +0x00  B8 XX XX XX XX   mov eax, this_adjust         <- event sink slot
+/// +0x05  66 3D            cmp ax, imm16 (its imm16 is the next 2 bytes)
+/// +0x07  33 C0            xor eax, eax                 <- method link entry
 /// +0x09  BA XX XX XX XX   mov edx, ProcDscInfo_VA
-/// +0x0E  68 XX XX XX XX   push return_handler_va
-/// +0x13  C3               ret                         -> tail-call ProcCallEngine
+/// +0x0E  68 XX XX XX XX   push engine_thunk_va         ; jmp [MethCallEngine]
+/// +0x13  C3               ret
 /// ```
 ///
-/// The event sink vtable points to +0x00, where `eax` is loaded with the
-/// event dispatch ID before falling through to the P-Code engine. The method
-/// dispatch table points to +0x07, where `eax` is cleared (direct call, no
-/// event). The `66 3D` at +0x05 is a `cmp ax, imm16` that harmlessly overlaps
-/// with the `xor eax, eax` bytes - a VB6 compiler space optimization.
+/// The control's [`EventSinkVtable`] slot points to +0x00 and the object's
+/// method link table entry (see [`MethodLink`](crate::project::MethodLink))
+/// to +0x07. Both reach `MethCallEngine` (MSVBVM60 6.00.8176
+/// `0x661080B8`), which starts with `sub [esp+4], eax`: `eax` is subtracted
+/// from the `this` pointer the caller passed. Through the method link entry
+/// it is 0; through the event sink it is the sink's offset in the object
+/// instance, the control's
+/// [`ControlInfo::dispatch_offset`](crate::vb::control::ControlInfo::dispatch_offset)
+/// (`tests/fixtures/controls`: 0x3C for `Command1_Click`, 0x38 for
+/// `Form_Load`), which turns the sink pointer back into the object. The
+/// `cmp ax, imm16` only skips the `xor` on the event path.
 #[derive(Clone, Copy, Debug)]
 pub struct EventHandlerThunk {
-    /// Event dispatch ID passed in eax (from `mov eax, imm32` at +0x00).
-    /// Zero when the stub has no event prefix.
-    pub event_dispatch_id: u32,
+    /// The value the event entry loads into `eax` (`mov eax, imm32` at
+    /// +0x00) and `MethCallEngine` subtracts from `this`.
+    pub this_adjust: u32,
     /// VA of the ProcDscInfo (RTMI) structure (from `mov edx, imm32` at +0x09).
     pub proc_dsc_info_va: u32,
-    /// VA of the return handler (from `push imm32` at +0x0E).
-    pub return_handler_va: u32,
-    /// VA of the method table entry point (+0x07 from the event entry).
+    /// VA the stub pushes and returns to (`push imm32` at +0x0E): the
+    /// `jmp [MethCallEngine]` import thunk.
+    pub engine_thunk_va: u32,
+    /// VA of the method link entry point (+0x07 from the event entry).
     pub method_entry_va: u32,
 }
 
@@ -56,7 +65,7 @@ impl EventHandlerThunk {
         if bytes[0] != 0xB8 {
             return None;
         }
-        let event_dispatch_id = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+        let this_adjust = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
         if bytes[5] != 0x66 || bytes[6] != 0x3D {
             return None;
         }
@@ -70,19 +79,19 @@ impl EventHandlerThunk {
         if bytes[14] != 0x68 {
             return None;
         }
-        let return_handler_va = u32::from_le_bytes([bytes[15], bytes[16], bytes[17], bytes[18]]);
+        let engine_thunk_va = u32::from_le_bytes([bytes[15], bytes[16], bytes[17], bytes[18]]);
         if bytes[19] != 0xC3 {
             return None;
         }
         Some(Self {
-            event_dispatch_id,
+            this_adjust,
             proc_dsc_info_va,
-            return_handler_va,
+            engine_thunk_va,
             method_entry_va: event_entry_va.wrapping_add(Self::METHOD_ENTRY_OFFSET as u32),
         })
     }
 
-    /// Parses from the method table entry point (`xor eax, eax` at +0x07).
+    /// Parses from the method link entry point (`xor eax, eax` at +0x07).
     ///
     /// Reads 7 bytes backwards to find the event prefix. Returns `None` if
     /// the bytes before the method entry don't match the event thunk pattern
@@ -102,15 +111,16 @@ impl fmt::Display for EventHandlerThunk {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "event_id={} rtmi=0x{:08X} method=0x{:08X}",
-            self.event_dispatch_id, self.proc_dsc_info_va, self.method_entry_va
+            "this_adjust=0x{:X} rtmi=0x{:08X} method=0x{:08X}",
+            self.this_adjust, self.proc_dsc_info_va, self.method_entry_va
         )
     }
 }
 
 /// Parsed native event handler thunk (13-byte `this`-adjusting JMP stub).
 ///
-/// Native-compiled VB6 controls use a different thunk pattern:
+/// The crate reads natively compiled event handlers as this pattern; no
+/// fixture has one, so it is unverified:
 ///
 /// ```text
 /// +0x00  81 6C 24 04 XX XX XX XX   sub dword [esp+4], this_adjust
@@ -198,8 +208,9 @@ impl fmt::Display for IUnknownThunk {
 /// View over a control's event sink vtable.
 ///
 /// This is a COM connection point interface that receives events from the
-/// control (Click, DblClick, KeyPress, etc.). The runtime populates the
-/// event handler VAs when connecting methods like `Private Sub Command1_Click()`.
+/// control (Click, DblClick, KeyPress, etc.). The compiler fills in a slot
+/// for each event the object handles (`Private Sub Command1_Click()`); the
+/// other slots are 0.
 ///
 /// # Layout (variable-length: 0x18 + event_handler_slots * 4)
 ///
@@ -216,8 +227,10 @@ impl fmt::Display for IUnknownThunk {
 /// The IUnknown thunks at +0x0C-0x14 are 6-byte `FF 25 imm32` indirect jumps
 /// through the Import Address Table to MSVBVM60.DLL. All controls in the same
 /// object share the same three thunk VAs. Use [`resolve_iunknown_thunk`](Self::resolve_iunknown_thunk)
-/// to parse the thunk code. Event handler slots at +0x18+ are zero on disk and
-/// populated at runtime.
+/// to parse the thunk code. Event handler slots at +0x18+ hold the handled
+/// events' [`EventHandlerThunk`] VAs on disk (`tests/fixtures/controls`:
+/// `Command1`'s sink 0x004018CC has slot 0, `Click`, = 0x00401928) and 0
+/// for the others.
 #[derive(Clone, Copy, Debug)]
 pub struct EventSinkVtable<'a> {
     bytes: &'a [u8],
@@ -283,7 +296,7 @@ impl<'a> EventSinkVtable<'a> {
 
     /// Returns the VA of the event handler at the given slot index.
     ///
-    /// Returns 0 if the event has no handler connected (typical on disk).
+    /// Returns 0 if the object does not handle the event.
     /// Returns `None` if `slot >= handler_count`.
     pub fn handler_va(&self, slot: u16) -> Option<u32> {
         if slot >= self.handler_count {
@@ -296,7 +309,7 @@ impl<'a> EventSinkVtable<'a> {
     /// Resolves an event handler VA into a parsed [`EventHandlerThunk`].
     ///
     /// Reads the 20-byte dual-entry stub at the handler VA and extracts
-    /// the event dispatch ID, ProcDscInfo VA, and method entry point.
+    /// the `this` adjustment, ProcDscInfo VA, and method entry point.
     /// Returns `None` if the slot is empty or the bytes don't match.
     pub fn resolve_handler_thunk(
         &self,

@@ -9,40 +9,31 @@
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x00 | 4 | Reserved (always 0 in compiled binaries) |
+//! | 0x00 | 4 | Reserved (0 in every fixture) |
 //! | 0x04 | 4 | `lpObjectInfo` - back-pointer to parent ObjectInfo |
-//! | 0x08 | 4 | Reserved (always 0xFFFFFFFF) |
-//! | 0x0C | 4 | Reserved (always 0 in compiled binaries) |
-//! | 0x10 | 2 | `wFuncCount` - number of public functions/methods |
-//! | 0x12 | 2 | `wFuncCount2` - secondary count (non-zero in ActiveX OCXs) |
-//! | 0x14 | 2 | `wVarCount` - number of public variables |
-//! | 0x16 | 2 | Padding (always 0) |
-//! | 0x18 | 4 | `lpFuncTypDescs` - VA to array of FuncTypDesc pointers |
-//! | 0x1C | 4 | `lpExtendedFuncData` - secondary FuncTypDesc metadata array (always 0 in compiled; IDE/debug only) |
-//! | 0x20 | 4 | `lpMethodNameTable` - secondary method name table (FuncTypDesc pointer array indexed by func index) |
-//! | 0x24 | 4 | `lpParamNames` - parameter name string table |
-//! | 0x28 | 4 | `lpVarStubs` - runtime stub reference table |
-//! | 0x2C | 12 | Reserved (always 0 in compiled binaries) |
-//! | 0x38 | 4 | `dwDescSize` - total size of function type descriptors area |
-//! | 0x3C | 4 | `dwFlags` - bit 2=valid, bit 8=class module |
+//! | 0x08 | 4 | Reserved (0xFFFFFFFF in every fixture) |
+//! | 0x0C | 4 | Reserved (0 in every fixture) |
+//! | 0x10 | 2 | Module-level variables, plus 1 per `Implements` (see [`member_count`](PrivateObjectDescriptor::member_count)) |
+//! | 0x12 | 2 | `Event` declarations (see [`event_count`](PrivateObjectDescriptor::event_count)) |
+//! | 0x14 | 2 | Count of [`var_stubs_va`](PrivateObjectDescriptor::var_stubs_va) entries (0 in every fixture; see [`var_stub_count`](PrivateObjectDescriptor::var_stub_count)) |
+//! | 0x16 | 2 | Padding (0 in every fixture) |
+//! | 0x18 | 4 | `lpFuncTypDescs` - VA to array of FuncTypDesc pointers, one per method (null for the unnamed ones) |
+//! | 0x1C | 4 | `lpExtendedFuncData` - secondary per-method array (0 in every fixture) |
+//! | 0x20 | 4 | `lpMethodNameTable` - secondary method table |
+//! | 0x24 | 4 | `lpParamNames` - parameter name table |
+//! | 0x28 | 4 | `lpVarStubs` - variable stub table |
+//! | 0x2C | 12 | Reserved (0 in every fixture) |
+//! | 0x38 | 4 | Instance size (equal to the PublicBytes `+0x02`; see [`instance_size`](PrivateObjectDescriptor::instance_size)) |
+//! | 0x3C | 4 | `dwFlags` - 0x0104 for classes and UserControls, 0x0004 for forms |
 //!
-//! # Unknown Field Verification (2026-03-29)
+//! Standard modules have no PrivateObjectDescriptor
+//! (`ObjectInfo.private_object_va` is 0xFFFFFFFF in every fixture module).
 //!
-//! Fields +0x00, +0x0C, +0x16, +0x1C, +0x2C-0x37 verified as zero across
-//! 30 EXE samples + ComCt332.ocx (46 objects total). Runtime code in
-//! `sub_660f6349` reads +0x1C as a pointer array, but the code path requires
-//! BOTH `(fObjectType & 0x02) == 0` (module-type) AND a valid PrivateObjectDescriptor.
-//! These are mutually exclusive in compiled binaries: modules lack
-//! PrivateObjectDescriptors (`private_object_va == 0xFFFFFFFF`), so the
-//! path is unreachable. Field is likely populated in IDE/debug mode only.
-//!
-//! # Discovery
-//!
-//! Layout reverse-engineered from multiple VB6 binaries. The u16 split at
-//! +0x10/+0x12 was discovered via ComCt332.ocx (Microsoft Common Controls 3)
-//! where `wFuncCount2` is non-zero for objects like CoolBar (13),
-//! EmbossedPicture (2), and BandPropertyNotify (1). EXE samples always
-//! have `wFuncCount2 == 0`, which masked the u32 vs u16 distinction.
+//! MSVBVM60 6.00.9848 reads the +0x18 array at `0x660F63ED` (with the
+//! method names of the PublicObjectDescriptor). Its function at
+//! `0x660F6349` indexes both the +0x18 and the +0x1C array and
+//! dereferences the +0x1C one unconditionally (`0x660F6390`), so it never
+//! runs on a descriptor like the fixtures', whose +0x1C is 0.
 
 use crate::{
     error::Error,
@@ -98,42 +89,66 @@ impl<'a> PrivateObjectDescriptor<'a> {
         read_u32_le(self.bytes, 0x04)
     }
 
-    /// Number of public functions/methods at offset 0x10 (u16).
+    /// The u16 count at offset 0x10: module-level variables plus
+    /// implemented interfaces.
+    ///
+    /// The number of module-level variable declarations (`Private`,
+    /// `Public`, `WithEvents`; not `Static` locals, not controls), plus 1
+    /// per `Implements`. It holds for the 16 objects checked against their
+    /// source in `tests/fixtures`: `calls` Counter 3 (`m_Value`, `m_Scale`,
+    /// `m_Owner`), Square 2 (`m_Side`, `Implements Shape`), Shape 0;
+    /// `events` Listener 2 (`WithEvents m_Source`, `m_Log`); `data` Item 1
+    /// (`Public Name`). It is not a method count: the FuncTypDesc array has
+    /// one entry per method of the object's method table.
     #[inline]
-    pub fn func_count(&self) -> Result<u16, Error> {
+    pub fn member_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x10)
     }
 
-    /// Secondary function count at offset 0x12 (u16).
+    /// Number of `Event` declarations, the u16 at offset 0x12.
     ///
-    /// Non-zero in ActiveX DLLs/OCXs (e.g., CoolBar=13, EmbossedPicture=2).
-    /// **Not read by any code in MSVBVM60.DLL** - exhaustive search confirmed
-    /// the runtime ignores this field. Likely vestigial or IDE-only metadata.
+    /// `calls` Counter 1,
+    /// `events` Source 3 (`Started`, `Ticked`, `Named`), `types` Kinds 1,
+    /// `forms` Gauge 1, 0 for every other fixture object.
     #[inline]
-    pub fn func_count2(&self) -> Result<u16, Error> {
+    pub fn event_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x12)
     }
 
-    /// Number of public variables at offset 0x14 (u16).
+    /// The u16 count at offset 0x14, read as the length of the
+    /// [`var_stubs_va`](Self::var_stubs_va) array.
+    ///
+    /// Not the number of public variables: `tests/fixtures/data` `Item`
+    /// declares `Public Name As String` and has 0 here. 0 in every fixture,
+    /// so what it counts is unconfirmed.
     #[inline]
-    pub fn var_count(&self) -> Result<u16, Error> {
+    pub fn var_stub_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x14)
     }
 
     /// VA of the [`FuncTypDesc`](super::functype::FuncTypDesc) pointer array at offset 0x18.
     ///
-    /// Points to an array of VAs, one per function. Each VA points to a
-    /// [`FuncTypDesc`](super::functype::FuncTypDesc) structure (use
-    /// [`FuncTypDesc::parse_extended`](super::functype::FuncTypDesc::parse_extended)
-    /// for full arg type access). Null entries (VA == 0) indicate functions
-    /// without public prototypes (e.g., event handlers).
-    /// Array length = [`func_count`](Self::func_count) + [`var_count`](Self::var_count).
+    /// Points to an array of VAs, one per method of the object's method
+    /// table. Each VA points to a
+    /// [`FuncTypDesc`](super::functype::FuncTypDesc) structure; pass
+    /// [`FuncTypDesc::parse`](super::functype::FuncTypDesc::parse) the bytes
+    /// to the end of the section for its type list. Null entries (VA == 0)
+    /// are the methods with no name in
+    /// [`PublicObjectDescriptor::method_names_va`](super::object::PublicObjectDescriptor::method_names_va):
+    /// `Private` and `Friend` procedures, `Class_Initialize`/`Terminate`
+    /// and a form's control event handlers. A class's `WithEvents`
+    /// handlers have one (`events` `Listener.m_Source_Started`).
     #[inline]
     pub fn func_type_descs_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x18)
     }
 
-    /// VA of the secondary method name table at offset 0x20.
+    /// VA of the secondary method table at offset 0x20.
+    ///
+    /// Its layout is unconfirmed. When the object has nothing to put in
+    /// it, it shares its VA with [`param_names_va`](Self::param_names_va)
+    /// and [`var_stubs_va`](Self::var_stubs_va) (`calls` Shape: all three
+    /// 0x00401C58).
     #[inline]
     pub fn method_name_table_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x20)
@@ -141,9 +156,12 @@ impl<'a> PrivateObjectDescriptor<'a> {
 
     /// VA of the parameter name string table at offset 0x24.
     ///
-    /// Points to an array of VAs to null-terminated parameter name strings.
-    /// These are shared across all functions in the object (e.g., `"Data"`,
-    /// `"PassWord"`, `"ZipName"`).
+    /// Points to an array of VAs, among them VAs of null-terminated
+    /// parameter name strings shared across the object's functions
+    /// (`calls` Counter: `"Value"`, `"o"`, `"a"`, `"values"`, `"which"`,
+    /// `"factor"`), but also VAs of other structures (its first entry,
+    /// 0x00401E54, is not a string) and zeros. The exact layout is
+    /// unconfirmed.
     #[inline]
     pub fn param_names_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x24)
@@ -151,46 +169,45 @@ impl<'a> PrivateObjectDescriptor<'a> {
 
     /// VA of variable implementation stub array at offset 0x28.
     ///
-    /// Points to an array of `wVarCount` VA pointers, each to a
-    /// [`VarStubDesc`](super::varstub::VarStubDesc) structure describing
-    /// which VBA runtime functions implement the property accessors for a
-    /// public variable. Use [`VarStubIter`](super::varstub::VarStubIter) to iterate.
-    ///
-    /// **Not read by MSVBVM60.DLL at runtime** - compiler/IDE metadata only.
-    /// Still useful for analysis: reveals runtime function dependencies and
-    /// method names for each public variable.
+    /// Points to an array of [`var_stub_count`](Self::var_stub_count) VA pointers,
+    /// each to a [`VarStubDesc`](super::varstub::VarStubDesc) structure.
+    /// Use [`VarStubIter`](super::varstub::VarStubIter) to iterate. Every
+    /// fixture object has a `var_stub_count` of 0, so the format is unconfirmed
+    /// by `tests/fixtures`.
     #[inline]
     pub fn var_stubs_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x28)
     }
 
-    /// Total size of the function type descriptors area at offset 0x38.
+    /// Size of an instance of the object, at offset 0x38.
+    ///
+    /// Equal to [`ClassFormPublicBytes::instance_size`](super::publicbytes::ClassFormPublicBytes::instance_size)
+    /// (PublicBytes `+0x02`) for all 51 objects with a descriptor in
+    /// `tests/fixtures` (`calls` Shape 0x40, Counter 0x58; `dispid` Bag
+    /// 0x88, Dial 0x94). It is not the size of the FuncTypDesc area.
     #[inline]
-    pub fn desc_size(&self) -> Result<u32, Error> {
+    pub fn instance_size(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x38)
     }
 
     /// Object flags at offset 0x3C.
     ///
-    /// Bit field with the following known flags:
-    /// - Bit 2 (`0x0004`): Always set - indicates a valid PrivateObjectDescriptor.
-    /// - Bit 8 (`0x0100`): Class module flag - set for `.cls` files.
+    /// Values in `tests/fixtures`:
+    /// - `0x0004`: forms (`controls` Form1, `dispid` Host, `forms` Board).
+    /// - `0x0104`: classes and UserControls (`dispid` Dial, `forms` Gauge).
     ///
-    /// Observed values across 709 objects in 104 samples:
-    /// - `0x0004` (557 objects): Forms, standard modules, UserControls, UserDocuments.
-    /// - `0x0104` (157 objects): Class modules (`.cls` files).
-    ///
-    /// No other values have been observed.
+    /// Bit `0x0004` is set on every descriptor; bit `0x0100` on the objects
+    /// whose `fObjectType` low byte is `0x03`.
     #[inline]
     pub fn flags(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x3C)
     }
 
-    /// Returns `true` if this object is a class module (`.cls` file).
+    /// Returns `true` if bit `0x0100` of the flags at +0x3C is set.
     ///
-    /// Checks bit 8 (`0x0100`) of the flags at +0x3C. This is distinct
-    /// from [`PublicObjectDescriptor::is_class()`](super::object::PublicObjectDescriptor::is_class)
-    /// which checks bit 4 of `fObjectType`.
+    /// Set for class modules and UserControls alike, the same objects
+    /// [`PublicObjectDescriptor::is_class()`](super::object::PublicObjectDescriptor::is_class)
+    /// accepts (bit `0x02` set, bit `0x80` clear in `fObjectType`).
     #[inline]
     pub fn is_class(&self) -> bool {
         self.flags().is_ok_and(|f| f & 0x0100 != 0)
@@ -223,12 +240,12 @@ mod tests {
     fn test_parse_cls_zip() {
         let pod = PrivateObjectDescriptor::parse(&CLS_ZIP).unwrap();
         assert_eq!(pod.object_info_va().unwrap(), 0x0040281C);
-        assert_eq!(pod.func_count().unwrap(), 14);
-        assert_eq!(pod.var_count().unwrap(), 5);
+        assert_eq!(pod.member_count().unwrap(), 14);
+        assert_eq!(pod.var_stub_count().unwrap(), 5);
         assert_eq!(pod.func_type_descs_va().unwrap(), 0x00405CA8);
         assert_eq!(pod.param_names_va().unwrap(), 0x00405544);
         assert_eq!(pod.var_stubs_va().unwrap(), 0x00405644);
-        assert_eq!(pod.desc_size().unwrap(), 0x4C);
+        assert_eq!(pod.instance_size().unwrap(), 0x4C);
         assert_eq!(pod.flags().unwrap(), 0x0104);
         assert!(pod.is_class());
     }
@@ -237,15 +254,15 @@ mod tests {
     fn test_parse_form1() {
         let pod = PrivateObjectDescriptor::parse(&FORM1).unwrap();
         assert_eq!(pod.object_info_va().unwrap(), 0x0040243C);
-        assert_eq!(pod.func_count().unwrap(), 0);
-        assert_eq!(pod.var_count().unwrap(), 0);
+        assert_eq!(pod.member_count().unwrap(), 0);
+        assert_eq!(pod.var_stub_count().unwrap(), 0);
         assert_eq!(pod.func_type_descs_va().unwrap(), 0x0040558C);
-        assert_eq!(pod.desc_size().unwrap(), 0x44);
+        assert_eq!(pod.instance_size().unwrap(), 0x44);
         assert_eq!(pod.flags().unwrap(), 0x0004);
         assert!(!pod.is_class());
     }
 
-    // Real data from CoolBar in ComCt332.ocx - func_count2 is non-zero (13)
+    // Real data from CoolBar in ComCt332.ocx - event_count is non-zero (13)
     const COOLBAR_OCX: [u8; 0x40] = [
         0x00, 0x00, 0x00, 0x00, 0x84, 0x71, 0x08, 0x28, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00,
         0x00, 0x1E, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x25, 0x09, 0x28, 0x00, 0x00,
@@ -257,9 +274,9 @@ mod tests {
     #[test]
     fn test_parse_coolbar_ocx() {
         let pod = PrivateObjectDescriptor::parse(&COOLBAR_OCX).unwrap();
-        assert_eq!(pod.func_count().unwrap(), 30);
-        assert_eq!(pod.func_count2().unwrap(), 13);
-        assert_eq!(pod.var_count().unwrap(), 0);
+        assert_eq!(pod.member_count().unwrap(), 30);
+        assert_eq!(pod.event_count().unwrap(), 13);
+        assert_eq!(pod.var_stub_count().unwrap(), 0);
         assert_eq!(pod.flags().unwrap(), 0x0104);
         assert!(pod.is_class());
     }

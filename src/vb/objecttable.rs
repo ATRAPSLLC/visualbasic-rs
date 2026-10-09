@@ -13,8 +13,9 @@ use crate::{
 
 /// View over an ObjectTable structure (0x54 bytes).
 ///
-/// Runtime confirmation: `ProcCallEngine_Body` in MSVBVM60.DLL reads
-/// `lpProjectObject` (+0x14) via `ObjectInfo.lpObjectTable` (+0x04).
+/// Runtime confirmation: `ProcCallEngine` (MSVBVM60 6.00.8176,
+/// `0x66104AE2`) reads `lpProjectObject` (+0x14) via
+/// `ObjectInfo.lpObjectTable` (+0x04).
 ///
 /// # Layout
 ///
@@ -29,7 +30,7 @@ use crate::{
 /// | 0x18 | 16 | `uuidObject` (project GUID) |
 /// | 0x28 | 2 | `fCompileState` (always 0x000A in compiled) |
 /// | 0x2A | 2 | `wTotalObjects` |
-/// | 0x2C | 2 | `wCompiledObjects` |
+/// | 0x2C | 2 | `wCompiledObjects` (not always the object count) |
 /// | 0x2E | 2 | `wObjectsInUse` |
 /// | 0x30 | 4 | `lpObjectArray` (VA of descriptor array) |
 /// | 0x34 | 4 | IDE flag (0 in compiled) |
@@ -85,15 +86,13 @@ impl<'a> ObjectTable<'a> {
 
     /// COM exec project object VA at offset 0x04.
     ///
-    /// Points to compiler-allocated .data section space (zeroed on disk,
-    /// populated at runtime by MSVBVM60). Always exactly 0x10 bytes after
-    /// [`project_object_va`](Self::project_object_va) - they are two
-    /// entry points into the same COM object.
+    /// Points to compiler-allocated .data section space (zero on disk,
+    /// populated at runtime by MSVBVM60). Always exactly 0x10 bytes
+    /// after [`project_object_va`](Self::project_object_va) (all 14
+    /// fixtures).
     ///
-    /// At runtime, the first DWORD at this address contains the VBHeader
-    /// VA (confirmed by `sub_6602BD7D` which matches `[node+0x10]` against
-    /// VBHeader). Useful for memory forensics to cross-reference the
-    /// structure chain from a process dump.
+    /// What the runtime stores here is not verified against these
+    /// binaries.
     ///
     /// # Errors
     ///
@@ -130,27 +129,13 @@ impl<'a> ObjectTable<'a> {
 
     /// Runtime project object VA at offset 0x14.
     ///
-    /// Points to compiler-allocated .data section space (zeroed on disk).
-    /// This is the base of a COM object; [`exec_proj_va`](Self::exec_proj_va)
-    /// points 0x10 bytes into the same object.
+    /// Points to compiler-allocated .data section space (zero on disk);
+    /// [`exec_proj_va`](Self::exec_proj_va) is 0x10 bytes past it.
     ///
-    /// Runtime layout of the project node at this address (0x110 bytes,
-    /// heap-allocated by `CreateProjectObject` in MSVBVM60):
-    ///
-    /// | Offset | Field |
-    /// |--------|-------|
-    /// | +0x00 | vtable (internal linked list interface, NOT IUnknown) |
-    /// | +0x04 | secondary data pointer |
-    /// | +0x08 | next project node (linked list) |
-    /// | +0x0C | prev project node (linked list) |
-    /// | +0x10 | VBHeader VA (= `lpExecProj` points here) |
-    /// | +0x14 | runtime state pointer (read by ProcCallEngine) |
-    /// | +0x1C | thread flags |
-    /// | +0x4C | tertiary vtable |
-    /// | +0x94 | lpSubMain (from VBHeader+0x2C) |
-    ///
-    /// `ProcCallEngine_Body` reads `[lpProjectObject+0x14]` then
-    /// dereferences `[result+0x0C]` from it.
+    /// `ProcCallEngine` (MSVBVM60 6.00.8176, `0x66104AE2` to `0x66104AEB`)
+    /// loads `ObjectInfo.lpObjectTable`, then this field, then the dword at
+    /// `lpProjectObject + 0x0C`, and keeps that dword in its frame at
+    /// `ebp-0x2C`. The rest of the block's runtime layout is not verified.
     ///
     /// # Errors
     ///
@@ -161,6 +146,9 @@ impl<'a> ObjectTable<'a> {
     }
 
     /// Object table GUID at offset 0x18 (16 bytes).
+    ///
+    /// A per-build GUID, distinct from the type library GUID in
+    /// [`ComRegData::project_guid`](super::comreg::ComRegData::project_guid).
     ///
     /// # Errors
     ///
@@ -194,6 +182,11 @@ impl<'a> ObjectTable<'a> {
     }
 
     /// Compiled objects count at offset 0x2C.
+    ///
+    /// Equal to [`total_objects`](Self::total_objects) in most fixtures,
+    /// but 4 in `controls`, which has one object (and 4 in `docs` with 2,
+    /// 12 in `extender` with 11, 4 in `ocx` with 3), so it is not a count of
+    /// this table's entries.
     ///
     /// # Errors
     ///
@@ -258,8 +251,8 @@ impl<'a> ObjectTable<'a> {
 
     /// Secondary locale ID at offset 0x48.
     ///
-    /// May differ from the primary LCID (e.g., `0x0416` for Portuguese
-    /// when the primary is `0x0409` US English).
+    /// Equal to the primary LCID (`0x0409`) in every fixture, while
+    /// [`VbHeader::sec_lcid`](super::header::VbHeader::sec_lcid) is 0 there.
     ///
     /// # Errors
     ///
@@ -269,7 +262,7 @@ impl<'a> ObjectTable<'a> {
         read_u32_le(self.bytes, 0x48)
     }
 
-    /// Format version identifier at offset 0x50 (always `2` in all tested samples).
+    /// Format version identifier at offset 0x50 (`2` in every fixture).
     ///
     /// # Errors
     ///

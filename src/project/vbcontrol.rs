@@ -6,7 +6,7 @@
 //! and event handler table VA.
 //!
 //! [`VbControl`] wraps a raw `ControlInfo` with resolved name, GUID, class
-//! identification, and event handler VAs for convenient access.
+//! identification, and the event handler VAs of its event sink vtable.
 
 use std::borrow::Cow;
 
@@ -34,14 +34,15 @@ pub struct VbControl<'a> {
     /// COM CLSID identifying the control class; `None` if the GUID VA was
     /// null or could not be resolved.
     guid: Option<Guid>,
-    /// Raw byte slice over the event handler VA table (4 bytes per event).
-    /// Empty if the control has no events or the table VA was null.
+    /// Raw byte slice over the event handler slots of the event sink vtable
+    /// (4 bytes per event, after its 0x18-byte header). Empty if the control
+    /// has no events, no sink, or the slots cannot be read.
     event_handler_vas: &'a [u8],
     /// Authoritative control type from form binary data (`cType` byte).
     ///
-    /// When available, this is more reliable than GUID-based identification
-    /// (GUID fuzzy matching fails for malware samples - 8/12 controls
-    /// misidentified in the vb_inject sample).
+    /// When available, this is more reliable than the GUID, which names
+    /// the control's events interface and is unknown for an ActiveX
+    /// control the crate has no table for.
     form_control_type: Option<FormControlType>,
 }
 
@@ -121,20 +122,33 @@ impl<'a> VbControl<'a> {
     /// Returns the control class name (e.g., `"CommandButton"`, `"TextBox"`).
     ///
     /// Resolution order:
-    /// 1. Form binary data `cType` (authoritative, from [`form_control_type`](Self::form_control_type))
-    /// 2. GUID fuzzy matching (fallback, unreliable for malware)
-    /// 3. `None` for unidentifiable controls
+    /// 1. Form binary data `cType` (authoritative, from [`form_control_type`](Self::form_control_type)),
+    ///    unless it is an unknown code
+    /// 2. The ControlInfo GUID: the control's events interface (or, for a
+    ///    control array, that IID + 1), `"Class"` for a class module's own
+    ///    `IClassModuleEvt`
+    /// 3. `None` for a hosted ActiveX control or UserControl instance: its
+    ///    GUID is a build-generated events IID, which
+    ///    [`VbProject::components`](crate::VbProject::components) pairs with
+    ///    the control's class
     pub fn class_name(&self) -> Option<&'static str> {
-        if let Some(fct) = self.form_control_type {
+        if let Some(fct) = self.form_control_type
+            && !matches!(fct, FormControlType::Unknown(_))
+        {
             return Some(fct.name());
         }
         self.guid.as_ref().and_then(|g| g.control_class_name())
     }
 
-    /// Returns the VA of the event handler at `event_index`.
+    /// Returns the VA of the event handler at `event_index`: slot
+    /// `event_index` of the control's [`EventSinkVtable`].
     ///
-    /// A return value of `0` means the event is not handled.
-    /// A non-zero VA points to the handler stub (P-Code or native).
+    /// A return value of `0` means the event is not handled. A non-zero VA
+    /// is the handler's entry stub, filled in on disk
+    /// (`tests/fixtures/controls`: `Command1`'s slot 0 is 0x00401928, the
+    /// 20-byte stub entering `Command1_Click`; see
+    /// [`EventHandlerThunk`](crate::vb::events::EventHandlerThunk)).
+    /// `None` if `event_index` is past the slots.
     pub fn event_handler_va(&self, event_index: u16) -> Option<u32> {
         let offset = (event_index as usize).checked_mul(4)?;
         let end = offset.checked_add(4)?;
@@ -180,7 +194,8 @@ impl<'a> VbControl<'a> {
 ///
 /// Walks the control array starting at `controls_va` from the
 /// [`OptionalObjectInfo`](crate::vb::object::OptionalObjectInfo), resolving
-/// each entry into a [`VbControl`] with name, GUID, and event handler table.
+/// each entry into a [`VbControl`] with name, GUID, and the handler slots of
+/// its event sink vtable.
 ///
 /// When form binary data is available (via [`with_form_data`](Self::with_form_data)),
 /// each control's [`form_control_type`](VbControl::form_control_type) is populated
@@ -200,13 +215,21 @@ pub struct ControlEntryIterator<'a, 'p> {
 }
 
 impl<'a, 'p> ControlEntryIterator<'a, 'p> {
-    /// Creates a new iterator over controls starting at `controls_va`.
+    /// Creates a new iterator over `total` controls starting at
+    /// `controls_va`.
+    ///
+    /// `total` is capped at the number of
+    /// [`ControlInfo`](crate::vb::control::ControlInfo) entries the file
+    /// holds from `controls_va` on, so a corrupt count cannot make the walk
+    /// outlast the data.
     pub fn new(map: &'p AddressMap<'a>, controls_va: u32, total: u32) -> Self {
+        let available =
+            map.slice_from_va(controls_va, 0).map_or(0, <[u8]>::len) / ControlInfo::MIN_SIZE;
         Self {
             map,
             controls_va,
             index: 0,
-            total,
+            total: total.min(u32::try_from(available).unwrap_or(u32::MAX)),
             form_data: None,
         }
     }
@@ -274,7 +297,7 @@ impl<'a, 'p> Iterator for ControlEntryIterator<'a, 'p> {
             None
         };
 
-        let dispid_va = match info.dispid_count_or_zero() {
+        let sink_va = match info.event_sink_vtable_va() {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
@@ -282,9 +305,14 @@ impl<'a, 'p> Iterator for ControlEntryIterator<'a, 'p> {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
-        let event_handler_vas: &[u8] = if dispid_va != 0 && slots > 0 {
-            let size = (slots as usize).saturating_mul(4);
-            self.map.slice_from_va(dispid_va, size).unwrap_or(b"")
+        // The handler slots follow the sink vtable's 0x18-byte header.
+        let event_handler_vas: &[u8] = if sink_va != 0 && slots > 0 {
+            let size = usize::from(slots).saturating_mul(4);
+            sink_va
+                .checked_add(EventSinkVtable::HEADER_SIZE as u32)
+                .and_then(|va| self.map.slice_from_va(va, size).ok())
+                .and_then(|data| data.get(..size))
+                .unwrap_or(b"")
         } else {
             b""
         };

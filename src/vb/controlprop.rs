@@ -265,7 +265,22 @@ impl<'a> ControlPropertyEntry<'a> {
             }
             // Fixed-length string / 10-byte value: 10 bytes.
             4 | 0x0A => 0x0A,
-            // Dynamic array: size comes from the inline SafeArray descriptor.
+            // An array. A dynamic one (flag bit 0) is a SAFEARRAY pointer and
+            // its element description: the runtime's size routine (6.00.8176,
+            // 0x66039a60) reads the u16 at +0x08 and gives 0x20 bytes when it
+            // has bits 0x60, else 14 when its low nibble is 0xA, else 10
+            // (`tests/fixtures/data`'s module array). A fixed one carries an
+            // inline SafeArray descriptor.
+            5 if flags & 0x01 != 0 => {
+                let element = read_u16_le(self.bytes, 0x08).unwrap_or(0);
+                if element & 0x60 != 0 {
+                    0x20
+                } else if element & 0x0F == 0x0A {
+                    14
+                } else {
+                    10
+                }
+            }
             5 => return self.calc_safearray_total_size(),
             // Fixed/locked array: 4 bytes, honoring the 6-byte floor.
             6 => 4usize.max(floor),

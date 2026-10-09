@@ -6,6 +6,139 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-08
+
+P-Code analysis: the opcode table covers every handler of `MSVBVM60.DLL`
+6.00.8176 and 6.00.9848, and new APIs give each instruction's stack effect,
+call target and signature, a stack simulation over a procedure, and the
+interfaces of the objects in its frame. Form data, hosted controls and many
+structure readers were corrected against compiled fixtures.
+
+### Added
+
+- **Stack effects** (`pcode::stackeffect`, `pcode::movement`):
+  `Instruction::{stack_effect, pr_source, movement, procedure_return,
+  value_type, frame_slots, jump_targets}`: what an instruction pops and
+  pushes on the evaluation and x87 stacks, where Pr comes from, what a load
+  or store moves and its side effects, and how an `ExitProc*` returns.
+- **Stack simulation** (`pcode::stacksim`): `ProcedureStack::simulate`
+  gives the stacks at every instruction over the control flow, including
+  `GoSub` depths (`shared_gosub_code`) and paths cut at unknown callees.
+- **Call resolution** (`pcode::calltarget`): `CallResolver`, `CallSignature`
+  and `Callee` name the callee and argument widths of every call opcode:
+  project procedures through vtables built from method link tables (forms
+  and UserControls after their designer interface and control getters),
+  `Declare`s, runtime imports, control getters, variable accessors,
+  `RaiseEvent`, late-bound members and external interfaces.
+- **External interfaces**: `InterfaceCatalog`, `InterfaceMember` (with
+  `returns_interface`) and `CallResolver::with_interfaces` let a host supply
+  type library members; `RuntimeInterfaces` covers the runtime's own
+  (control arrays, `Err`).
+- **Object slot typing**: `SlotInterfaces`, `ProjectSlots` and
+  `CallResolver::{resolve_with_slots, simulate_procedure,
+  simulate_procedure_seeded, infer_project_slots, returned_interface}` infer
+  the interface of the object in each frame slot from casts, typed calls,
+  call results and arguments across procedures, so typed `VCall*` without an
+  IID resolve.
+- **Opcode table**: columns `stack`, `popped`, `object`, `movement` and
+  per-build handler addresses; `OpcodeInfo::{popped, rule_at, fpu_callee,
+  pr_load, stack, receiver, handler, value_type}`, `StackRule`, `Receiver`;
+  `OpcodeSemantics::{GoSub, GoSubReturn, Resume, OnError, Raise, End}`;
+  `CallKind::Event`, `ArgumentOrder`; `Operand::{JumpTable, FrameList}`.
+- **Procedures**: `ProcDscInfo::{zeroed_frame, line_numbers,
+  line_table_offset}`, `PCodeMethod::error_handling`,
+  `FrameResolver::{for_method, declarations}`, `FrameVar::{ReturnValue,
+  HiddenResult}`, `FrameOwner`.
+- **Constant pool and imports**: `ConstantPool::{entry_at, entries, va_at,
+  string_at, name_at, guid_at, api_stub_at}` and `PoolEntry`;
+  `imports::ImportTable` (`VbProject::imports`).
+- **Objects**: `vb::designer::Designer`, `VbObject::{designer, object_kind,
+  static_bytes, instancing}`, `Instancing`,
+  `ObjectTypeFlags::{is_exposed, is_global_namespace}`,
+  `VbProject::com_registration`, `MethodLink::kind`, `MethodEntry::Declare`,
+  `OptionalObjectInfo::basic_class_object_size`, `proc_dsc_va` on
+  `CodeEntry` and `CodeEntrypoint`, `ProjectInfo2Iter`, `ProjectData::path`,
+  `GuiTableEntry::object_index`, `ExternalDeclareInfo::{ordinal,
+  is_by_ordinal, resolve_cache_va}`.
+- **Hosted ActiveX controls**: `ExternalComponentEntry::{clsid,
+  events_iid, default_iid, instance_events_iid, array_events_iid,
+  declared_event_count, license_key, event_dispids, event_conversions,
+  bindable_properties, extender_flags, control_flags}`, `BindableProperty`,
+  `ParamConversion`, `ConversionKind`; extender events are named.
+- **Form data**: `FormDataParser::{form_name, form_type}`,
+  `FormControlRecord::has_submenu`, `Property::index`,
+  `PropertyIter::{position, at_terminator}`, `PropertyValue::{Single,
+  Bounds, Scale}`, `ControlBounds`, `ScaleState`, `UserScale`.
+- `impl FromStr for Guid` and `Error::InvalidGuid`.
+- 34 runtime exports missing from the export table.
+- Compiled test fixtures covering classes, forms, MDI, controls, ActiveX
+  DLL/OCX/EXE projects, hosted ActiveX controls, every intrinsic control
+  property, native builds and opcode coverage, with a Docker/Wine build and
+  test suites for the stack simulation, call resolution and structures.
+
+### Changed
+
+- Opcode table stack effects: a Variant on the evaluation stack is its
+  address (one slot); `Mem*`, `VCall*` and `Late*` take their object from
+  Pr and the Pr loaders push nothing; the x87 result of `ImpAdCallFPR4`,
+  `VCallFPR8` and `ThisVCall*` is the callee's.
+- `FuncTypDesc` reads the entry count, property kind, `ParamArray` flag and
+  type list as the compiler writes them; `ArgType` is a struct.
+- Every P-Code procedure's arguments start at `ebp+0x0C`
+  (`pcode_frame::FIRST_ARG`); `FrameResolver` names `ebp+8` `me` or
+  `module_data`.
+- `ProcOptFlags::{FRIEND, ADJUSTED_ME_AS_PRIMARY}` replace
+  `HAS_ERROR_HANDLER` / `HAS_RESUME_NEXT`.
+- Renamed: `Callee::Api` to `Declare`; `StackEffect::writes_pr` to `pr`;
+  `PrivateObjectDescriptor::{func_count, func_count2, var_count,
+  desc_size}` to `member_count`, `event_count`, `var_stub_count`,
+  `instance_size`; `VbObject::class_form_public_bytes` to `public_bytes`
+  (covers modules); `OptionalObjectInfo::pcode_count_raw` to
+  `inherited_vtable_slots`; `EventHandlerThunk::{event_dispatch_id,
+  return_handler_va}` to `this_adjust`, `engine_thunk_va`;
+  `PropType::LongPair` to `Bounds`.
+- An unknown property index is named `"?"` (with `Property::index`)
+  instead of a leaked string.
+- `examples/dump` annotates calls with their callee and effect.
+
+### Removed
+
+- `ControlPosition` / `PropertyValue::Position` (now `ControlBounds`),
+  `decode_form_type`, `MethodLink::this_adjust`, `OpcodeInfo::{mem_read,
+  mem_write}` (now `movement`), `ClassFormPublicBytes::{default_iid,
+  events_iid}`, `eventname::standard_event_name`.
+- `ExternalComponentEntry::{info_block_size, event_count, event_names}`:
+  the fields are the licence key length and bindable properties.
+- `ConstantPool`'s byte-offset accessors and `ConstPoolEntry`,
+  `ImportResolver` / `CallTarget`, `PublicVarTable` and its iterator,
+  `OptionalObjectInfo::{pcode_count, is_native_sentinel}`,
+  `ExternalDeclareInfo::{api_stub, native_stub_va}`.
+
+### Fixed
+
+- Opcode table rows (arities of `ForVar`, `ForStepVar`, `PutMem8`,
+  `PutMemVar`, `VerifyVarObj`, the `Next*` and `ExitProcCb*` forms;
+  operand kinds of `ParmAry1St`, `WMemSt*`, `LitVarStr`, `CStrVarVal`;
+  several instruction sizes) and runtime export signatures (`Rnd`,
+  `rtcDateAdd`, `rtcVarFromFormatVar`, `rtDecFromVar`, the `VBDll*`
+  exports).
+- Late-bound member names are null-terminated UTF-16, not BSTRs.
+- Form data: the designer's own record is no longer decoded as properties;
+  `ScaleMode` carries its scale and `AutoRedraw` / `FontTransparent` (a
+  PictureBox's misaligned the rest of its record); every menu after the
+  first was lost; control bounds, Singles and signed coordinates decode
+  correctly; an empty OLE container's `OleObjectBlob` has no data; 52
+  property names and the control GUID table follow the runtime.
+- `GuiObjectType` codes, designer vtable bases, control getters of
+  controls without handlers, and the IDs and DISPIDs of hosted controls.
+- `VbObject::{func_type_descs, has_pcode, events, methods, method_name}`,
+  module variable tables, `ControlTypeIter`, `MethodLinkIterator`,
+  `ExternalTableEntry::as_typelib` and the `ComRegObject` type tests.
+- `code_entrypoints` resolves P-Code `Sub Main`; `code_entries` lists each
+  method once.
+- Counts read from the file are capped at what the data can hold, and a
+  packer's `push imm32; ret` entry point is not taken for a VB6 header.
+
 ## [0.3.2] - 2026-09-13
 
 ### Added
@@ -360,7 +493,8 @@ Affects `vbobject.rs`, `pcodemethod.rs`, `methodlink.rs`,
 
 Initial public release.
 
-[Unreleased]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.2.1...v0.3.0

@@ -22,12 +22,12 @@ use crate::{
 /// | 0x08 | 4 | Reserved (always 0) |
 /// | 0x0C | 4 | `lpCodeStart` (.text VA - start of native/P-Code region) |
 /// | 0x10 | 4 | `lpCodeEnd` (.text VA - end of code region) |
-/// | 0x14 | 4 | `dwDataSize` (size of VB object structures in bytes) |
-/// | 0x18 | 4 | `lpThreadSpace` (.data VA - per-object data area base) |
+/// | 0x14 | 4 | `dwDataSize` (bytes of `.data` from `lpThreadSpace` to the section end) |
+/// | 0x18 | 4 | `lpThreadSpace` (.data VA - base of the project's `.data` area) |
 /// | 0x1C | 4 | `lpVbaSeh` (.text VA - `__vbaExceptHandler` import thunk) |
 /// | 0x20 | 4 | `lpNativeCode` (.data VA; **0 = P-Code!**) |
-/// | 0x24 | 528 | `szPathInfo` (null-terminated VBP path; often zeroed in malware) |
-/// | 0x234 | 4 | `lpExternalTable` (.text VA) |
+/// | 0x24 | 528 | `szPathInfo` (UTF-16LE `.vbp` path, 264 code units, e.g. `*\AZ:\work\calls\calls.vbp`) |
+/// | 0x234 | 4 | `lpExternalTable` (.text VA - `Declare` and global-object table) |
 /// | 0x238 | 4 | `dwExternalCount` |
 ///
 /// # Relationships
@@ -35,6 +35,8 @@ use crate::{
 /// - For native binaries: `lpNativeCode` = .data section start,
 ///   `lpThreadSpace` = `lpNativeCode + 8`.
 /// - For P-Code binaries: `lpNativeCode` = 0, `lpThreadSpace` = .data start.
+/// - `lpThreadSpace + dwDataSize` is the end of the `.data` section's
+///   virtual size in every fixture.
 /// - `lpVbaSeh` always points to a `jmp [__vbaExceptHandler]` import thunk.
 #[derive(Clone, Copy, Debug)]
 pub struct ProjectData<'a> {
@@ -104,7 +106,8 @@ impl<'a> ProjectData<'a> {
     /// Start of the native/P-Code region in .text at offset 0x0C.
     ///
     /// For native binaries, this spans the compiled native code.
-    /// For P-Code binaries, this is a tiny stub (e.g., 16 bytes).
+    /// For P-Code binaries, it is a 16-byte region holding `E9 E9 E9 E9`
+    /// followed by twelve `CC` bytes (every P-Code fixture).
     ///
     /// # Errors
     ///
@@ -124,7 +127,12 @@ impl<'a> ProjectData<'a> {
         read_u32_le(self.bytes, 0x10)
     }
 
-    /// Size of VB object structures in bytes at offset 0x14.
+    /// Size in bytes of the `.data` area that starts at
+    /// [`thread_space_va`](Self::thread_space_va), at offset 0x14.
+    ///
+    /// `thread_space_va + data_size` is the end of the `.data` section's
+    /// virtual size in every fixture (P-Code: the whole section; native:
+    /// the section minus its first 8 bytes).
     ///
     /// # Errors
     ///
@@ -134,11 +142,11 @@ impl<'a> ProjectData<'a> {
         read_u32_le(self.bytes, 0x14)
     }
 
-    /// Per-object data area base in .data section at offset 0x18.
+    /// Base of the project's `.data` area at offset 0x18.
     ///
     /// For native binaries: always `lpNativeCode + 8`.
     /// For P-Code binaries: equals the .data section start.
-    /// This is the base from which per-module variable storage is allocated.
+    /// Its size is [`data_size`](Self::data_size).
     ///
     /// # Errors
     ///
@@ -188,7 +196,13 @@ impl<'a> ProjectData<'a> {
         Ok(self.native_code_va()? == 0)
     }
 
-    /// Path and ID string at offset 0x24 (528-byte fixed region).
+    /// Path of the `.vbp` the project was built from, at offset 0x24
+    /// (528-byte fixed region).
+    ///
+    /// The region holds a null-terminated UTF-16LE string (264 code units),
+    /// prefixed `*\A` for an absolute path, e.g. `*\AZ:\work\calls\calls.vbp`.
+    /// The returned slice is the raw region; [`path`](Self::path) decodes
+    /// it (a single-byte C-string read stops after the `*`).
     ///
     /// # Errors
     ///
@@ -198,7 +212,35 @@ impl<'a> ProjectData<'a> {
         read_fixed(self.bytes, 0x24, 528)
     }
 
+    /// Decodes [`path_info`](Self::path_info): the UTF-16LE string up to its
+    /// first NUL code unit, unpaired surrogates replaced by U+FFFD
+    /// (`tests/fixtures/calls`: `*\AZ:\work\calls\calls.vbp`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Truncated`] if the backing buffer is shorter than expected.
+    pub fn path(&self) -> Result<String, Error> {
+        let units: Vec<u16> = self
+            .path_info()?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        Ok(String::from_utf16_lossy(&units))
+    }
+
     /// Virtual address of the external table at offset 0x234.
+    ///
+    /// An array of [`external_count`](Self::external_count) 8-byte entries,
+    /// `(kind: u32, descriptor VA: u32)`. In the fixtures kind 7 is a
+    /// `Declare`d function (the descriptor holds the DLL and function name
+    /// VAs) and kind 6 a reference to a global object (the descriptor holds
+    /// a CLSID VA and a `.data` slot; `VB.Global` in `dispid` and `forms`).
+    /// It is a different table from
+    /// [`VbHeader::external_table_va`](super::header::VbHeader::external_table_va),
+    /// which lists OCX and UserControl components.
     ///
     /// # Errors
     ///
@@ -208,7 +250,7 @@ impl<'a> ProjectData<'a> {
         read_u32_le(self.bytes, 0x234)
     }
 
-    /// External object count at offset 0x238.
+    /// Number of entries in the external table at offset 0x238.
     ///
     /// # Errors
     ///
