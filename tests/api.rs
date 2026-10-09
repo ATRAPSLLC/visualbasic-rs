@@ -1298,9 +1298,9 @@ fn slots_take_the_interface_a_call_returns() {
                             Some(Callee::Interface { members, .. }) if members[0].name == then
                         )
                 });
-                let after_store = Some(&PrSource::Frame { offset: *target });
+                let after_store = PrSource::Frame { offset: *target };
                 found.push((
-                    slots.for_pr_at(after_store, store.offset + 1),
+                    slots.for_pr_at(Some(&after_store), store.offset + 1),
                     then_resolved,
                 ));
             }
