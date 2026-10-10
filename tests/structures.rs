@@ -20,13 +20,17 @@ use std::{
 
 use visualbasic::{
     CompilationMode, EntrypointKind, Error, MethodEntry, RecognitionFailure, VbObject, VbProject,
-    project::{CodeEntryKind, MethodLinkKind, MethodNameResult},
+    project::{CodeEntry, CodeEntryKind, MethodLinkKind, MethodNameResult, NameOwner},
     vb::{
         comreg::ComRegData,
         constantpool::PoolEntry,
-        controlprop::ControlPropertyType,
+        control::Guid,
+        controlprop::{ControlPropertyEntry, ControlPropertyType, RecordLayout},
         external::{CallApiStub, ConversionKind, ExternalKind},
-        projectinfo2::{ControlTypeIter, read_name_strings},
+        functype::ArgType,
+        member::MemberKind,
+        native::{ProcUnwindInfo, ProcedureUnwind},
+        projectinfo2::{ControlTypeIter, ProjectInfo2, read_name_strings},
     },
 };
 
@@ -345,7 +349,7 @@ fn private_descriptor_counts() {
     }
 }
 
-/// The ProjectInfo2 records and parameter names interleave: the walk
+/// The ProjectInfo2 records and names interleave: the walk
 /// reads past names and records with no type library, and stops at the
 /// P-Code.
 #[test]
@@ -389,6 +393,710 @@ fn project_info2_records_and_names() {
     for name in ["hello", "flow", "exprs", "late", "vtable"] {
         assert_eq!(records(name), (Vec::new(), Vec::new()), "{name}");
     }
+}
+
+/// The member array lists the public variables and the `Implements`, with
+/// a null entry per private variable: plain variables in declaration
+/// order, then the interfaces, then the `WithEvents` variables.
+#[test]
+fn members_match_declarations() {
+    let members = |project_name: &str, name: &str| -> Vec<(u16, String, MemberKind)> {
+        let project = project(project_name);
+        let map = project.address_map();
+        object(project, name)
+            .members()
+            .unwrap()
+            .map(|(i, m)| {
+                let name = String::from_utf8_lossy(m.name(map).unwrap()).into_owned();
+                (i, name, m.kind().unwrap())
+            })
+            .collect()
+    };
+    let holder = members("members", "Holder");
+    let names: Vec<&str> = holder.iter().map(|(_, n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "B", "I", "L", "S", "D", "C", "Dt", "Flag", "Str", "V", "O", "Peer", "Auto"
+        ]
+    );
+    assert!(holder.iter().all(|(_, _, k)| *k == MemberKind::Variable));
+    assert_eq!(
+        members("members", "Mixed"),
+        [
+            (0, "Value".into(), MemberKind::Variable),
+            (1, "Note".into(), MemberKind::Variable),
+            (2, "IFirst".into(), MemberKind::Implements),
+            (3, "Shown".into(), MemberKind::WithEvents),
+        ]
+    );
+    assert_eq!(
+        members("calls", "Square"),
+        [(1, "Shape".into(), MemberKind::Implements)]
+    );
+    assert_eq!(
+        members("data", "Item"),
+        [(0, "Name".into(), MemberKind::Variable)]
+    );
+    // Control: private variables only.
+    assert!(members("calls", "Counter").is_empty());
+
+    // The fields agree with the method links and the type lists.
+    let project = project("members");
+    let holder = object(project, "Holder");
+    let (_, peer) = holder.members().unwrap().nth(11).unwrap();
+    assert_eq!(peer.memid().unwrap(), Some(0x4003000B));
+    assert_eq!(peer.vtable_offset().unwrap(), Some(0x7C));
+    assert_eq!(peer.instance_offset().unwrap(), Some(0x74));
+    assert_eq!(peer.var_type().unwrap().base_type(), ArgType::OBJECT);
+    assert_eq!(
+        peer.var_type().unwrap().descriptor_va(),
+        Some(holder.descriptor().object_info_va().unwrap())
+    );
+    let (_, first) = object(project, "Two").members().unwrap().nth(1).unwrap();
+    assert_eq!(first.vtable_offset().unwrap(), None);
+    assert_eq!(
+        first.var_type().unwrap().descriptor_va(),
+        Some(
+            object(project, "IFirst")
+                .descriptor()
+                .object_info_va()
+                .unwrap()
+        )
+    );
+}
+
+/// A type-list entry of a class, interface or record names its descriptor:
+/// the class's ObjectInfo, an InterfaceRef (library and IID), a RecordRef
+/// (library and record GUID).
+#[test]
+fn type_descriptors_resolve() {
+    let mut seen = BTreeMap::new();
+    for name in projects() {
+        let fixture = project(&name);
+        let map = fixture.address_map();
+        let infos: HashSet<u32> = fixture
+            .objects()
+            .unwrap()
+            .map(|o| o.unwrap().descriptor().object_info_va().unwrap())
+            .collect();
+        let mut types = Vec::new();
+        for obj in fixture.objects().unwrap() {
+            let obj = obj.unwrap();
+            types.extend(obj.members().unwrap().map(|(_, m)| m.var_type().unwrap()));
+            let descs = obj
+                .func_type_descs()
+                .unwrap()
+                .chain(obj.event_type_descs().unwrap());
+            for (_, ftd) in descs {
+                types.extend(ftd.arg_types());
+                types.extend(ftd.return_type());
+            }
+        }
+        for t in types.into_iter().filter(|t| t.descriptor_va().is_some()) {
+            let resolved = match t.base_type() {
+                ArgType::OBJECT => infos.contains(&t.descriptor_va().unwrap()),
+                ArgType::IUNKNOWN | ArgType::INTERFACE => t.interface(map).is_some_and(|i| {
+                    i.iid(map).is_some() && i.typelib(map).and_then(|l| l.name(map)).is_some()
+                }),
+                ArgType::RECORD => t
+                    .record(map)
+                    .is_some_and(|r| r.libid(map).is_some() && r.guid(map).is_some()),
+                _ => false,
+            };
+            assert!(resolved, "{name}: {t:?}");
+            *seen.entry(t.base_type()).or_insert(0) += 1;
+        }
+    }
+    assert_eq!(
+        seen.keys().copied().collect::<Vec<_>>(),
+        [0x13, 0x14, 0x1C, 0x1D]
+    );
+
+    let typerefs = project("typerefs");
+    let map = typerefs.address_map();
+    let shapes = object(typerefs, "Shapes");
+    let iface = |t: ArgType| {
+        let i = t.interface(map).unwrap();
+        let lib = i.typelib(map).unwrap();
+        (lib.name(map).unwrap(), i.iid(map).unwrap().to_string())
+    };
+    let members: Vec<_> = shapes
+        .members()
+        .unwrap()
+        .map(|(_, m)| iface(m.var_type().unwrap()))
+        .collect();
+    let collection = ("VBA", "{A4C46780-499F-101B-BB78-00AA00383CBB}".to_string());
+    assert_eq!(
+        members,
+        [
+            collection.clone(),
+            collection.clone(),
+            (
+                "stdole",
+                "{BEF6E003-A874-101A-8BBA-00AA00300CAB}".to_string()
+            ),
+            (
+                "stdole",
+                "{00000000-0000-0000-C000-000000000046}".to_string()
+            ),
+        ]
+    );
+    let unk = shapes
+        .members()
+        .unwrap()
+        .nth(3)
+        .unwrap()
+        .1
+        .var_type()
+        .unwrap();
+    assert_eq!(unk.base_type(), ArgType::IUNKNOWN);
+
+    // `Pass(ByVal c As Collection, ByRef f As StdFont, p As Point)`.
+    let (_, pass) = shapes.func_type_descs().unwrap().next().unwrap();
+    let args = pass.arg_types();
+    assert_eq!(iface(args[0]), collection);
+    let point = args[2].record(map).unwrap();
+    assert_eq!(
+        point.libid(map),
+        typerefs.com_registration().unwrap().project_guid()
+    );
+    assert_eq!(
+        point.guid(map).unwrap().to_string(),
+        "{218538C9-BFB4-4136-BFAF-302AB309BE7D}"
+    );
+    assert_eq!(
+        (point.version().unwrap(), point.lcid().unwrap()),
+        ((1, 0), 0x409)
+    );
+
+    // The libraries: VBA 6.0 LCID 9 from its file, stdole 2.0 LCID 0.
+    let vba = args[0].interface(map).unwrap().typelib(map).unwrap();
+    assert_eq!(
+        (vba.version().unwrap(), vba.lcid().unwrap(), vba.path(map)),
+        ((6, 0), 9, Some("C:\\VB98\\VBA6.dll"))
+    );
+    let stdole = args[1].interface(map).unwrap().typelib(map).unwrap();
+    assert_eq!(
+        (stdole.version().unwrap(), stdole.lcid().unwrap()),
+        ((2, 0), 0)
+    );
+
+    // A watcher's `t As VB.TextBox` names VB's TextBox.
+    let watch = object(typerefs, "Watcher")
+        .func_type_descs()
+        .unwrap()
+        .next()
+        .unwrap()
+        .1;
+    assert_eq!(
+        iface(watch.arg_types()[0]),
+        ("VB", "{33AD4EE1-6699-11CF-B70C-00AA0060D393}".to_string())
+    );
+
+    // The hosted controls' libraries carry their versions.
+    let activex = project("activex");
+    let amap = activex.address_map();
+    let pi2 = activex.object_table().project_info2_va().unwrap();
+    let mut libs: Vec<(String, (u16, u16), u32)> = ControlTypeIter::new(amap, pi2)
+        .filter_map(|e| e.typelib(amap))
+        .map(|l| {
+            (
+                l.name(amap).unwrap().to_string(),
+                l.version().unwrap(),
+                l.lcid().unwrap(),
+            )
+        })
+        .collect();
+    libs.sort();
+    libs.dedup();
+    assert_eq!(
+        libs,
+        [
+            ("InetCtlsObjects".to_string(), (1, 0), 0),
+            ("MSComctlLib".to_string(), (2, 0), 0),
+            ("MSMask".to_string(), (1, 1), 0),
+            ("MSWinsockLib".to_string(), (1, 0), 0),
+            ("VB".to_string(), (6, 0), 9),
+        ]
+    );
+}
+
+/// UDT members and arrays of UDTs name their type's layout; fixed arrays
+/// carry their elements' IID or VARTYPE after the SAFEARRAY descriptor.
+#[test]
+fn cleanup_entries_name_their_types() {
+    let entries = |name: &str| -> Vec<(String, ControlPropertyEntry<'static>)> {
+        let project = project(name);
+        let mut all = Vec::new();
+        for obj in project.objects().unwrap() {
+            let obj = obj.unwrap();
+            let owner = obj.name().unwrap().into_owned();
+            for table in [obj.public_bytes(), obj.static_bytes()]
+                .into_iter()
+                .flatten()
+            {
+                all.extend(table.control_entries().map(|e| (owner.clone(), e)));
+            }
+            for method in obj.methods().unwrap() {
+                if let Ok(MethodEntry::PCode(m)) = method {
+                    all.extend(m.cleanup_entries().map(|e| (owner.clone(), e)));
+                }
+            }
+        }
+        all
+    };
+    let mut sizes = HashSet::new();
+    for name in projects() {
+        let map = project(&name).address_map();
+        for (_, entry) in entries(&name) {
+            let Some(layout) = entry.record_layout(map) else {
+                assert!(entry.record_layout_va().is_none() && entry.element_layout_va().is_none());
+                continue;
+            };
+            let strides: usize = layout.entries().map(|e| e.total_size().unwrap()).sum();
+            assert_eq!(
+                strides + RecordLayout::HEADER_SIZE,
+                usize::from(layout.size().unwrap()),
+                "{name}"
+            );
+            sizes.insert(layout.record_size().unwrap());
+        }
+    }
+    // coverage's Rec and FileRec, data's Record and Pair, statics' Rec,
+    // types' Pair, records' Outer and Item.CT.
+    assert_eq!(
+        sizes,
+        HashSet::from([0x50, 0x24, 0x20, 0x14, 0x10, 0x08, 0x68, 0x04])
+    );
+
+    // `Rec`: fStr, fV, fO and the fixed-length fFx need cleanup.
+    let coverage = project("coverage");
+    let (_, rec) = entries("coverage")
+        .into_iter()
+        .find(|(owner, e)| owner == "Globals" && e.record_layout_va().is_some())
+        .unwrap();
+    let members: Vec<(u16, ControlPropertyType)> = rec
+        .record_layout(coverage.address_map())
+        .unwrap()
+        .entries()
+        .map(|e| (e.frame_offset().unwrap(), e.property_type()))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            (0x24, ControlPropertyType::String),
+            (0x28, ControlPropertyType::Variant),
+            (0x3C, ControlPropertyType::Object),
+            (0x40, ControlPropertyType::Value(0x0A)),
+        ]
+    );
+
+    // `Bag.m_Slots(7) As Object`: IID_IDispatch; `m_Static(1 To 10) As
+    // Integer`: VT_I2.
+    let dispid = project("dispid");
+    let iids: Vec<String> = entries("dispid")
+        .iter()
+        .filter_map(|(_, e)| e.safearray_iid_va())
+        .map(|va| {
+            Guid::from_bytes(dispid.address_map().slice_from_va(va, 16).unwrap())
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(iids, ["{00020400-0000-0000-C000-000000000046}"; 2]);
+    assert!(
+        entries("data")
+            .iter()
+            .any(|(_, e)| e.frame_offset().unwrap() == 4 && e.safearray_vartype() == Some(2))
+    );
+}
+
+/// ProjectInfo2's object descriptor array repeats each object's
+/// `ObjectInfo.lpPrivateObject`, but for `udts`' module, whose slot holds
+/// an address outside the image.
+#[test]
+fn project_info2_object_descs() {
+    let mut classes = 0;
+    for name in projects() {
+        let project = project(&name);
+        let map = project.address_map();
+        let pi2_va = project.object_table().project_info2_va().unwrap();
+        let pi2 = ProjectInfo2::parse(
+            map.slice_from_va(pi2_va, ProjectInfo2::HEADER_SIZE)
+                .unwrap(),
+        )
+        .unwrap();
+        let count = project.object_table().total_objects().unwrap();
+        let descs = pi2.object_descs(map, count).unwrap();
+        let expected: Vec<u32> = project
+            .objects()
+            .unwrap()
+            .map(|o| o.unwrap().info().private_object_va().unwrap())
+            .collect();
+        let descs: Vec<u32> = descs
+            .into_iter()
+            .map(|va| if map.is_va_in_image(va) { va } else { u32::MAX })
+            .collect();
+        assert_eq!(descs, expected, "{name}");
+        classes += descs.iter().filter(|&&va| va != u32::MAX).count();
+    }
+    assert!(classes > 50, "{classes}");
+}
+
+/// An ActiveX DLL's or OCX's COM exports are stubs that push the VBHeader
+/// (and two `.data` VAs) and jump to the runtime's `VBDll*` function.
+#[test]
+fn export_stubs_enter_the_runtime() {
+    for name in projects() {
+        let project = project(&name);
+        let stubs: Vec<(String, usize, String)> = project
+            .export_stubs()
+            .into_iter()
+            .inspect(|s| assert_eq!(s.vb_header_va, project.vb_header_va(), "{name}"))
+            .map(|s| (s.name.unwrap(), s.data_vas.len(), s.function.unwrap()))
+            .collect();
+        if !["docs", "extender", "ocx", "typerefs", "udts"].contains(&name.as_str()) {
+            assert!(stubs.is_empty(), "{name}");
+            continue;
+        }
+        assert_eq!(
+            stubs,
+            [
+                ("DllCanUnloadNow", 0, "VBDllCanUnloadNow"),
+                ("DllGetClassObject", 2, "VBDllGetClassObject"),
+                ("DllRegisterServer", 2, "VBDllRegisterServer"),
+                ("DllUnregisterServer", 2, "VBDllUnRegisterServer"),
+            ]
+            .map(|(n, d, f)| (n.to_string(), d, f.to_string())),
+            "{name}"
+        );
+    }
+}
+
+/// Every native procedure that stores an unwind record is found, named or
+/// not, and everything its record names lies inside it: between its start
+/// and the next procedure the project knows.
+#[test]
+fn native_procedures_store_unwind_records() {
+    let mut found = BTreeMap::new();
+    for name in ["events-native", "flow-native", "errors-native"] {
+        let project = project(name);
+        let map = project.address_map();
+        let code = project.native_code_range().unwrap();
+        let starts: Vec<u32> = project
+            .native_entries()
+            .into_iter()
+            .filter(|va| code.contains(va))
+            .collect();
+        let records = project.unwind_records();
+        for procedure in &records {
+            let (start, info) = (procedure.procedure_va, procedure.info);
+            assert_eq!(
+                ProcUnwindInfo::from_prologue(map, start).map(|(va, _)| va),
+                Some(procedure.record_va),
+                "{name} {start:#x}"
+            );
+            assert!(starts.contains(&start), "{name} {start:#x} is no entry");
+            let end = starts
+                .iter()
+                .copied()
+                .find(|&next| next > start)
+                .unwrap_or(code.end);
+            let flags = info.flags().unwrap();
+            let slot = info.frame_slot().unwrap();
+            let expected_slot = match flags & 0x70 {
+                0 => None,
+                0x10 => Some(0x10),
+                _ => Some(0x14),
+            };
+            match expected_slot {
+                Some(expected) => assert_eq!(slot, expected, "{name} {start:#x}"),
+                None => assert!(slot == 4 || slot == 8, "{name} {start:#x}"),
+            }
+            let size = if flags & 0x40 != 0 {
+                0x1C
+            } else if flags & 0x30 != 0 {
+                0x18
+            } else if flags & 0x0E != 0 {
+                0x10
+            } else {
+                8
+            };
+            assert_eq!(info.size(), size, "{name} {start:#x}");
+            for va in info.code_vas(map) {
+                assert!(start < va && va < end, "{name} {start:#x}: {va:#x}");
+            }
+        }
+        found.insert(name, records.len());
+    }
+    // events-native: 33 class methods, Sub Main and `ThroughInterface`;
+    // flow-native: Sub Main and 15 of Program's procedures, none of which a
+    // table names; errors-native: Sub Main, Program's 7 and Guard's 2.
+    assert_eq!(
+        found,
+        BTreeMap::from([
+            ("events-native", 35),
+            ("flow-native", 16),
+            ("errors-native", 10)
+        ])
+    );
+
+    // A class method holds Me: `Source`'s methods have an exit block.
+    let native = project("events-native");
+    for link in object(native, "Source").method_links().unwrap() {
+        let link = link.unwrap();
+        let (_, info) = ProcUnwindInfo::from_prologue(native.address_map(), link.code_va).unwrap();
+        assert_eq!(info.flags().unwrap() & 0x01, 1);
+        assert_eq!(info.frame_slot().unwrap(), 8);
+    }
+}
+
+/// The native code region lies between the code markers: empty in a P-Code
+/// build, and holding every procedure of a native one (Sub Main and each
+/// that stores an unwind record) while the stubs that enter them stay
+/// outside it.
+#[test]
+fn native_code_lies_between_the_markers() {
+    for name in projects() {
+        let project = project(&name);
+        let code = project.native_code_range().unwrap();
+        if !name.ends_with("-native") {
+            assert!(code.is_empty(), "{name}: {code:x?}");
+            assert!(project.unwind_records().is_empty(), "{name}");
+            continue;
+        }
+        assert!(
+            code.contains(&project.vb_header().sub_main_va().unwrap()),
+            "{name}"
+        );
+        for procedure in project.unwind_records() {
+            assert!(code.contains(&procedure.procedure_va), "{name}");
+        }
+        for entry in project.code_entrypoints().unwrap() {
+            assert!(
+                entry.stub_va.is_none_or(|va| !code.contains(&va)),
+                "{name}: {entry:x?}"
+            );
+        }
+    }
+}
+
+/// The tables an unwind record names hold what the source says: one handler
+/// per `On Error GoTo` label, one address per statement for `Resume`, one
+/// line number per statement for `Erl`.
+#[test]
+fn error_handling_tables_match_the_source() {
+    let project = project("errors-native");
+    let map = project.address_map();
+    let records = project.unwind_records();
+    // Program's procedures in source order, Sub Main, then Guard's methods.
+    let [
+        two,
+        three,
+        even,
+        odd,
+        lines_odd,
+        lines_even,
+        everything,
+        _main,
+        divide,
+        retry,
+    ] = records.as_slice()
+    else {
+        panic!("{} records", records.len());
+    };
+    let shape = |procedure: &ProcedureUnwind| {
+        let info = procedure.info;
+        (info.flags().unwrap(), info.frame_slot().unwrap())
+    };
+    let handlers = |procedure: &ProcedureUnwind| -> Vec<u32> {
+        procedure
+            .info
+            .handlers(map)
+            .map(|table| table.iter().map(|handler| handler.number).collect())
+            .unwrap_or_default()
+    };
+    let statements =
+        |procedure: &ProcedureUnwind| procedure.info.resume(map).map(|table| table.count());
+    let lines = |procedure: &ProcedureUnwind| -> Vec<u16> {
+        let table = procedure.info.lines(map).unwrap();
+        (0..=table.count())
+            .map(|n| table.line(n).unwrap())
+            .collect()
+    };
+
+    assert_eq!((shape(two), handlers(two)), ((0x10, 0x10), vec![1, 2]));
+    assert_eq!(
+        (shape(three), handlers(three)),
+        ((0x10, 0x10), vec![1, 2, 3])
+    );
+    assert_eq!((shape(even), statements(even)), ((0x20, 0x14), Some(6)));
+    assert_eq!((shape(odd), statements(odd)), ((0x20, 0x14), Some(7)));
+    assert_eq!(shape(lines_odd), (0x50, 0x14));
+    assert_eq!(lines(lines_odd), [0, 0, 10, 20, 30]);
+    assert_eq!(shape(lines_even), (0x70, 0x14));
+    // A numbered line is two statements, its label and its code.
+    assert_eq!(
+        lines(lines_even),
+        [
+            0, 0, 100, 100, 110, 110, 120, 120, 130, 130, 140, 140, 140, 140, 140, 140
+        ]
+    );
+    assert_eq!(statements(lines_even), Some(15));
+    assert_eq!(shape(everything), (0x7E, 0x14));
+    assert_eq!(
+        lines(everything)[..12],
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+    );
+    assert_eq!(statements(everything), Some(18));
+    // A class method's record also names its exit block.
+    assert_eq!((shape(divide), handlers(divide)), ((0x11, 0x10), vec![1]));
+    assert_eq!((shape(retry), statements(retry)), ((0x31, 0x14), Some(8)));
+    assert!(divide.info.exit_va().is_some() && retry.info.exit_va().is_some());
+
+    for procedure in [even, odd, lines_even, everything, retry] {
+        let table = procedure.info.resume(map).unwrap();
+        let vas: Vec<u32> = table.iter().collect();
+        assert!(vas.is_sorted(), "{:#x}", procedure.procedure_va);
+        assert_eq!(table.statement_va(table.count() + 1), None);
+        // The first statement stores its number in `ebp-4`.
+        let first = map.slice_from_va(vas[0], 7).unwrap();
+        assert_eq!(first[..7], [0xC7, 0x45, 0xFC, 1, 0, 0, 0]);
+        // The word after the last statement, which `Resume Next` from it
+        // reads, is 0.
+        let va = procedure.info.resume_va().unwrap();
+        let sentinel = map
+            .slice_from_va(va + 4 * (table.count() as u32 + 1), 4)
+            .unwrap();
+        assert_eq!(sentinel[..4], [0; 4]);
+    }
+}
+
+/// An ActiveX project's type library names each class's events by DISPID;
+/// a Standard EXE has none, and its pooled strings name no event.
+#[test]
+fn event_names_come_from_the_type_library() {
+    let names = |project_name: &str, object_name: &str| -> Vec<Option<&'static str>> {
+        object(project(project_name), object_name)
+            .event_names()
+            .unwrap()
+    };
+    assert_eq!(names("ocx", "Knob"), [Some("Turned"), Some("Reset")]);
+    assert_eq!(names("ocx", "Panel"), [Some("Summary")]);
+    assert_eq!(
+        names("extender", "Coords"),
+        [
+            "Pixels",
+            "Himetric",
+            "Container",
+            "Others",
+            "Variants",
+            "Referenced"
+        ]
+        .map(Some)
+    );
+    assert_eq!(names("typerefs", "Shapes"), [Some("Moved")]);
+    assert_eq!(names("server", "Multi"), [Some("Changed")]);
+    // A Private class is not in the library.
+    assert_eq!(names("server", "Hidden"), [None]);
+    // Standard EXEs.
+    assert_eq!(names("events", "Source"), [None, None, None]);
+    assert_eq!(names("eventnames", "Second"), [None, None]);
+    assert!(project("events").type_library_bytes().is_none());
+    assert!(
+        project("docs")
+            .type_library_bytes()
+            .unwrap()
+            .starts_with(b"MSFT")
+    );
+}
+
+/// The event prototypes are in declaration order, with the events'
+/// parameter names.
+#[test]
+fn event_type_descs_name_event_parameters() {
+    let project = project("events");
+    let map = project.address_map();
+    let params: Vec<Vec<&[u8]>> = object(project, "Source")
+        .event_type_descs()
+        .unwrap()
+        .map(|(_, ftd)| ftd.param_names(map))
+        .collect();
+    assert_eq!(
+        params,
+        [
+            vec![],
+            vec![&b"n"[..], b"ratio", b"Cancel"],
+            vec![&b"s"[..], b"v", b"o"]
+        ]
+    );
+}
+
+/// Every string of the ProjectInfo2 name area has an owner, and every
+/// pointer to it in the file is one of its owners' pointers.
+#[test]
+fn name_references_own_every_name() {
+    let mut owned = 0;
+    for name in projects() {
+        let project = project(&name);
+        let map = project.address_map();
+        let file = map.file();
+        let refs = project.name_references().unwrap();
+        let pi2 = project.object_table().project_info2_va().unwrap();
+        for pool_name in read_name_strings(map, pi2) {
+            let offset = pool_name.as_ptr() as usize - file.as_ptr() as usize;
+            let va = map.offset_to_va(offset).unwrap();
+            let owners: HashSet<u32> = refs
+                .iter()
+                .filter(|r| r.name_va == va)
+                .map(|r| r.pointer_va)
+                .collect();
+            assert!(!owners.is_empty(), "{name}: {pool_name} has no owner");
+            let pointers: HashSet<u32> = file
+                .windows(4)
+                .enumerate()
+                .filter(|(_, w)| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == va)
+                .filter_map(|(o, _)| map.offset_to_va(o))
+                .collect();
+            assert_eq!(pointers, owners, "{name}: {pool_name}");
+            owned += 1;
+        }
+    }
+    assert_eq!(owned, 127);
+
+    // Names past where the walk stops are attributed too.
+    let refs = project("members").name_references().unwrap();
+    let amount: Vec<NameOwner> = refs
+        .iter()
+        .filter(|r| r.name == b"Amount")
+        .map(|r| r.owner)
+        .collect();
+    assert_eq!(amount.len(), 4, "{amount:?}");
+    assert!(amount.iter().any(|o| matches!(
+        o,
+        NameOwner::EventParameter {
+            event: 0,
+            index: 0,
+            ..
+        }
+    )));
+    // `calls` `Value` is the parameter of `Counter`'s `Event Changed`, not
+    // its property.
+    let refs = project("calls").name_references().unwrap();
+    let value: Vec<NameOwner> = refs
+        .iter()
+        .filter(|r| r.name == b"Value")
+        .map(|r| r.owner)
+        .collect();
+    assert!(matches!(
+        value[..],
+        [NameOwner::EventParameter {
+            event: 0,
+            index: 0,
+            ..
+        }]
+    ));
 }
 
 /// `Sub Main` is found through the ProcDscInfo its P-Code stub loads.
@@ -443,7 +1151,7 @@ fn sub_main_names_its_procedure() {
         assert_eq!(method.proc_dsc_va(), dsc);
         found += 1;
     }
-    assert_eq!(found, 19);
+    assert_eq!(found, 21);
     let hello = project("hello")
         .code_entrypoints()
         .unwrap()
@@ -529,6 +1237,138 @@ fn code_entries_list_each_method_once() {
             .count();
         assert_eq!(variables, count, "{class}");
     }
+}
+
+/// A `WithEvents` or `Implements` sink is a dual interface's vtable: four
+/// `IDispatch` slots, then the handlers; a control's sink has the handlers
+/// alone. Every handler enters the procedure that handles its slot.
+#[test]
+fn sinks_skip_idispatch_slots() {
+    const DISPATCH: [&str; 4] = [
+        "Zombie_GetTypeInfoCount",
+        "Zombie_GetTypeInfo",
+        "EVENT_SINK_GetIDsOfNames",
+        "EVENT_SINK_Invoke",
+    ];
+    let thunk_name = |project: &VbProject<'_>, va: u32| -> Option<String> {
+        let code = project.address_map().slice_from_va(va, 6).ok()?;
+        (code[..2] == [0xFF, 0x25]).then_some(())?;
+        let slot = u32::from_le_bytes(code[2..6].try_into().unwrap());
+        Some(project.imports().by_slot(slot)?.function().to_string())
+    };
+    let mut kinds = BTreeMap::new();
+    for name in projects() {
+        let project = project(&name);
+        let map = project.address_map();
+        for obj in project.objects().unwrap() {
+            let obj = obj.unwrap();
+            for control in obj.controls().unwrap() {
+                let control = control.unwrap();
+                let kind = control.info().kind().unwrap();
+                *kinds.entry(format!("{kind:?}")).or_insert(0) += 1;
+                let Some(sink) = control.event_sink(map) else {
+                    continue;
+                };
+                let dispatch: Vec<Option<String>> = (0..4)
+                    .map(|i| sink.dispatch_va(i).and_then(|va| thunk_name(project, va)))
+                    .collect();
+                // Every sink has the IDispatch slots iff ControlInfo says so,
+                // and those are the runtime's thunks.
+                let raw: Vec<Option<String>> = (0..4)
+                    .map(|i| {
+                        let va = control.info().event_sink_vtable_va().unwrap() + 0x18 + 4 * i;
+                        let slot = map.slice_from_va(va, 4).ok()?;
+                        thunk_name(project, u32::from_le_bytes(slot[..4].try_into().unwrap()))
+                    })
+                    .collect();
+                let dual = raw == DISPATCH.map(|f| Some(f.to_string()));
+                assert_eq!(
+                    dual,
+                    control.info().dispatch_slots().unwrap() == 4,
+                    "{name}"
+                );
+                if dual {
+                    assert_eq!(dispatch, raw, "{name}");
+                } else {
+                    assert_eq!(dispatch, [None, None, None, None], "{name}");
+                }
+                for (slot, va) in sink.connected_handlers() {
+                    assert_eq!(control.event_handler_va(slot), Some(va));
+                    let imported = thunk_name(project, va);
+                    assert!(
+                        imported.as_deref().is_none_or(|f| !DISPATCH.contains(&f)),
+                        "{name}: {} slot {slot} is {imported:?}",
+                        control.name()
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        kinds,
+        BTreeMap::from([
+            ("Control".to_string(), 136),
+            ("Implements".to_string(), 9),
+            ("WithEvents".to_string(), 6),
+        ])
+    );
+
+    // The handlers enter the procedures named for their control.
+    let handled = |project_name: &str, object_name: &str, control: &str| -> Vec<String> {
+        let obj = object(project(project_name), object_name);
+        let entries = obj.code_entries(None).unwrap();
+        let ctrl = obj
+            .controls()
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|c| c.name() == control)
+            .unwrap();
+        (0..ctrl.event_count().unwrap())
+            .filter_map(|slot| ctrl.event_handler_va(slot).filter(|&va| va != 0))
+            .map(|va| {
+                let entry = entries.iter().find(|e| e.va == va).unwrap();
+                // The method's name; a handler with none (a private handler
+                // of a dispinterface source) by its entry's label.
+                let index = entry.method_index.unwrap();
+                obj.method_name(index)
+                    .unwrap()
+                    .as_str()
+                    .map(|n| n.into_owned())
+                    .unwrap_or_else(|| entry.name.clone().unwrap())
+            })
+            .collect()
+    };
+    assert_eq!(
+        handled("events", "Listener", "m_Source"),
+        ["m_Source_Started", "m_Source_Ticked", "m_Source_Named"]
+    );
+    // Native: each handler's stub jumps to one of the object's procedures,
+    // listed as its own entry.
+    let listener = object(project("events-native"), "Listener");
+    let entries = listener.code_entries(None).unwrap();
+    let handlers: Vec<&CodeEntry> = entries
+        .iter()
+        .filter(|e| e.kind == CodeEntryKind::EventHandler)
+        .collect();
+    assert_eq!(handlers.len(), 3);
+    for handler in handlers {
+        let target = handler.target_va.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.kind == CodeEntryKind::NativeThunk && e.va == target),
+            "{target:#x}"
+        );
+    }
+    let ring = handled("events", "Ring", "Measure");
+    assert_eq!(ring.len(), 9);
+    assert!(ring.iter().all(|n| n.starts_with("Measure_")), "{ring:?}");
+    assert_eq!(handled("members", "Mixed", "Shown"), ["Shown_Fed"]);
+    // A WithEvents variable of a dispinterface source has no IDispatch
+    // slots; one of a project class has them.
+    assert_eq!(handled("typerefs", "Watcher", "Txt"), ["Txt_Change"]);
+    assert_eq!(handled("typerefs", "Watcher", "Src"), ["Src_Moved"]);
+    assert_eq!(handled("members", "Mixed", "Hidden"), ["Hidden_Fed"]);
 }
 
 /// A control's event sink slots hold its handlers' event stubs on disk.

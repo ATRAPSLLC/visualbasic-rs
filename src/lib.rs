@@ -35,6 +35,8 @@
 //!   internal format (VBHeader, ProjectData, ObjectTable, etc.).
 //! - **P-Code decoding** ([`pcode`]): Opcode tables, operand types, and a streaming
 //!   instruction iterator.
+//! - **Extents** ([`extents`]): Where each structure the crate reads lies in
+//!   the image, for a disassembler that must not decode it.
 //! - **Imports** ([`imports::ImportTable`]): The PE import table by address
 //!   table slot, naming the runtime functions P-Code calls by ordinal.
 //! - **High-level API** ([`VbProject`]): Ties everything together into a convenient
@@ -141,6 +143,7 @@
 pub mod addressmap;
 pub mod entrypoint;
 pub mod error;
+pub mod extents;
 pub mod imports;
 pub mod pcode;
 pub mod project;

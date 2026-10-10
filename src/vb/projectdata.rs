@@ -103,11 +103,15 @@ impl<'a> ProjectData<'a> {
         read_u32_le(self.bytes, 0x08)
     }
 
-    /// Start of the native/P-Code region in .text at offset 0x0C.
+    /// Start of the project's native code region, at offset 0x0C.
     ///
-    /// For native binaries, this spans the compiled native code.
-    /// For P-Code binaries, it is a 16-byte region holding `E9 E9 E9 E9`
-    /// followed by twelve `CC` bytes (every P-Code fixture).
+    /// The region opens with a 16-byte marker, `E9 E9 E9 E9` and twelve
+    /// `CC`, which nothing executes; a native build's procedures follow it,
+    /// up to [`code_end_va`](Self::code_end_va), and a P-Code build has
+    /// none, its region being the marker alone (every fixture). The runtime
+    /// reads the bounds only to turn an access violation at a near-null
+    /// address inside the region into error 91 (MSVBVM60 6.00.8176
+    /// `0x660E3ADC`).
     ///
     /// # Errors
     ///
@@ -117,7 +121,9 @@ impl<'a> ProjectData<'a> {
         read_u32_le(self.bytes, 0x0C)
     }
 
-    /// End of the native/P-Code region in .text at offset 0x10.
+    /// End of the project's native code region, at offset 0x10: a 4-byte
+    /// marker, `9E 9E 9E 9E`, which nothing executes. The import directory
+    /// follows it in every fixture.
     ///
     /// # Errors
     ///

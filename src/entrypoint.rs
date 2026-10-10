@@ -28,11 +28,26 @@
 //!
 //! The `DllCanUnloadNow` stub pushes one value (`58 68 <imm32> 50 E9 <rel32>`).
 //!
+//! The DLL's own entry point is a stub of the same kind that slips two
+//! `.data` VAs under the loader's arguments and jumps to the import thunk of
+//! the runtime's DLL entry function:
+//!
+//! ```x86asm
+//! pop     edx                 ; 0x5A: the return address
+//! push    <imm32>             ; 0x68 <imm32>
+//! push    <imm32>             ; 0x68 <imm32>
+//! push    edx                 ; 0x52
+//! jmp     <import thunk>      ; 0xE9 <rel32>
+//! ```
+//!
+//! [`entry_stub_target`] reads either entry stub's target.
+//!
 //! [`extract_vb_header_va`] reads the EXE stub and
 //! [`extract_vb_header_va_from_exports`] the DLL stubs, each accepting only
 //! a pushed VA that holds the `"VB5!"` magic;
 //! [`VbProject::from_goblin`](crate::project::VbProject::from_goblin) tries
 //! the first, then the second. Nothing scans the file for the magic.
+//! [`ExportStub`] decodes every export stub.
 
 use crate::{addressmap::AddressMap, error::Error};
 
@@ -44,6 +59,42 @@ const PUSH_IMM32: u8 = 0x68;
 
 /// VBHeader magic signature.
 const VB5_MAGIC: &[u8; 4] = b"VB5!";
+
+/// Returns the import thunk the entry point stub at `entry_va` transfers
+/// to: an executable's `push imm32; call rel32` or a DLL's `pop edx; push
+/// imm32; push imm32; push edx; jmp rel32`. `None` for any other code.
+pub fn entry_stub_target(map: &AddressMap<'_>, entry_va: u32) -> Option<u32> {
+    let code = map.slice_from_va(entry_va, 10).ok()?;
+    let (rel, end) = match code {
+        [0x68, _, _, _, _, 0xE8, r0, r1, r2, r3, ..] => ([*r0, *r1, *r2, *r3], 10u32),
+        [
+            0x5A,
+            0x68,
+            _,
+            _,
+            _,
+            _,
+            0x68,
+            _,
+            _,
+            _,
+            _,
+            0x52,
+            0xE9,
+            r0,
+            r1,
+            r2,
+            r3,
+            ..,
+        ] => ([*r0, *r1, *r2, *r3], 17),
+        _ => return None,
+    };
+    Some(
+        entry_va
+            .wrapping_add(end)
+            .wrapping_add(i32::from_le_bytes(rel).cast_unsigned()),
+    )
+}
 
 /// Extracts the VBHeader virtual address from the PE entry point.
 ///
@@ -102,6 +153,57 @@ pub fn extract_vb_header_va(map: &AddressMap<'_>, entry_point_rva: u32) -> Resul
         // The file ends before the header: a truncated VB6 file.
         Err(Error::TooShort { .. }) => Ok(va),
         Err(e) => Err(e),
+    }
+}
+
+/// One COM export stub of an ActiveX DLL or OCX (see the
+/// [module documentation](self)), read by
+/// [`VbProject::export_stubs`](crate::project::VbProject::export_stubs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportStub {
+    /// The export's name (`DllGetClassObject`, `DllCanUnloadNow`, ...).
+    pub name: Option<String>,
+    /// VA of the stub.
+    pub va: u32,
+    /// The VBHeader VA the stub pushes first.
+    pub vb_header_va: u32,
+    /// The values it pushes after the VBHeader VA: two `.data` section VAs,
+    /// none for `DllCanUnloadNow` (`docs`: 0x11003B18 and 0x11003B1C).
+    pub data_vas: Vec<u32>,
+    /// Target of its `jmp rel32`: the import thunk of the runtime function.
+    pub target_va: u32,
+    /// The runtime function that thunk jumps to (`VBDllGetClassObject`,
+    /// `VBDllCanUnloadNow`, `VBDllRegisterServer`, `VBDllUnRegisterServer`).
+    pub function: Option<String>,
+}
+
+impl ExportStub {
+    /// Decodes the stub at `va` whose code starts with `code`:
+    /// `pop eax`, a `push imm32` per value, `push eax`, `jmp rel32`.
+    /// `None` if the code is not one.
+    pub fn decode(code: &[u8], va: u32) -> Option<Self> {
+        let mut rest = code.strip_prefix(&[0x58])?;
+        let mut pushed = Vec::new();
+        while let [PUSH_IMM32, b0, b1, b2, b3, tail @ ..] = rest {
+            pushed.push(u32::from_le_bytes([*b0, *b1, *b2, *b3]));
+            rest = tail;
+        }
+        let [0x50, 0xE9, r0, r1, r2, r3, ..] = rest else {
+            return None;
+        };
+        let (&vb_header_va, data_vas) = pushed.split_first()?;
+        let consumed = code.len().checked_sub(rest.len())?.checked_add(6)?;
+        let target_va = va
+            .checked_add(u32::try_from(consumed).ok()?)?
+            .wrapping_add_signed(i32::from_le_bytes([*r0, *r1, *r2, *r3]));
+        Some(Self {
+            name: None,
+            va,
+            vb_header_va,
+            data_vas: data_vas.to_vec(),
+            target_va,
+            function: None,
+        })
     }
 }
 

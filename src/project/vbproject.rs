@@ -4,7 +4,7 @@
 //! together PE parsing, VB structure navigation, and P-Code access into
 //! a single convenient type with lifetime `'a` tied to the file buffer.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeSet, ops::Range};
 
 use goblin::{
     options::ParseMode,
@@ -13,17 +13,22 @@ use goblin::{
 
 use crate::{
     addressmap::AddressMap,
-    entrypoint,
+    entrypoint::{self, ExportStub},
     error::Error,
     imports::ImportTable,
-    project::{CodeEntryKind, PCodeMethod, VbObject},
-    util::read_cstr,
+    project::{CodeEntryKind, MethodLinkKind, PCodeMethod, VbObject},
+    util::{read_cstr, read_u16_le, read_u32_le},
     vb::{
         comreg::ComRegData,
+        constantpool::PoolEntry,
+        events::{EventHandlerThunk, NativeEventThunk},
         external::{ExternalComponentIter, ExternalTableEntry},
         formdata::FormDataParser,
+        functype::FuncTypDesc,
         guitable::{GuiTableEntry, GuiTableIter},
         header::VbHeader,
+        member::{MemberDesc, MemberKind},
+        native::ProcedureUnwind,
         object::PublicObjectDescriptor,
         objecttable::ObjectTable,
         projectdata::ProjectData,
@@ -229,6 +234,8 @@ pub enum CompilationMode {
 pub struct VbProject<'a> {
     /// VA-to-file-offset resolver built from PE section headers.
     map: AddressMap<'a>,
+    /// VA of the PE entry point.
+    entry_point_va: u32,
     /// VA of the VbHeader in the PE image.
     vb_header_va: u32,
     /// Root VBHeader (EXEPROJECTINFO) parsed from the entry point.
@@ -239,6 +246,10 @@ pub struct VbProject<'a> {
     object_table: ObjectTable<'a>,
     /// The PE imports, by import address table slot.
     imports: ImportTable,
+    /// The PE exports: name and RVA.
+    exports: Vec<(Option<String>, u32)>,
+    /// RVA of the PE resource directory, 0 when there is none.
+    resource_rva: u32,
 }
 
 impl<'a> VbProject<'a> {
@@ -372,13 +383,124 @@ impl<'a> VbProject<'a> {
             .unwrap_or_default();
 
         Ok(Self {
+            entry_point_va: map.image_base().wrapping_add(entry_rva),
             map,
             vb_header_va,
             vb_header,
             project_data,
             object_table,
             imports,
+            resource_rva: pe
+                .header
+                .optional_header
+                .as_ref()
+                .and_then(|oh| oh.data_directories.get_resource_table())
+                .map_or(0, |dir| dir.virtual_address),
+            exports: pe
+                .exports
+                .iter()
+                .filter_map(|e| Some((e.name.map(String::from), u32::try_from(e.rva).ok()?)))
+                .collect(),
         })
+    }
+
+    /// Returns the type library the compiler embeds in an ActiveX DLL, OCX
+    /// or ActiveX EXE: the data of the `TYPELIB` resource (an MSFT type
+    /// library naming the project's public classes, their members and
+    /// events). `None` for a Standard EXE, which has none.
+    ///
+    /// The resource directory is read here, fail-soft: a malformed one
+    /// gives `None`.
+    pub fn type_library_bytes(&self) -> Option<&'a [u8]> {
+        let rva = self.resource_rva;
+        if rva == 0 {
+            return None;
+        }
+        let root = self.map.slice_from_rva(rva, 16).ok()?;
+        // Root: the TYPELIB type; then its first name or ID; then its first
+        // language.
+        let typelib = self.resource_entry(root, |entry| {
+            entry & 0x8000_0000 != 0 && Self::resource_name_is(root, entry, "TYPELIB")
+        })?;
+        let names = self.resource_subdir(root, typelib)?;
+        let languages = self.resource_subdir(root, self.resource_entry(names, |_| true)?)?;
+        let leaf = self.resource_entry(languages, |_| true)?;
+        let data = root.get(usize::try_from(leaf & 0x7FFF_FFFF).ok()?..)?;
+        let data_rva = read_u32_le(data, 0).ok()?;
+        let size = usize::try_from(read_u32_le(data, 4).ok()?).ok()?;
+        self.map.slice_from_rva(data_rva, size).ok()?.get(..size)
+    }
+
+    /// The offset field of the first entry of resource directory `dir`
+    /// whose name field satisfies `matches`.
+    fn resource_entry(&self, dir: &[u8], matches: impl Fn(u32) -> bool) -> Option<u32> {
+        let named = read_u16_le(dir, 12).ok()?;
+        let ids = read_u16_le(dir, 14).ok()?;
+        (0..usize::from(named).saturating_add(usize::from(ids))).find_map(|i| {
+            let at = 16usize.checked_add(i.checked_mul(8)?)?;
+            let name = read_u32_le(dir, at).ok()?;
+            let offset = read_u32_le(dir, at.checked_add(4)?).ok()?;
+            matches(name).then_some(offset)
+        })
+    }
+
+    /// The subdirectory an entry's offset field names (bit 31 set), as a
+    /// slice from the subdirectory to the end of the section.
+    fn resource_subdir<'r>(&self, root: &'r [u8], offset: u32) -> Option<&'r [u8]> {
+        (offset & 0x8000_0000 != 0)
+            .then(|| root.get(usize::try_from(offset & 0x7FFF_FFFF).ok()?..))
+            .flatten()
+    }
+
+    /// Whether the UTF-16 name an entry's name field points to is the
+    /// ASCII `expected`.
+    fn resource_name_is(root: &[u8], name: u32, expected: &str) -> bool {
+        let Ok(at) = usize::try_from(name & 0x7FFF_FFFF) else {
+            return false;
+        };
+        let Ok(len) = read_u16_le(root, at) else {
+            return false;
+        };
+        let units = at
+            .checked_add(2)
+            .and_then(|start| Some(start..start.checked_add(usize::from(len).checked_mul(2)?)?))
+            .and_then(|range| root.get(range));
+        units.is_some_and(|units| {
+            units
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[low, high]| if high == 0 { low } else { 0 })
+                .eq(expected.bytes())
+        })
+    }
+
+    /// Decodes the COM export stubs of an ActiveX DLL or OCX
+    /// ([`ExportStub`]): per export, the VBHeader and `.data` VAs it pushes
+    /// and the runtime function it jumps to. Exports that are not such a
+    /// stub are skipped; an executable has none.
+    pub fn export_stubs(&self) -> Vec<ExportStub> {
+        self.exports
+            .iter()
+            .filter_map(|(name, rva)| {
+                let va = self.map.image_base().checked_add(*rva)?;
+                let code = self.map.slice_from_va(va, 8).ok()?;
+                let mut stub = ExportStub::decode(code.get(..code.len().min(32))?, va)?;
+                stub.name.clone_from(name);
+                stub.function = self
+                    .map
+                    .slice_from_va(stub.target_va, 6)
+                    .ok()
+                    .and_then(|thunk| match thunk {
+                        [0xFF, 0x25, s0, s1, s2, s3, ..] => self
+                            .imports
+                            .by_slot(u32::from_le_bytes([*s0, *s1, *s2, *s3])),
+                        _ => None,
+                    })
+                    .map(|import| import.function().into_owned());
+                Some(stub)
+            })
+            .collect()
     }
 
     /// Returns the executable's imports, by import address table slot.
@@ -389,6 +511,172 @@ impl<'a> VbProject<'a> {
     #[inline]
     pub fn imports(&self) -> &ImportTable {
         &self.imports
+    }
+
+    /// Returns the VA of the PE entry point: the stub that pushes the
+    /// [`VbHeader`] and calls `ThunRTMain`, for an executable.
+    #[inline]
+    pub fn entry_point_va(&self) -> u32 {
+        self.entry_point_va
+    }
+
+    /// Returns every address of native code the project's structures name.
+    ///
+    /// The PE entry point, the import thunk it transfers to and the
+    /// exception handler thunk ([`ProjectData::vba_seh_va`]); the COM export
+    /// stubs with the import thunks they jump to; every [`code_entrypoints`](Self::code_entrypoints)
+    /// entry's stub and, unless it is P-Code, the entry itself; each object's
+    /// method link entries and the code their jumps reach; each event sink's
+    /// `IUnknown` thunks and connected handler stubs; and the procedure,
+    /// import and `Declare` stubs its constant pool names; the procedures
+    /// native adjustor thunks enter, and every procedure that stores an
+    /// unwind record ([`unwind_records`](Self::unwind_records)). Not the
+    /// code a record names: the runtime enters that in its procedure's
+    /// frame. A dual-entry stub
+    /// (`mov eax, imm32; cmp ax, 0xC033; mov edx, ...`, whose `xor eax,
+    /// eax` at +7 is the method entry) gives both entries. In a P-Code build
+    /// these stubs are all the native code there is; in a native build the
+    /// procedures between the code markers
+    /// ([`native_code_range`](Self::native_code_range)) are what they reach.
+    ///
+    /// Fail-soft: a structure that does not read contributes nothing.
+    pub fn native_entries(&self) -> BTreeSet<u32> {
+        let mut code = BTreeSet::new();
+        code.insert(self.entry_point_va);
+        code.extend(entrypoint::entry_stub_target(
+            &self.map,
+            self.entry_point_va,
+        ));
+        code.extend(self.project_data.vba_seh_va());
+        for stub in self.export_stubs() {
+            code.extend([stub.va, stub.target_va]);
+        }
+        for entry in self.code_entrypoints().unwrap_or_default() {
+            if entry.kind != EntrypointKind::PCodeStub {
+                code.insert(entry.va);
+            }
+            code.extend(entry.stub_va);
+        }
+        for object in self.objects().into_iter().flatten().flatten() {
+            for link in object.method_links().into_iter().flatten().flatten() {
+                code.insert(link.thunk_va);
+                if link.kind == MethodLinkKind::Jump {
+                    code.insert(link.code_va);
+                }
+            }
+            for control in object.controls().into_iter().flatten().flatten() {
+                let Some(sink) = control.event_sink(&self.map) else {
+                    continue;
+                };
+                code.extend(
+                    [
+                        sink.query_interface_va(),
+                        sink.add_ref_va(),
+                        sink.release_va(),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                );
+                code.extend(sink.connected_handlers().map(|(_, va)| va));
+            }
+            if let (Ok(pool), Ok(count)) =
+                (object.constants_pool(), object.info().constants_count())
+            {
+                for (index, entry) in pool.entries(count) {
+                    if matches!(
+                        entry,
+                        Ok(PoolEntry::Procedure { .. }
+                            | PoolEntry::Import { .. }
+                            | PoolEntry::Declare(_))
+                    ) && let Ok(va) = pool.va_at(index)
+                    {
+                        code.insert(va);
+                    }
+                }
+            }
+        }
+        let partners: Vec<u32> = code
+            .iter()
+            .filter_map(|&va| self.dual_entry_partner(va))
+            .collect();
+        code.extend(partners);
+        // A native adjustor thunk enters its procedure; a procedure that
+        // stores an unwind record is one too, whether or not a table names it.
+        let procedures: Vec<u32> = code
+            .iter()
+            .filter_map(|&va| {
+                let data = self.map.slice_from_va(va, NativeEventThunk::SIZE).ok()?;
+                NativeEventThunk::parse(data, va).map(|thunk| thunk.handler_va)
+            })
+            .collect();
+        code.extend(procedures);
+        code.extend(
+            self.unwind_records()
+                .iter()
+                .map(|procedure| procedure.procedure_va),
+        );
+        code.remove(&0);
+        code
+    }
+
+    /// Returns every native procedure that stores an unwind record, with
+    /// the record: [`ProcedureUnwind::scan`] over
+    /// [`native_code_range`](Self::native_code_range). This finds the
+    /// procedures no table names (a module's private ones, reached only by
+    /// direct calls) along with the rest. Empty for a P-Code build.
+    pub fn unwind_records(&self) -> Vec<ProcedureUnwind<'a>> {
+        self.native_code_range()
+            .map(|range| ProcedureUnwind::scan(&self.map, range))
+            .unwrap_or_default()
+    }
+
+    /// The other entry of the two-entry stub with an entry at `va`: a P-Code
+    /// method stub's method entry at +7 or its first entry 7 bytes before,
+    /// or a native adjustor thunk's (`sub [esp+4], imm32; jmp rel32`) bare
+    /// jump at +8 or its first entry 8 bytes before.
+    fn dual_entry_partner(&self, va: u32) -> Option<u32> {
+        let method_entry = |at: u32| {
+            self.map
+                .slice_from_va(at, EventHandlerThunk::SIZE)
+                .ok()
+                .and_then(|data| EventHandlerThunk::parse_from_event_entry(data, at))
+                .map(|thunk| thunk.method_entry_va)
+        };
+        let jump_entry = |at: u32| {
+            self.map
+                .slice_from_va(at, NativeEventThunk::SIZE)
+                .ok()
+                .and_then(|data| NativeEventThunk::parse(data, at))
+                .and_then(|_| at.checked_add(NativeEventThunk::JUMP_OFFSET))
+        };
+        let back = |offset: u32, entry: &dyn Fn(u32) -> Option<u32>| {
+            let start = va.checked_sub(offset)?;
+            (entry(start)? == va).then_some(start)
+        };
+        method_entry(va)
+            .or_else(|| jump_entry(va))
+            .or_else(|| {
+                back(
+                    u32::try_from(EventHandlerThunk::METHOD_ENTRY_OFFSET).ok()?,
+                    &method_entry,
+                )
+            })
+            .or_else(|| back(NativeEventThunk::JUMP_OFFSET, &jump_entry))
+    }
+
+    /// Returns the range of the project's native procedures: from the end of
+    /// the marker [`ProjectData::code_start_va`] names to the marker
+    /// [`ProjectData::code_end_va`] names. Empty for a P-Code build, whose
+    /// region is the start marker alone; `None` when either marker is not
+    /// where its field points.
+    pub fn native_code_range(&self) -> Option<Range<u32>> {
+        let start = self.project_data.code_start_va().ok()?;
+        let end = self.project_data.code_end_va().ok()?;
+        let at = |va: u32, len: usize| self.map.slice_from_va(va, len).ok();
+        let opens = at(start, 16)?.get(..4)? == [0xE9; 4];
+        let closes = at(end, 4)?.get(..4)? == [0x9E; 4];
+        let first = start.checked_add(16)?;
+        (opens && closes && first <= end).then_some(first..end)
     }
 
     /// Returns the VA of the [`VbHeader`] structure in the PE image.
@@ -940,6 +1228,117 @@ impl<'a> VbProject<'a> {
         })
     }
 
+    /// Lists every pointer to a parameter, event parameter, public variable
+    /// or implemented interface name, with the structure it belongs to.
+    ///
+    /// Three pointer arrays per object refer to these names: the
+    /// [`FuncTypDesc::param_names_va`] arrays of its procedures, those of
+    /// its events' prototypes ([`VbObject::event_type_descs`]), and its
+    /// [`MemberDesc`]s ([`VbObject::members`]). In every fixture they
+    /// account for every pointer to every string of the ProjectInfo2 name
+    /// area ([`read_name_strings`](crate::vb::projectinfo2::read_name_strings)),
+    /// and for the names past where that walk stops (`members`: `Count`,
+    /// `IFirst`, `Value`, `Amount`, ...). The compiler stores one string per
+    /// spelling, so a name can have several references (`extender`: the
+    /// nine controls' `Event Ping(ByVal N)` share one `N`). Property and
+    /// method names are not among them: those are in the
+    /// [method names table](crate::vb::object::PublicObjectDescriptor::method_names_va).
+    ///
+    /// The order is by object, then procedures, events and members.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an object cannot be parsed or its private object
+    /// descriptor's arrays cannot be read.
+    pub fn name_references(&self) -> Result<Vec<NameReference<'a>>, Error> {
+        let mut refs = Vec::new();
+        for (object, obj) in self.objects()?.enumerate() {
+            let obj = obj?;
+            let object = u16::try_from(object).unwrap_or(u16::MAX);
+            for (method, ftd) in obj.func_type_descs()? {
+                self.push_param_refs(&mut refs, &ftd, |index| NameOwner::Parameter {
+                    object,
+                    method,
+                    index,
+                });
+            }
+            for (event, ftd) in obj.event_type_descs()? {
+                self.push_param_refs(&mut refs, &ftd, |index| NameOwner::EventParameter {
+                    object,
+                    event,
+                    index,
+                });
+            }
+            let Some(private) = obj.private_object() else {
+                continue;
+            };
+            let array_va = private.member_descs_va()?;
+            for member in 0..private.member_count()? {
+                let entry_va = array_va.wrapping_add(u32::from(member).saturating_mul(4));
+                let Some(desc_va) = self.read_va(entry_va).filter(|&va| va != 0) else {
+                    continue;
+                };
+                let Ok(desc) = self
+                    .map
+                    .slice_from_va(desc_va, MemberDesc::MIN_SIZE)
+                    .and_then(MemberDesc::parse)
+                else {
+                    continue;
+                };
+                let (Ok(name_va), Ok(kind)) = (desc.name_va(), desc.kind()) else {
+                    continue;
+                };
+                if let Ok(name) = self.read_string_at_va(name_va) {
+                    refs.push(NameReference {
+                        pointer_va: desc_va,
+                        name_va,
+                        name,
+                        owner: NameOwner::Member {
+                            object,
+                            member,
+                            kind,
+                        },
+                    });
+                }
+            }
+        }
+        Ok(refs)
+    }
+
+    /// Appends a reference per named parameter of `ftd`.
+    fn push_param_refs(
+        &self,
+        refs: &mut Vec<NameReference<'a>>,
+        ftd: &FuncTypDesc<'_>,
+        owner: impl Fn(u8) -> NameOwner,
+    ) {
+        let Ok(base) = ftd.param_names_va() else {
+            return;
+        };
+        if base == 0 {
+            return;
+        }
+        for index in 0..ftd.arg_count() {
+            let pointer_va = base.wrapping_add(u32::from(index).saturating_mul(4));
+            let Some(name_va) = self.read_va(pointer_va).filter(|&va| va != 0) else {
+                continue;
+            };
+            if let Ok(name) = self.read_string_at_va(name_va) {
+                refs.push(NameReference {
+                    pointer_va,
+                    name_va,
+                    name,
+                    owner: owner(index),
+                });
+            }
+        }
+    }
+
+    /// Reads the DWORD at `va`.
+    fn read_va(&self, va: u32) -> Option<u32> {
+        read_u32_le(self.map.slice_from_va(va, 4).ok()?, 0).ok()
+    }
+
     /// Reads a null-terminated string at the given VA.
     ///
     /// # Errors
@@ -952,6 +1351,61 @@ impl<'a> VbProject<'a> {
         let offset = self.map.va_to_offset(va)?;
         read_cstr(self.map.file(), offset)
     }
+}
+
+/// The structure field that points at a name: see
+/// [`VbProject::name_references`].
+///
+/// `object` is the object's index in the object table, `method` its method
+/// table slot, `event` the index of its `Event` declaration and `member`
+/// the index in its member array (see [`VbObject::members`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameOwner {
+    /// Parameter `index` of a procedure: an entry of its
+    /// [`FuncTypDesc::param_names_va`] array.
+    Parameter {
+        /// Object index.
+        object: u16,
+        /// Method table slot of the procedure.
+        method: u32,
+        /// Parameter index.
+        index: u8,
+    },
+    /// Parameter `index` of an `Event` declaration: an entry of the
+    /// [`FuncTypDesc::param_names_va`] array of the event's prototype (see
+    /// [`VbObject::event_type_descs`]).
+    EventParameter {
+        /// Object index.
+        object: u16,
+        /// Index of the event, in declaration order.
+        event: u32,
+        /// Parameter index.
+        index: u8,
+    },
+    /// A public variable or an `Implements`: the
+    /// [`MemberDesc::name_va`] field.
+    Member {
+        /// Object index.
+        object: u16,
+        /// Index in the object's member array.
+        member: u16,
+        /// Variable, `WithEvents` variable or `Implements`.
+        kind: MemberKind,
+    },
+}
+
+/// A name and the pointer to it: see [`VbProject::name_references`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NameReference<'a> {
+    /// VA of the pointer: the parameter name array entry or the
+    /// [`MemberDesc`].
+    pub pointer_va: u32,
+    /// VA of the name.
+    pub name_va: u32,
+    /// The name's bytes, without the terminating NUL.
+    pub name: &'a [u8],
+    /// The structure the pointer belongs to.
+    pub owner: NameOwner,
 }
 
 /// Iterator over the project's external table.

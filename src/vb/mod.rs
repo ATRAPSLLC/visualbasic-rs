@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! PE Entry Point
-//!   └─ push <VA>  →  VbHeader (0x68 bytes)
+//!   └─ push <VA>  →  VbHeader (0x78 bytes)
 //!                       ├─ lpProjectData  →  ProjectData (0x23C bytes)
 //!                       │                      ├─ lpObjectTable  →  ObjectTable (0x54 bytes)
 //!                       │                      │                      └─ lpObjectArray  →  PublicObjectDescriptor[] (0x30 each)
@@ -20,7 +20,8 @@
 //!                       │                      │                           │                     ├─ lpConstants  →  Constant pool
 //!                       │                      │                           │                     └─ lpPrivateObject  →  PrivateObjectDescriptor (0x40 bytes)
 //!                       │                      │                           │                           ├─ lpFuncTypDescs  →  FuncTypDesc pointer array
-//!                       │                      │                           │                           └─ lpParamNames  →  Parameter name strings
+//!                       │                      │                           │                           ├─ lpMemberDescs  →  MemberDesc pointer array
+//!                       │                      │                           │                           └─ lpEventDescs  →  event FuncTypDesc pointer array
 //!                       │                      │                           └─ [if flag 0x01]  →  OptionalObjectInfo (0x40 bytes)
 //!                       │                      │                                 ├─ lpControls  →  ControlInfo[] (0x28 each)
 //!                       │                      │                                 └─ wPCodeCount, event offsets
@@ -66,12 +67,15 @@ pub mod formdata;
 pub mod functype;
 pub mod guitable;
 pub mod header;
+pub mod member;
+pub mod native;
 pub mod object;
 pub mod objecttable;
+pub mod pooldesc;
 pub mod privateobj;
 pub mod procedure;
 pub mod projectdata;
 pub mod projectinfo2;
 pub mod property;
 pub mod publicbytes;
-pub mod varstub;
+pub mod typeref;

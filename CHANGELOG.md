@@ -6,6 +6,200 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-09
+
+Every name of the ProjectInfo2 name area now has an owner: the private
+object descriptor's +0x20 and +0x24 arrays, misread as a method name table
+and a parameter name table, describe an object's public variables and
+implemented interfaces, and its events' prototypes.
+
+### Added
+
+- **Structure extents** (`extents`): `VbProject::structure_extents`
+  states the extent of every structure the crate reads (`StructureExtent`,
+  `StructureKind`), each measured by the walk that reads it: the headers
+  and tables, each object's descriptors, method, method link, GUID and
+  control tables, event sinks and DISPID maps, prototypes, members, record
+  layouts, constant pools and the data their entries name, procedure
+  descriptors with their line tables, P-Code, the external and component
+  tables, form data, COM registration data, the code markers, and native
+  procedures' unwind records with their tables. Native stubs and procedures
+  are never an extent.
+- **Pool entry roles**: `Instruction::pool_references` lists every constant
+  pool entry an instruction names with what its opcode says it holds
+  (`PoolReference`, `PoolEntryRole`).
+- **Pool descriptors** (`vb::pooldesc`): `RecordIoDescriptor` (the
+  recursive descriptor `Get #` and `Put #` of a record read, with
+  `RecordIoEntry`, `RecordIoKind`), `IoItems` (the item list of `Print`,
+  `Write` and `Input`, with `IoItem`, `IoSeparator`), `ArrayDescriptor`
+  (the `SAFEARRAY` header of a fixed array in a record) and
+  `CreationDescriptor` (what `New` creates when it is not a project class).
+- **Record layouts of an object's `Type`s**: `VbObject::record_layouts`.
+- **DISPID maps**: `ControlInfo::{dispid_map, dispid_map_count,
+  dispid_map_va}` read the `{source DISPID, handler MEMID}` pairs
+  (`DispidMapping`) of a `WithEvents` variable's or an `Implements`' entry;
+  `ControlInfo::sink_slots` gives its event sink vtable's slot count.
+- `MethodLinkKind::Variable::pushed`: the pool index and pool VA a `New`
+  variable's accessor pushes.
+- `VbObject::interface_iid_va`: the IID the compiler writes before an
+  object's CLSID.
+- `VbHeader::reserved_guid`, `TypeLibRef::flags`, `RecordLayout::ansi_size`,
+  `ExternalDeclareInfo::BLOCK_SIZE`, `FuncTypDesc::size`, `MemberDesc::size`,
+  `EventSinkVtable::size`, `ProcDscInfo::extent_size` (with the line-number
+  table), `ProjectInfo2Iter::position`.
+- Fixtures `records` (record I/O, arrays in records, record arrays, `For
+  Each` into a typed variable) and `udts` (`Public` and `Private` `Type`s of
+  classes).
+- **Member descriptors** (`vb::member`): `MemberDesc` reads a public
+  variable's or an `Implements`' name, DISPID, accessor vtable offset,
+  instance offset and type (with the class's or interface's `ObjectInfo`
+  VA); `MemberKind` tells variables, `WithEvents` variables and
+  `Implements` apart. `VbObject::members` walks an object's array, so its
+  public variables and their count are recoverable.
+- **Event prototypes**: `VbObject::event_type_descs` yields the
+  `FuncTypDesc` of each `Event` declaration, with its parameter names.
+- **Name ownership**: `VbProject::name_references` lists every pointer to a
+  parameter, event parameter, variable or interface name with its owner
+  (`NameOwner`), including the names past where the ProjectInfo2 walk
+  stops.
+- **Control kinds**: `ControlInfo::kind` (`ControlKind::{Control,
+  WithEvents, Implements}`, from the flags at +0x00, documented as always
+  0x0040 before), `ControlInfo::{dispatch_slots, event_count}`;
+  `EventSinkVtable::{dispatch_va, dispatch_slots}` read a dual sink's
+  `IDispatch` slots.
+- **Type references** (`vb::typeref`): `TypeLibRef` (a type library's GUID,
+  version, LCID, path and name), `InterfaceRef` (an interface's library and
+  IID) and `RecordRef` (a user-defined type's library, GUID, version and
+  LCID). `ArgType::{interface, record}` read the descriptor of an interface
+  (codes 0x1C, 0x1D) or record (0x14) type; `ArgType::{IUNKNOWN,
+  INTERFACE}` name the interface codes.
+- **UDT layouts and array element types** (`vb::controlprop`):
+  `RecordLayout` reads a user-defined type's size and the members that need
+  init or cleanup; `ControlPropertyEntry::{record_layout_va,
+  element_layout_va, record_layout}` name it from a UDT member or an array
+  of UDTs, `element_type` and `safearray_{offset, features, iid_va,
+  vartype}` read an array's element type, inline `SAFEARRAY` descriptor and
+  the IID or `VARTYPE` after it.
+- `ProjectInfo2::object_descs` reads the per-object PrivateObjectDescriptor
+  array.
+- `VbProject::export_stubs` decodes an ActiveX DLL's or OCX's COM export
+  stubs (`entrypoint::ExportStub`): the VBHeader and `.data` VAs each
+  pushes and the `VBDll*` runtime function it jumps to.
+- **Native unwind records** (`vb::native`): `ProcUnwindInfo` reads the
+  record a native procedure's prologue stores in its frame, in all four
+  sizes: the addresses of the code that releases its `Me`, its variables
+  and its statement's temporaries when it unwinds, and of its error
+  handling's tables, `ErrorHandlerTable` (each `On Error GoTo` label,
+  `ErrorHandler`), `ResumeTable` (each statement's address, for `Resume`
+  and `Resume Next`) and `LineNumberTable` (each statement's line number,
+  for `Erl`). `ProcUnwindInfo::from_prologue` finds the record from the
+  procedure's start, `ProcUnwindInfo::code_vas` lists the code it names,
+  and `VbProject::unwind_records` (`ProcedureUnwind::scan`) finds every
+  procedure that stores one, including those no table names.
+- **Native code**: `VbProject::native_entries` lists every address of
+  native code the project's structures name (the entry point and its stub
+  target, export stubs, entry stubs, method link thunks and targets, event
+  sink thunks and handlers, pool stubs, dual-entry partners, the procedures
+  adjustor thunks enter and every procedure that stores an unwind record);
+  `VbProject::native_code_range` gives the region between the code markers
+  `ProjectData::{code_start_va, code_end_va}` name, empty for a P-Code
+  build; `VbProject::entry_point_va` and `entrypoint::entry_stub_target`
+  decode the PE entry point's stub (an executable's `push imm32; call` and
+  a DLL's `pop edx; push imm32; push imm32; push edx; jmp`).
+  `NativeEventThunk::JUMP_OFFSET` is the bare jump of a native adjustor
+  thunk.
+- `ExportSignature::noreturn` (a sixth column of the export table): the
+  runtime functions that never return to their caller (`__vbaError`,
+  `__vbaErrorOverflow`, `__vbaGenerateBoundsError`, `__vbaFailedFriend`,
+  `__vbaFPException`, `__vbaEnd`, `__vbaStopExe`, `rtcAppleScript`,
+  `ThunRTMain`).
+- Fixture `errors-native`: error handling compiled to native code, each
+  procedure varying one table of its unwind record.
+- `CodeEntry::target_va`: a native build's event handler stub enters the
+  procedure at this VA (a native class has no method table to index).
+- **Event names**: `VbObject::event_names` names each `Event` declaration
+  from the project's type library (`VbProject::type_library_bytes`, the
+  `TYPELIB` resource of an ActiveX DLL, OCX or EXE), matching the event's
+  DISPID in the events dispinterface. A Standard EXE has no type library:
+  its event names are pooled strings no structure points to, and stay
+  unnamed.
+- Fixture `eventnames`: classes sharing member and event name spellings.
+- Fixture `typerefs`: an ActiveX DLL with interface- and UDT-typed members,
+  parameters and return values, and `WithEvents` variables of a project
+  class and of a `TextBox`.
+- **Late-bound calls by DISPID resolve**: `Callee::Late` carries the
+  member its DISPID names (`LateTarget`) when the receiver's class is
+  known: a project UserControl's procedure, a hosted ActiveX control's
+  member, or the control extender's (`_VBControlExtender`, whose members
+  the compiler calls 0x3000 below the DISPIDs it declares,
+  `RuntimeInterfaces::{CONTROL_EXTENDER, extender_member}`).
+  `InterfaceCatalog::dispatched` describes a member by DISPID (empty by
+  default); `InvokeKind::{of_late_call, admits}` tell how a late-bound
+  opcode invokes its member, `InvokeKind::accessor_prefix` the name COM
+  gives the accessor.
+- **Hosted controls name their class**: `FormControlRecord::{prog_id,
+  prog_id_bytes}` read the ProgID a hosted control's record begins with,
+  with or without an event handler; a form's getter for the control
+  returns its class's default interface
+  (`CallResolver::returned_interface`), and the getter of a control array
+  of one its elements' (`CallResolver::returned_elements`), which
+  `SlotInterfaces` gives to the slot the array's `Item`
+  (`RuntimeInterfaces::CONTROL_ARRAY_ITEM`) writes.
+
+### Changed
+
+- `PrivateObjectDescriptor::{var_stub_count, var_stubs_va}` are now
+  `record_layout_count` and `record_layouts_va`: the array holds the record
+  layouts of the object's `Type` declarations.
+- `ControlInfo::{dispid_count_or_zero, dispid_table_va}` are now
+  `dispid_map_count` (the u16 at +0x10) and `dispid_map_va`: the map is on
+  disk, not filled at runtime.
+- `VbHeader::SIZE` is 0x78 and `TypeLibRef::SIZE` 0x28, the sizes the
+  compiler writes.
+- `ControlPropertyEntry::{record_layout_va, element_layout_va}` return
+  `None` for 0 and 0xFFFFFFFF, which a UDT with no member to initialize or
+  release holds.
+- Depends on `msft-typelib` 0.2.0 to read the embedded type library.
+- `PrivateObjectDescriptor::method_name_table_va` is now `member_descs_va`
+  and `param_names_va` is now `event_descs_va`.
+- `read_name_strings` documents what its strings are (parameter, event
+  parameter, variable and interface names) and where its walk stops.
+- `EventSinkVtable::parse` takes the entry's `ControlInfo`.
+- `InterfaceMetadata` is now `vb::typeref::TypeLibRef`, with
+  `ControlTypeEntry::typelib_va` and `typelib` for `interface_metadata_va`
+  and `interface_metadata`; its fields at +0x08 and +0x0C, documented as
+  always 6 and 9, are the library's version and LCID (`MSMask` 1.1, LCID 0).
+- `ArgType::object_va` is now `descriptor_va`: for an interface or record
+  type it is not an object.
+- `FuncTypDesc::dispid` returns the whole DISPID as an `i32`, the four
+  bytes at +0x0C (0x60030000 plus the index for a Sub or Function,
+  0x68030000 for a property procedure, an event's number from 1), which
+  is what a late-bound caller names the member by; it read only the low
+  word.
+
+### Removed
+
+- `vb::varstub` (`VarStubDesc`, `VarStubIter`) and `VbObject::{var_stubs,
+  var_stub_count}`: no structure of that format exists; the array they read
+  is the record layouts of the object's `Type`s.
+- `InterfaceMetadata::{dispatch_names, all_dispatch_names}`: the first read
+  the library name, now `TypeLibRef::name`; the second scanned 4 KiB past
+  it for identifier-like strings that belong to other structures.
+
+### Fixed
+
+- `EventSinkVtable` of an `Implements` entry spans its four trailing zero
+  slots: every sink is `0x0C + 4 * (slots + 3)` bytes, `+ 7` with flag bit
+  0x08.
+- The event handlers of a `WithEvents` variable: its sink vtable is a dual
+  interface's, with four `IDispatch` slots before the handlers, and
+  `VbControl::event_handler_va`, `EventSinkVtable::handler_va`,
+  `VbObject::events` and `VbObject::code_entries` read those slots as the
+  first handlers (`Listener.m_Source` gave the `IDispatch` thunks for
+  `Started`, `Ticked` and `Named`). An `Implements` sink has the same four
+  slots, which its handler count included: they no longer appear as event
+  handlers.
+
 ## [0.4.0] - 2026-10-08
 
 P-Code analysis: the opcode table covers every handler of `MSVBVM60.DLL`
@@ -493,7 +687,8 @@ Affects `vbobject.rs`, `pcodemethod.rs`, `methodlink.rs`,
 
 Initial public release.
 
-[Unreleased]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.0...v0.3.1

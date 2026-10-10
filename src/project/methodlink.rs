@@ -96,6 +96,13 @@ pub enum MethodLinkKind {
         offset: u32,
         /// VA of the import thunk the accessor jumps through.
         thunk_va: u32,
+        /// The two values a `New` or `WithEvents` variable's accessor pushes
+        /// for the runtime, in push order; `None` for the other variables'
+        /// accessors, which push nothing. For a `New` variable
+        /// (`GetMemNewObj`, `PutMemNewObj`, `SetMemNewObj`) they are the
+        /// constant pool index of what to create and the pool's VA
+        /// (`members` `Holder.Auto As New Collection`: 0 and 0x00401F6C).
+        pushed: Option<[u32; 2]>,
     },
     /// An `E9 rel32` jump to [`MethodLink::code_va`].
     Jump,
@@ -120,15 +127,15 @@ impl MethodLinkKind {
                 o2,
                 o3,
                 0x68,
-                _,
-                _,
-                _,
-                _,
+                a0,
+                a1,
+                a2,
+                a3,
                 0x68,
-                _,
-                _,
-                _,
-                _,
+                b0,
+                b1,
+                b2,
+                b3,
                 0x50,
                 0xB9,
                 t0,
@@ -138,8 +145,15 @@ impl MethodLinkKind {
                 0xFF,
                 0xE1,
                 ..,
-            ]
-            | [
+            ] => Self::Variable {
+                offset: u32::from_le_bytes([*o0, *o1, *o2, *o3]),
+                thunk_va: u32::from_le_bytes([*t0, *t1, *t2, *t3]),
+                pushed: Some([
+                    u32::from_le_bytes([*a0, *a1, *a2, *a3]),
+                    u32::from_le_bytes([*b0, *b1, *b2, *b3]),
+                ]),
+            },
+            [
                 0x81,
                 0x44,
                 0x24,
@@ -159,6 +173,7 @@ impl MethodLinkKind {
             ] => Self::Variable {
                 offset: u32::from_le_bytes([*o0, *o1, *o2, *o3]),
                 thunk_va: u32::from_le_bytes([*t0, *t1, *t2, *t3]),
+                pushed: None,
             },
             [0xE9, ..] => Self::Jump,
             _ => Self::Other,

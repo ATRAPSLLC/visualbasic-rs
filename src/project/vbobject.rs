@@ -6,7 +6,7 @@
 //! (the array entry), an [`ObjectInfo`] with method/constant table pointers,
 //! an optional [`OptionalObjectInfo`] (controls, method links, vtable
 //! layout), and an optional [`PrivateObjectDescriptor`] (function type
-//! descriptors, parameter name tables).
+//! descriptors, member and event descriptors).
 //!
 //! [`VbObject`] ties these structures together and provides iterators over
 //! methods, controls, and method link thunks.
@@ -16,6 +16,8 @@ use std::{
     collections::{HashMap, HashSet},
     str,
 };
+
+use msft_typelib::TypeLib;
 
 use crate::{
     addressmap::AddressMap,
@@ -28,17 +30,18 @@ use crate::{
     vb::{
         constantpool::ConstantPool,
         control::Guid,
+        controlprop::RecordLayout,
         designer::Designer,
         eventname,
-        events::EventHandlerThunk,
+        events::{EventHandlerThunk, NativeEventThunk},
         flags::ObjectTypeFlags,
         formdata::{FormControlType, FormDataParser},
         functype::FuncTypDesc,
         guitable::GuiTableEntry,
+        member::MemberDesc,
         object::{GuidTableIter, ObjectInfo, OptionalObjectInfo, PublicObjectDescriptor},
         privateobj::PrivateObjectDescriptor,
         publicbytes::ClassFormPublicBytes,
-        varstub::VarStubIter,
     },
 };
 
@@ -156,8 +159,8 @@ pub enum Instancing {
 /// A single VB6 object (form, module, class) within the project.
 ///
 /// Provides access to the object's descriptor, info, optional info,
-/// and private object descriptor (which contains function type
-/// descriptors and parameter name tables).
+/// and private object descriptor (which contains function type,
+/// member and event descriptors).
 ///
 /// Holds a reference to the parent [`VbProject`] so all accessor methods
 /// can resolve VAs without requiring the project as a parameter.
@@ -300,7 +303,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
 
     /// Returns the [`PrivateObjectDescriptor`] if present.
     ///
-    /// Contains function type descriptors and parameter name tables. Not
+    /// Contains function type, member and event descriptors. Not
     /// available for standard modules (BAS files) - those have
     /// `private_object_va == 0xFFFFFFFF`.
     #[inline]
@@ -324,26 +327,6 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
     /// method count cannot be read.
     pub fn public_func_count(&self) -> Result<u32, Error> {
         Ok(u32::try_from(self.func_type_descs()?.count()).unwrap_or(u32::MAX))
-    }
-
-    /// The private object descriptor's
-    /// [`var_stub_count`](PrivateObjectDescriptor::var_stub_count), or 0 if
-    /// no private object descriptor is available.
-    ///
-    /// It is 0 in every fixture, including `data`'s `Item`, which declares
-    /// `Public Name As String`, so it does not count public variables; what
-    /// it counts is unconfirmed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the underlying PrivateObjectDescriptor field
-    /// cannot be read.
-    #[inline]
-    pub fn var_stub_count(&self) -> Result<u32, Error> {
-        match self.private_object.as_ref() {
-            Some(p) => Ok(u32::from(p.var_stub_count()?)),
-            None => Ok(0),
-        }
     }
 
     /// Reads the object name as a lossy UTF-8 string.
@@ -845,6 +828,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                         stub_va: stub_by_dsc.get(&proc_dsc_va).copied(),
                         proc_dsc_va: Some(proc_dsc_va),
                         pcode_size: Some(pcode_size),
+                        target_va: None,
                     });
                 }
                 MethodEntry::Native { va } => {
@@ -860,6 +844,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                         stub_va: None,
                         proc_dsc_va: None,
                         pcode_size: None,
+                        target_va: None,
                     });
                 }
                 MethodEntry::Null | MethodEntry::Declare | MethodEntry::Runtime { .. } => {}
@@ -893,6 +878,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                 stub_va,
                 proc_dsc_va,
                 pcode_size: None,
+                target_va: None,
             });
         }
 
@@ -955,6 +941,11 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                     .ok()
                     .and_then(|data| EventHandlerThunk::parse_from_event_entry(data, handler_va))
                     .map(|thunk| thunk.proc_dsc_info_va);
+                let target_va = map
+                    .slice_from_va(handler_va, NativeEventThunk::SIZE)
+                    .ok()
+                    .and_then(|data| NativeEventThunk::parse(data, handler_va))
+                    .map(|thunk| thunk.handler_va);
                 entries.push(CodeEntry {
                     va: handler_va,
                     kind: CodeEntryKind::EventHandler,
@@ -964,6 +955,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                     stub_va: None,
                     proc_dsc_va,
                     pcode_size: None,
+                    target_va,
                 });
             }
         }
@@ -1168,6 +1160,28 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
             .and_then(|opt| opt.resolve_clsid(self.project.address_map()))
     }
 
+    /// Returns the VA of the 16-byte GUID the compiler writes right before
+    /// the object's CLSID ([`OptionalObjectInfo::object_clsid_va`]), when
+    /// it is one.
+    ///
+    /// For a form, UserControl, PropertyPage or UserDocument it is the IID
+    /// of the object's own interface, which a `VCallHresult` through the
+    /// object names (`controls` `Form1`); for one class module of a project
+    /// with classes it is the IID of the runtime's `_DClass`
+    /// (`{FCFB3D2B-A0FA-1068-A738-08002B3371B5}`), taken by its value.
+    /// `None` for a module and any other class.
+    pub fn interface_iid_va(&self) -> Option<u32> {
+        /// The IID of `_DClass`.
+        const DCLASS: [u8; 16] = [
+            0x2B, 0x3D, 0xFB, 0xFC, 0xFA, 0xA0, 0x68, 0x10, 0xA7, 0x38, 0x08, 0x00, 0x2B, 0x33,
+            0x71, 0xB5,
+        ];
+        let clsid = self.optional_info.as_ref()?.object_clsid_va().ok()?;
+        let va = clsid.checked_sub(16).filter(|_| clsid != 0)?;
+        let bytes = self.project.address_map().slice_from_va(va, 16).ok()?;
+        (self.designer().is_some() || bytes.get(..16) == Some(&DCLASS[..])).then_some(va)
+    }
+
     /// Returns an iterator over GUI GUIDs for this object.
     ///
     /// Delegates to [`OptionalObjectInfo::gui_guids`]. Returns an empty
@@ -1233,34 +1247,142 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
         })
     }
 
-    /// Returns an iterator over [`VarStubDesc`](crate::vb::varstub::VarStubDesc) entries.
+    /// Returns an iterator over the prototypes of the object's `Event`
+    /// declarations, in declaration order.
     ///
-    /// Walks the pointer array at [`PrivateObjectDescriptor::var_stubs_va`].
-    /// Returns an empty iterator if no private object descriptor is present
-    /// or if there are no variable stubs.
+    /// Walks the [`PrivateObjectDescriptor::event_descs_va`] array, yielding
+    /// `(event index, FuncTypDesc)`. Each descriptor's
+    /// [`param_names`](FuncTypDesc::param_names) are the event's parameter
+    /// names (`ocx` `Knob`: `Turned(Position, Delta)`). Empty without a
+    /// private object descriptor or events.
     ///
     /// # Errors
     ///
-    /// Returns an error if the private object descriptor's `var_stubs_va`
-    /// or `var_stub_count` cannot be read.
-    pub fn var_stubs(&self) -> Result<VarStubIter<'a>, Error> {
-        let (stubs_va, count) = match self.private_object.as_ref() {
-            Some(p) => {
-                let va = p.var_stubs_va()?;
-                let cnt = p.var_stub_count()?;
-                if va != 0 && cnt > 0 {
-                    (va, cnt)
-                } else {
-                    (0, 0)
-                }
-            }
+    /// Returns an error if the private object descriptor's event array VA
+    /// or count cannot be read.
+    pub fn event_type_descs(&self) -> Result<FuncTypDescIter<'a, 'p>, Error> {
+        let (va, total) = match self.private_object.as_ref() {
+            Some(p) => (p.event_descs_va()?, u32::from(p.event_count()?)),
             None => (0, 0),
         };
-        Ok(VarStubIter::new(
-            self.project.address_map(),
-            stubs_va,
-            count,
-        ))
+        Ok(FuncTypDescIter {
+            map: self.project.address_map(),
+            ftd_array_va: va,
+            index: 0,
+            total: if va == 0 { 0 } else { total },
+        })
+    }
+
+    /// Returns the names of the object's `Event` declarations, in
+    /// declaration order (the order of [`event_type_descs`](Self::event_type_descs)).
+    ///
+    /// The names come from the project's embedded type library
+    /// ([`VbProject::type_library_bytes`]): the dispinterface whose GUID is
+    /// the object's events IID ([`events_iids`](Self::events_iids)) names
+    /// each event by its DISPID, which the event's prototype carries
+    /// ([`FuncTypDesc::dispid`]). `ocx` `Knob`: `Turned`, `Reset`. An event
+    /// is `None` when the project has no type library, as in a Standard EXE:
+    /// there the compiler writes the names into its string pool with no
+    /// pointer to them and shares each spelling between objects
+    /// (`eventnames`: `Second`'s property `N` is `First`'s string, `Third`'s
+    /// method `Pong` is `Second`'s event name), so nothing ties a name to its
+    /// event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the private object descriptor's event array
+    /// cannot be read.
+    pub fn event_names(&self) -> Result<Vec<Option<&'a str>>, Error> {
+        let dispids: Vec<Option<i32>> = self
+            .event_type_descs()?
+            .map(|(_, ftd)| ftd.dispid().ok())
+            .collect();
+        if dispids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names = self
+            .project
+            .type_library_bytes()
+            .and_then(|bytes| TypeLib::parse(bytes).ok())
+            .and_then(|lib| self.events_interface_names(&lib))
+            .unwrap_or_default();
+        Ok(dispids
+            .into_iter()
+            .map(|dispid| names.get(&dispid?).copied())
+            .collect())
+    }
+
+    /// The member names, by DISPID, of the type library's interface whose
+    /// GUID is one of the object's events IIDs.
+    fn events_interface_names(&self, lib: &TypeLib<'a>) -> Option<HashMap<i32, &'a str>> {
+        let iids: Vec<Guid> = self.events_iids().map(|(_, iid)| iid).collect();
+        (0..lib.typeinfo_count()).find_map(|index| {
+            let ti = lib.typeinfo(index).ok()?;
+            let guid = lib.guid(ti.guid_offset())?;
+            iids.iter()
+                .any(|iid| iid.bytes[..] == *guid.as_bytes())
+                .then(|| {
+                    (0..usize::from(ti.func_count()))
+                        .filter_map(|k| Some((lib.func_memid(&ti, k)?, lib.func_name(&ti, k)?)))
+                        .collect()
+                })
+        })
+    }
+
+    /// Returns an iterator over the object's public variables and
+    /// implemented interfaces.
+    ///
+    /// Walks the [`PrivateObjectDescriptor::member_descs_va`] array (one
+    /// entry per [`member_count`](PrivateObjectDescriptor::member_count)),
+    /// yielding `(member index, MemberDesc)` and skipping the null entries
+    /// of `Private` variables. [`MemberDesc::kind`] tells a `Public`
+    /// variable from an `Implements`, so the object's public variables are
+    /// the members that are not [`MemberKind::Implements`](crate::vb::member::MemberKind::Implements)
+    /// (`members` `Holder`: 13, `Mixed`: `Value`, `Note`, `Shown`; `data`
+    /// `Item`: `Name`). Empty for a standard module.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the private object descriptor's member array VA
+    /// or count cannot be read.
+    pub fn members(&self) -> Result<MemberIter<'a, 'p>, Error> {
+        let (va, total) = match self.private_object.as_ref() {
+            Some(p) => (p.member_descs_va()?, p.member_count()?),
+            None => (0, 0),
+        };
+        Ok(MemberIter {
+            map: self.project.address_map(),
+            array_va: va,
+            index: 0,
+            total: if va == 0 { 0 } else { total },
+        })
+    }
+
+    /// Returns the record layouts of the object's `Type` declarations, in
+    /// declaration order, each with its VA: the
+    /// [`PrivateObjectDescriptor::record_layouts_va`] array.
+    ///
+    /// Empty for an object that declares no `Type` and for a standard
+    /// module, which has no private object descriptor. A layout that does
+    /// not read is left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the private object descriptor's array VA or count
+    /// cannot be read.
+    pub fn record_layouts(&self) -> Result<Vec<(u32, RecordLayout<'a>)>, Error> {
+        let Some(private) = self.private_object.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let (array_va, count) = (private.record_layouts_va()?, private.record_layout_count()?);
+        let map = self.project.address_map();
+        Ok((0..u32::from(count))
+            .filter_map(|index| {
+                let slot = array_va.checked_add(index.checked_mul(4)?)?;
+                let va = read_u32_le(map.slice_from_va(slot, 4).ok()?, 0).ok()?;
+                Some((va, RecordLayout::at(map, va).ok()?))
+            })
+            .collect())
     }
 }
 
@@ -1306,6 +1428,40 @@ impl<'a, 'p> Iterator for FuncTypDescIter<'a, 'p> {
     }
 }
 
+/// Iterator over the [`MemberDesc`]s of a [`PrivateObjectDescriptor`]'s
+/// member array.
+///
+/// Created by [`VbObject::members`]. Yields `(member index, MemberDesc)`;
+/// null entries (`Private` variables) are skipped.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct MemberIter<'a, 'p> {
+    map: &'p AddressMap<'a>,
+    array_va: u32,
+    index: u16,
+    total: u16,
+}
+
+impl<'a, 'p> Iterator for MemberIter<'a, 'p> {
+    type Item = (u16, MemberDesc<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.total {
+            let i = self.index;
+            self.index = self.index.saturating_add(1);
+            let ptr_va = self.array_va.wrapping_add(u32::from(i).saturating_mul(4));
+            let desc_va = read_u32_le(self.map.slice_from_va(ptr_va, 4).ok()?, 0).ok()?;
+            if desc_va == 0 {
+                continue;
+            }
+            let data = self.map.slice_from_va(desc_va, MemberDesc::MIN_SIZE).ok()?;
+            if let Ok(desc) = MemberDesc::parse(data) {
+                return Some((i, desc));
+            }
+        }
+        None
+    }
+}
+
 /// A code entry point discovered in a VB6 object.
 ///
 /// Returned by [`VbObject::code_entries`], which combines method table entries,
@@ -1318,8 +1474,9 @@ pub struct CodeEntry {
     pub kind: CodeEntryKind,
     /// Method table index: of the method for a method table entry, of the
     /// procedure the stub enters for an event handler; `None` for a
-    /// [`CodeEntryKind::NativeThunk`] and for an event handler whose stub
-    /// does not decode.
+    /// [`CodeEntryKind::NativeThunk`], for a native build's event handler
+    /// (see [`target_va`](Self::target_va)) and for an event handler whose
+    /// stub does not decode.
     pub method_index: Option<u16>,
     /// Human-readable name (method name or "ControlName_EventName").
     pub name: Option<String>,
@@ -1341,6 +1498,11 @@ pub struct CodeEntry {
     /// Size of the P-Code byte stream in bytes.
     /// Present for [`CodeEntryKind::PCode`] entries.
     pub pcode_size: Option<u16>,
+    /// For an event handler of a native build, the procedure its
+    /// `sub [esp+4], adj; jmp` stub ([`NativeEventThunk`](crate::vb::events::NativeEventThunk))
+    /// enters: a native class has no method table, so the procedure is the
+    /// [`CodeEntryKind::NativeThunk`] entry at this VA.
+    pub target_va: Option<u32>,
 }
 
 /// Classification of a code entry point.

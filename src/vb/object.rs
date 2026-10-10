@@ -382,9 +382,10 @@ impl<'a> ObjectInfo<'a> {
     /// method in source order, each the VA of the method's
     /// [`ProcDscInfo`](super::procedure::ProcDscInfo) (whose +0x00 points
     /// back to this `ObjectInfo`). In a module the slots of `Declare`
-    /// statements hold no `ProcDscInfo` VA (`tests/fixtures/exprs`: 0 and
-    /// 0xFFFFFFFF; `vtable`, whose 13 `Declare` slots overlap other data:
-    /// small integers and the text `Vtable`). The runtime
+    /// statements hold no `ProcDscInfo` VA: the compiler reserves them and
+    /// writes nothing, so they hold stale bytes (`tests/fixtures/exprs`: 0
+    /// and 0xFFFFFFFF; `vtable`'s 13: small integers and the text
+    /// `Vtable`). The table follows the constant pool. The runtime
     /// builds an object's vtable from the method link table, not from this
     /// one (see [`OptionalObjectInfo::basic_class_object_va`]). When
     /// `method_count() == 0`, this value is not an address (`flow-native`

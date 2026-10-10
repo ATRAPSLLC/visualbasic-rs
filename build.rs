@@ -1275,6 +1275,7 @@ fn generate_msvbvm60_exports(out_dir: &str) {
         cc: String,
         ret_type: String,
         variadic: bool,
+        noreturn: bool,
         params: Vec<(String, String)>, // (type, name)
         category: String,
     }
@@ -1290,9 +1291,9 @@ fn generate_msvbvm60_exports(out_dir: &str) {
             continue;
         }
 
-        // name,ordinal,calling_convention,return_type,variadic,params,category,notes
-        let parts: Vec<&str> = line.splitn(8, ',').collect();
-        if parts.len() < 7 {
+        // name,ordinal,calling_convention,return_type,variadic,noreturn,params,category,notes
+        let parts: Vec<&str> = line.splitn(9, ',').collect();
+        if parts.len() < 8 {
             panic!("too few columns at line {}", line_num + 1);
         }
 
@@ -1304,8 +1305,13 @@ fn generate_msvbvm60_exports(out_dir: &str) {
         let cc = parts[2].trim().to_string();
         let ret_type = parts[3].trim().to_string();
         let variadic = parts[4].trim() == "1";
-        let params_str = parts[5].trim();
-        let category = parts[6].trim().to_string();
+        let noreturn = match parts[5].trim() {
+            "0" => false,
+            "1" => true,
+            other => panic!("bad noreturn '{other}' at line {}", line_num + 1),
+        };
+        let params_str = parts[6].trim();
+        let category = parts[7].trim().to_string();
 
         // Validate calling convention and return type at build time
         map_calling_conv(&cc);
@@ -1336,6 +1342,7 @@ fn generate_msvbvm60_exports(out_dir: &str) {
             cc,
             ret_type,
             variadic,
+            noreturn,
             params,
             category,
         });
@@ -1379,12 +1386,13 @@ fn generate_msvbvm60_exports(out_dir: &str) {
         };
         writeln!(
             out,
-            "    ExportSignature {{ name: {:?}, ordinal: {}, calling_convention: {}, return_type: {}, variadic: {}, params: {}, category: {:?} }},",
+            "    ExportSignature {{ name: {:?}, ordinal: {}, calling_convention: {}, return_type: {}, variadic: {}, noreturn: {}, params: {}, category: {:?} }},",
             entry.name,
             entry.ordinal,
             map_calling_conv(&entry.cc),
             map_param_type(&entry.ret_type),
             entry.variadic,
+            entry.noreturn,
             params_ref,
             entry.category,
         )

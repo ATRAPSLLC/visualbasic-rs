@@ -1401,3 +1401,459 @@ fn arguments_carry_interfaces_between_procedures() {
         resolver.simulate_procedure(program, &code, method.pcode_bytes());
     assert_eq!(own.get(-0x88), None);
 }
+
+/// The late-bound calls by DISPID of method `index` of object `object`, in
+/// code order: each DISPID with the member it reaches, resolved through the
+/// interfaces the procedure's frame slots hold.
+fn late_targets(
+    project: &'static VbProject<'static>,
+    resolver: &CallResolver<'static, 'static>,
+    object: u16,
+    index: u16,
+) -> Vec<(i32, Option<visualbasic::pcode::calltarget::LateTarget>)> {
+    use visualbasic::pcode::stacksim::InstructionStack;
+
+    let method = method(project, object, usize::from(index));
+    let code: Vec<Instruction> = method.instructions().unwrap().flatten().collect();
+    let (stack, slots) = resolver.simulate_procedure(object, &code, method.pcode_bytes());
+    let mut last_load = None;
+    let mut found = Vec::new();
+    for (insn, record) in code.iter().zip(&stack.instructions) {
+        let pr = match record {
+            InstructionStack::Reached { pr, .. } | InstructionStack::Cut { pr, .. } => *pr,
+            _ => last_load,
+        };
+        if let Some(source) = insn.pr_source() {
+            last_load = Some(source);
+        }
+        if let Some(Callee::Late {
+            dispid: Some(dispid),
+            target,
+            ..
+        }) = resolver
+            .resolve_with_slots(object, insn, pr.as_ref(), &slots)
+            .map(|call| call.callee)
+        {
+            found.push((dispid, target));
+        }
+    }
+    found
+}
+
+/// `dispid`: a form's late-bound calls on the UserControl it hosts reach
+/// the control's procedures by their prototypes' DISPIDs: its control
+/// getter returns the control's class, which names the procedure each call
+/// invokes the way the opcode does (a load gets, a store lets, a store of
+/// an object sets, a call calls).
+#[test]
+fn late_calls_reach_a_hosted_user_controls_procedures() {
+    use visualbasic::pcode::calltarget::{InvokeKind, LateTarget};
+
+    let project = project_with_dispids();
+    let resolver = CallResolver::new(project).unwrap();
+    let host = object_index(project, "Host");
+    let dial = object_index(project, "Dial");
+    let name = |target: &Option<LateTarget>| match target {
+        Some(LateTarget::Procedure {
+            object,
+            method,
+            invoke,
+        }) => {
+            assert_eq!(*object, dial);
+            let object = project
+                .objects()
+                .unwrap()
+                .nth(usize::from(*object))
+                .unwrap()
+                .unwrap();
+            let name = object.method_name(*method).unwrap();
+            let accessor = match invoke {
+                InvokeKind::Method => "",
+                InvokeKind::Get => "get ",
+                InvokeKind::Let => "let ",
+                InvokeKind::Set => "set ",
+            };
+            format!("{accessor}{}", name.as_str().unwrap())
+        }
+        other => panic!("{other:?}"),
+    };
+    let named = |method: &str| -> Vec<String> {
+        late_targets(
+            project,
+            &resolver,
+            host,
+            method_index(project, host, method),
+        )
+        .iter()
+        .map(|(_, target)| name(target))
+        .collect()
+    };
+    assert_eq!(
+        named("Properties"),
+        ["let Value", "get Value", "set Target", "get Target"]
+    );
+    assert_eq!(
+        named("Indexed"),
+        [
+            "let Item", "get Item", "let Item", "set Slot", "get Item", "get Slot"
+        ]
+    );
+    // `Scaled(1.5) + Len(Describe("v"))` calls `Describe` first.
+    assert_eq!(
+        named("Methods"),
+        ["Clear", "Spin", "Spin", "Describe", "Scaled"]
+    );
+    assert_eq!(
+        named("Named"),
+        ["Spin", "let Item", "get Target", "set Slot", "Describe"]
+    );
+}
+
+/// `dispid`: the extender's members of a hosted control are called 0x3000
+/// below the DISPIDs `_VBControlExtender` declares, and reach the members
+/// it declares there when the caller's catalog describes it; with no
+/// catalog they stay unresolved.
+#[test]
+fn late_calls_reach_a_hosted_controls_extender() {
+    use std::sync::Arc;
+
+    use visualbasic::{
+        pcode::calltarget::{
+            InterfaceCatalog, InterfaceMember, InvokeKind, LateTarget, RuntimeInterfaces,
+        },
+        vb::control::Guid,
+    };
+
+    /// `_VBControlExtender`'s members at the DISPIDs `VB6.OLB` declares.
+    struct Extender;
+    impl InterfaceCatalog for Extender {
+        fn members(&self, _iid: &Guid, _vtable_offset: u16) -> Vec<InterfaceMember> {
+            Vec::new()
+        }
+        fn dispatched(&self, iid: &Guid, dispid: i32) -> Vec<InterfaceMember> {
+            if *iid != RuntimeInterfaces::CONTROL_EXTENDER {
+                return Vec::new();
+            }
+            let property = match dispid.cast_unsigned() {
+                0x8001_3000 => "Name",
+                0x8001_3003 => "Left",
+                0x8001_3004 => "Top",
+                0x8001_3005 => "Width",
+                0x8001_3006 => "Height",
+                0x8001_3007 => "Visible",
+                0x8001_3008 => "Parent",
+                0x8001_3009 => "DragMode",
+                0x8001_300B => "Tag",
+                0x8001_300F => "TabIndex",
+                0x8001_301C => "object",
+                0x8001_3032 => "HelpContextID",
+                0x8001_3046 => "WhatsThisHelpID",
+                0x8001_3047 => "Container",
+                0x8001_3048 => "CausesValidation",
+                0x8001_304A => "ToolTipText",
+                _ => "",
+            };
+            let method = match dispid.cast_unsigned() {
+                0x8001_4000 => "SetFocus",
+                0x8001_4001 => "ZOrder",
+                0x8001_4002 => "Move",
+                0x8001_4003 => "Drag",
+                0x8001_4004 => "ShowWhatsThis",
+                _ => "",
+            };
+            let member = |name: &str, invoke| InterfaceMember {
+                interface: "_VBControlExtender".to_string(),
+                name: name.to_string(),
+                invoke,
+                dispid: Some(dispid),
+                arg_widths: Vec::new(),
+                float_result: false,
+                returns_interface: None,
+            };
+            match (property, method) {
+                ("", "") => Vec::new(),
+                ("", method) => vec![member(method, InvokeKind::Method)],
+                (property, _) => vec![
+                    member(property, InvokeKind::Get),
+                    member(property, InvokeKind::Let),
+                ],
+            }
+        }
+    }
+
+    assert_eq!(
+        RuntimeInterfaces::CONTROL_EXTENDER.to_string(),
+        "{164CBDD0-7321-11D1-A1E8-00A0C90F2731}"
+    );
+    let project = project_with_dispids();
+    let host = object_index(project, "Host");
+    let bare = CallResolver::new(project).unwrap();
+    assert!(
+        late_targets(
+            project,
+            &bare,
+            host,
+            method_index(project, host, "Extender")
+        )
+        .iter()
+        .all(|(_, target)| target.is_none())
+    );
+
+    let resolver = CallResolver::new(project)
+        .unwrap()
+        .with_interfaces(Arc::new(Extender));
+    let named = |method: &str| -> Vec<String> {
+        late_targets(
+            project,
+            &resolver,
+            host,
+            method_index(project, host, method),
+        )
+        .iter()
+        .map(|(dispid, target)| match target {
+            Some(LateTarget::Members {
+                iid,
+                dispid: declared,
+                members,
+            }) => {
+                assert_eq!(*iid, RuntimeInterfaces::CONTROL_EXTENDER);
+                assert_eq!(declared.wrapping_sub(*dispid), 0x3000);
+                let invoke = match members.as_slice() {
+                    [only] => only.invoke,
+                    other => panic!("{other:?}"),
+                };
+                let accessor = match invoke {
+                    InvokeKind::Method => "",
+                    InvokeKind::Get => "get ",
+                    InvokeKind::Let => "let ",
+                    InvokeKind::Set => "set ",
+                };
+                format!("{accessor}{}", members[0].name)
+            }
+            other => panic!("{dispid:#x}: {other:?}"),
+        })
+        .collect()
+    };
+    assert_eq!(
+        named("Extender"),
+        [
+            "get Left",
+            "let Left",
+            "let Visible",
+            "get Name",
+            "let Tag",
+            "get Tag",
+            "get Width"
+        ]
+    );
+    assert_eq!(
+        named("ExtenderMembers"),
+        [
+            "SetFocus",
+            "ZOrder",
+            "Move",
+            "Drag",
+            "ShowWhatsThis",
+            "get Height",
+            "let Top",
+            "let TabIndex",
+            "let ToolTipText",
+            "let HelpContextID",
+            "let WhatsThisHelpID",
+            "let CausesValidation",
+            "let DragMode",
+            "get Parent",
+            "get Container",
+            "get object"
+        ]
+    );
+}
+
+/// `activex`: a hosted ActiveX control's form record names its class by
+/// ProgID, with or without an event handler (`CommonDialog1` has none),
+/// so the late-bound calls on it, and on an element of a control array of
+/// it, ask the caller's catalog for the members of its class's default
+/// interface.
+#[test]
+fn late_calls_reach_an_activex_controls_class() {
+    use std::sync::Arc;
+
+    use visualbasic::{
+        pcode::calltarget::{InterfaceCatalog, InterfaceMember, InvokeKind, LateTarget},
+        vb::control::Guid,
+    };
+
+    /// Any member of any interface, named by its interface's IID.
+    struct Any;
+    impl InterfaceCatalog for Any {
+        fn members(&self, _iid: &Guid, _vtable_offset: u16) -> Vec<InterfaceMember> {
+            Vec::new()
+        }
+        fn dispatched(&self, iid: &Guid, dispid: i32) -> Vec<InterfaceMember> {
+            [InvokeKind::Method, InvokeKind::Let]
+                .into_iter()
+                .map(|invoke| InterfaceMember {
+                    interface: iid.to_string(),
+                    name: format!("{dispid:#x}"),
+                    invoke,
+                    dispid: Some(dispid),
+                    arg_widths: Vec::new(),
+                    float_result: false,
+                    returns_interface: None,
+                })
+                .collect()
+        }
+    }
+
+    let project = project("activex");
+    let components: Vec<String> = project
+        .components()
+        .unwrap()
+        .map(|component| component.prog_id().into_owned())
+        .collect();
+    let client = object_index(project, "Client");
+    let object = project
+        .objects()
+        .unwrap()
+        .nth(usize::from(client))
+        .unwrap()
+        .unwrap();
+    let gui = project
+        .gui_entries()
+        .unwrap()
+        .find(|entry| entry.object_index().ok() == Some(u32::from(client)))
+        .unwrap();
+    let form = object.form_data_from_gui_entry(&gui).unwrap();
+    let records: Vec<(String, String)> = form
+        .controls()
+        .iter()
+        .map(|record| {
+            (
+                record.name().into_owned(),
+                record.prog_id().unwrap().into_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        records
+            .iter()
+            .all(|(_, prog_id)| components.contains(prog_id))
+    );
+    assert!(records.contains(&(
+        "CommonDialog1".to_string(),
+        "MSComDlg.CommonDialog".to_string()
+    )));
+
+    let resolver = CallResolver::new(project)
+        .unwrap()
+        .with_interfaces(Arc::new(Any));
+    let interfaces = |method: &str| -> Vec<String> {
+        late_targets(
+            project,
+            &resolver,
+            client,
+            method_index(project, client, method),
+        )
+        .into_iter()
+        .map(|(dispid, target)| match target {
+            Some(LateTarget::Members { iid, members, .. }) => {
+                assert!(members.iter().all(|m| m.name == format!("{dispid:#x}")));
+                iid.to_string()
+            }
+            other => format!("{other:?}"),
+        })
+        .collect()
+    };
+    // `CommonDialog`'s default interface, `ICommonDialog`.
+    assert_eq!(
+        interfaces("PickFile"),
+        ["{083039C2-13F4-11D1-8B7E-0000F8754DA1}"; 3]
+    );
+    // `Winsock`'s, `IMSWinsockControl`: the four calls on `Winsock1`, and
+    // the two on `Peers(0)`, an element `Item` returns from the array.
+    assert_eq!(
+        interfaces("Start"),
+        ["{248DD892-BB45-11CF-9ABC-0080C7E7B78D}"; 6]
+    );
+    // Every call by DISPID of the form, its handlers' included.
+    let mut resolved = 0;
+    for (index, entry) in object.methods().unwrap().enumerate() {
+        if !matches!(entry, Ok(MethodEntry::PCode(_))) {
+            continue;
+        }
+        let index = u16::try_from(index).unwrap();
+        for (dispid, target) in late_targets(project, &resolver, client, index) {
+            assert!(target.is_some(), "method {index}: {dispid:#x}");
+            resolved += 1;
+        }
+    }
+    assert!(resolved >= 20, "{resolved}");
+}
+
+/// Every fixture: each call by DISPID reaches a member once its receiver's
+/// class is known, given a catalog that describes every external member.
+#[test]
+fn every_call_by_dispid_reaches_a_member() {
+    use std::sync::Arc;
+
+    use visualbasic::{
+        pcode::calltarget::{InterfaceCatalog, InterfaceMember, InvokeKind},
+        vb::control::Guid,
+    };
+
+    /// Every member of every interface, each invoked every way.
+    struct Every;
+    impl InterfaceCatalog for Every {
+        fn members(&self, _iid: &Guid, _vtable_offset: u16) -> Vec<InterfaceMember> {
+            Vec::new()
+        }
+        fn dispatched(&self, iid: &Guid, dispid: i32) -> Vec<InterfaceMember> {
+            [
+                InvokeKind::Method,
+                InvokeKind::Get,
+                InvokeKind::Let,
+                InvokeKind::Set,
+            ]
+            .into_iter()
+            .map(|invoke| InterfaceMember {
+                interface: iid.to_string(),
+                name: format!("{dispid:#x}"),
+                invoke,
+                dispid: Some(dispid),
+                arg_widths: Vec::new(),
+                float_result: false,
+                returns_interface: None,
+            })
+            .collect()
+        }
+    }
+
+    let mut unresolved = Vec::new();
+    let mut resolved = 0;
+    for name in common::projects() {
+        let project = project(&name);
+        let resolver = CallResolver::new(project)
+            .unwrap()
+            .with_interfaces(Arc::new(Every));
+        for (object, entry) in project.objects().unwrap().enumerate() {
+            let object = u16::try_from(object).unwrap();
+            let Ok(entry) = entry else {
+                continue;
+            };
+            for (index, method) in entry.methods().unwrap().enumerate() {
+                if !matches!(method, Ok(MethodEntry::PCode(_))) {
+                    continue;
+                }
+                let index = u16::try_from(index).unwrap();
+                for (dispid, target) in late_targets(project, &resolver, object, index) {
+                    match target {
+                        Some(_) => resolved += 1,
+                        None => unresolved.push(format!("{name} {object}.{index} {dispid:#x}")),
+                    }
+                }
+            }
+        }
+    }
+    assert!(unresolved.is_empty(), "{unresolved:#?}");
+    assert!(resolved >= 60, "{resolved}");
+}

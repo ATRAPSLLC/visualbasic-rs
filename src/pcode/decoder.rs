@@ -335,6 +335,53 @@ impl Instruction {
         slots
     }
 
+    /// Returns every constant pool entry the instruction names, with what
+    /// the opcode says the entry holds ([`PoolEntryRole`]): its `%s`, `%c`,
+    /// `%v` and `%x` operands and the names of a named-argument list
+    /// ([`Operand::NamedArgs`], read from `code`, the procedure's P-Code).
+    pub fn pool_references(&self, code: &[u8]) -> Vec<PoolReference> {
+        let mnemonic = self.info.mnemonic;
+        let mut specs = self
+            .info
+            .operand_format
+            .split('%')
+            .skip(1)
+            .filter_map(|spec| spec.bytes().next());
+        let mut references = Vec::new();
+        for operand in self.operands.iter().flatten() {
+            let spec = specs.next();
+            match *operand {
+                Operand::ConstPoolIndex(index) => references.push(PoolReference {
+                    index,
+                    role: PoolEntryRole::of_operand(mnemonic, spec.unwrap_or(b'c')),
+                }),
+                Operand::VTableRef { interface, .. } => references.push(PoolReference {
+                    index: interface,
+                    role: PoolEntryRole::Guid,
+                }),
+                Operand::ExternalCall { import, .. } => references.push(PoolReference {
+                    index: import,
+                    role: PoolEntryRole::Address,
+                }),
+                Operand::NamedArgs {
+                    at,
+                    count,
+                    kind: operand::NamedArgKind::Name,
+                } => references.extend(
+                    (0..usize::from(count))
+                        .map_while(|i| usize::from(at).checked_add(i.checked_mul(2)?))
+                        .map_while(|pos| read_u16_le(code, pos).ok())
+                        .map(|index| PoolReference {
+                            index,
+                            role: PoolEntryRole::MemberName,
+                        }),
+                ),
+                _ => {}
+            }
+        }
+        references
+    }
+
     /// Returns how an `ExitProc*` instruction returns its procedure's result
     /// ([`ProcedureReturn`]); `None` for any other instruction.
     pub fn procedure_return(&self) -> Option<ProcedureReturn> {
@@ -541,6 +588,101 @@ impl fmt::Display for ErrorFlow {
             Self::Resume => f.write_str("Resume"),
         }
     }
+}
+
+/// What a constant pool entry holds, as the opcode that names it says
+/// (see [`Instruction::pool_references`]).
+///
+/// Read from the handlers of MSVBVM60 6.00.8176 and the runtime functions
+/// they call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PoolEntryRole {
+    /// A BSTR string literal (`LitStr`, `LitVarStr`).
+    String,
+    /// A member name a late-bound call passes to `GetIDsOfNames`: UTF-16,
+    /// NUL-terminated, with no length prefix (`LateMem*`, `VarLateMem*`,
+    /// and each name of a named-argument list).
+    MemberName,
+    /// A 16-byte GUID: the IID of a vtable call's interface (the second
+    /// half of `%v`), of a cast's or `TypeOf`'s interface (`CastAd`,
+    /// `CastAdVar`, `CheckType`, `CheckTypeVar`, which compares a record's
+    /// GUID), or of a `For Each` loop variable's (`ForEachCollObj`,
+    /// `NextEachCollObj`).
+    Guid,
+    /// A record's layout
+    /// ([`RecordLayout`](crate::vb::controlprop::RecordLayout)):
+    /// `AssignRecord`, `CRec*`, `CVar*Udt`, `CDargRefUdt`, `Destruct*`,
+    /// `StUdtVar`, `Redim*VarUdt`, and the element layout of `EraseDestruct`,
+    /// `EraseDestrKeepData` and `StAryRec*`.
+    RecordLayout,
+    /// The descriptor `Get #` and `Put #` of a record read
+    /// ([`RecordIoDescriptor`](crate::vb::pooldesc::RecordIoDescriptor):
+    /// `GetRecOwn*`, `PutRecOwn*`).
+    RecordIo,
+    /// The item list of a `Print`, `Write` or `Input` statement
+    /// ([`IoItems`](crate::vb::pooldesc::IoItems): `PrintObject`,
+    /// `PrintFile`, `WriteFile`, `InputFile`).
+    IoItems,
+    /// The `SAFEARRAY` header of a fixed array inside a record
+    /// ([`ArrayDescriptor`](crate::vb::pooldesc::ArrayDescriptor):
+    /// `AryInRecLdPr`, `AryInRecLdRf`).
+    ArrayDescriptor,
+    /// What `New` creates (`New`, `NewIfNull*`): a project class's
+    /// `ObjectInfo`, or a
+    /// [`CreationDescriptor`](crate::vb::pooldesc::CreationDescriptor).
+    Creation,
+    /// An address (`%c`), or the procedure or stub an `ImpAdCall*` calls
+    /// (`%x`).
+    Address,
+}
+
+impl PoolEntryRole {
+    /// The role of the entry a `%s` or `%c` operand of `mnemonic` names.
+    fn of_operand(mnemonic: &str, spec: u8) -> Self {
+        match (spec, mnemonic) {
+            (b's', "LitStr" | "LitVarStr") => Self::String,
+            (
+                b's',
+                "AssignRecord"
+                | "CDargRefUdt"
+                | "CRec2Ansi"
+                | "CRec2Uni"
+                | "CRecAnsi2Uni"
+                | "CRecUni2Ansi"
+                | "CVarAryUdt"
+                | "CVarRefUdt"
+                | "CVarUdt"
+                | "DestructAnsiOFrame"
+                | "DestructOFrame"
+                | "DestructRecord"
+                | "StUdtVar"
+                | "RedimVarUdt"
+                | "RedimPreserveVarUdt"
+                | "EraseDestruct"
+                | "EraseDestrKeepData"
+                | "StAryRecCopy"
+                | "StAryRecMove",
+            ) => Self::RecordLayout,
+            (b's', "GetRecOwn3" | "GetRecOwn4" | "PutRecOwn3" | "PutRecOwn4") => Self::RecordIo,
+            (b's', "PrintObject" | "PrintFile" | "WriteFile" | "InputFile") => Self::IoItems,
+            (b's', "AryInRecLdPr" | "AryInRecLdRf") => Self::ArrayDescriptor,
+            (b's', "ForEachCollObj" | "NextEachCollObj")
+            | (b'c', "CastAd" | "CastAdVar" | "CheckType" | "CheckTypeVar") => Self::Guid,
+            (b'c', "New" | "NewIfNullPr" | "NewIfNullAd" | "NewIfNullRf") => Self::Creation,
+            (b's', _) if mnemonic.contains("LateMem") => Self::MemberName,
+            _ => Self::Address,
+        }
+    }
+}
+
+/// A constant pool entry an instruction names: see
+/// [`Instruction::pool_references`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolReference {
+    /// The entry's index in the procedure's constant pool.
+    pub index: u16,
+    /// What the opcode says the entry holds.
+    pub role: PoolEntryRole,
 }
 
 /// Streaming iterator over P-Code instructions.

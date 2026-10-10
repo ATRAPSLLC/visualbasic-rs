@@ -114,6 +114,14 @@ pub struct ExportSignature {
     pub return_type: VbParamType,
     /// Whether this function accepts variable arguments after fixed params.
     pub variadic: bool,
+    /// Whether this function never returns to its caller: it raises a VB
+    /// error on every path (`__vbaErrorOverflow`, `__vbaGenerateBoundsError`,
+    /// `__vbaError`, `__vbaFPException`, `__vbaFailedFriend`,
+    /// `rtcAppleScript`), ends the program (`__vbaEnd`, `__vbaStopExe`, both
+    /// through the error the runtime unwinds on) or the process
+    /// (`ThunRTMain`). The error raiser ends in a noncontinuable
+    /// `RaiseException` (MSVBVM60 6.00.8176 `0x66026D91`).
+    pub noreturn: bool,
     /// Fixed parameter list (in calling order).
     pub params: &'static [ExportParam],
     /// Functional category (e.g., `"free"`, `"string"`, `"variant"`).

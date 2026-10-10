@@ -14,15 +14,16 @@ use visualbasic::{
     project::MethodLinkKind,
     vb::{
         comreg::{ComRegData, ComRegObject},
+        control::ControlKind,
         eventname,
         external::ExternalKind,
         formdata::{FormControlType, FormDataParser},
         functype::FuncTypDesc,
         guitable::{GuiTableEntry, GuiTableIter},
+        member::MemberKind,
         projectinfo2::{ControlTypeIter, ProjectInfo2, read_name_strings},
         property::{Property, PropertyValue},
         publicbytes::ClassFormPublicBytes,
-        varstub::VarStubIter,
     },
 };
 
@@ -340,7 +341,8 @@ fn print_control_types(project: &VbProject<'_>) -> DynResult<()> {
         return Ok(());
     }
 
-    // The parameter names between and after the records
+    // The parameter, event parameter, variable and interface names between
+    // and after the records
     let param_names = read_name_strings(map, pi2_va);
 
     println!();
@@ -355,7 +357,7 @@ fn print_control_types(project: &VbProject<'_>) -> DynResult<()> {
         }
     }
     if !param_names.is_empty() {
-        println!("    // Parameter names: {}", param_names.join(", "));
+        println!("    // Names: {}", param_names.join(", "));
     }
     println!("}}");
     Ok(())
@@ -547,9 +549,21 @@ fn print_object(
         if ftd_va != 0 {
             println!("    // FuncTypDescs VA: 0x{ftd_va:08X}");
         }
-        let pn_va = priv_obj.param_names_va()?;
-        if pn_va != 0 {
-            println!("    // Param Names VA:  0x{pn_va:08X}");
+        let ev_va = priv_obj.event_descs_va()?;
+        if ev_va != 0 && priv_obj.event_count()? != 0 {
+            println!("    // Event Descs VA:  0x{ev_va:08X}");
+        }
+        let map = obj.project().address_map();
+        for (i, member) in obj.members()? {
+            let name = String::from_utf8_lossy(member.name(map).unwrap_or(b""));
+            match (member.kind()?, member.instance_offset()?) {
+                (MemberKind::Implements, _) => println!("    // Member {i}:  Implements {name}"),
+                (kind, offset) => println!(
+                    "    // Member {i}:  {kind:?} {name} As {} (offset 0x{:X})",
+                    member.var_type()?.type_name(),
+                    offset.unwrap_or(0)
+                ),
+            }
         }
     }
 
@@ -564,25 +578,16 @@ fn print_object(
         print_variable_table("statics", &table);
     }
 
-    // Print variable implementation stubs (compiler metadata)
-    if let Some(priv_obj) = obj.private_object() {
-        let stubs_va = priv_obj.var_stubs_va()?;
-        let var_count = priv_obj.var_stub_count()?;
-        if stubs_va != 0 && var_count > 0 {
-            println!();
-            for (i, stub) in
-                VarStubIter::new(obj.project().address_map(), stubs_va, var_count).enumerate()
-            {
-                let name = stub.name();
-                let name_str = if name.is_empty() { "?" } else { name };
-                let pcount = stub.param_count().unwrap_or(0);
-                let params = if pcount > 0 {
-                    format!(" ({pcount} params)")
-                } else {
-                    String::new()
-                };
-                println!("    .varimpl /*{i:02}*/ {name_str}{params}");
-            }
+    // The record layouts of the object's `Type`s
+    let layouts = obj.record_layouts()?;
+    if !layouts.is_empty() {
+        println!();
+        for (i, (va, layout)) in layouts.iter().enumerate() {
+            println!(
+                "    .type /*{i:02}*/ layout=0x{va:08X} size=0x{:X} entries={}",
+                layout.record_size().unwrap_or(0),
+                layout.entry_count().unwrap_or(0),
+            );
         }
     }
 
@@ -673,12 +678,14 @@ fn print_object(
         }
     };
 
-    // The library's event names per (control index, sink slot).
-    let bound_names: HashMap<(u16, u16), &'static str> = obj
+    // The library's event names per (control name, sink slot): the object
+    // itself, its WithEvents variables and its Implements all have index
+    // 0xFFFF.
+    let bound_names: HashMap<(String, u16), &'static str> = obj
         .events_all_slots(None)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|b| Some(((b.control_index, b.event_slot), b.event_name?)))
+        .filter_map(|b| Some(((b.control_name.into_owned(), b.event_slot), b.event_name?)))
         .collect();
 
     if !controls.is_empty() {
@@ -724,11 +731,15 @@ fn print_object(
                             _ => FormControlType::Unknown(0xFF),
                         }
                     });
+                    // The templates name a control's events; a WithEvents or
+                    // Implements sink's slots are its interface's.
+                    let templated = ctrl.info().kind().ok() == Some(ControlKind::Control);
                     let ev_name = ctrl
                         .class_name()
                         .and_then(|class| eventname::event_name_for_class(class, slot))
                         .or_else(|| eventname::event_name(slot, ev_ctype))
-                        .or_else(|| bound_names.get(&(ctrl_index, slot)).copied())
+                        .filter(|_| templated)
+                        .or_else(|| bound_names.get(&(ctrl.name().into_owned(), slot)).copied())
                         .unwrap_or("?");
 
                     if let Some(thunk) = sink.resolve_handler_thunk(slot, map) {

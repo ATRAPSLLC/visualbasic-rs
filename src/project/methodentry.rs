@@ -18,10 +18,11 @@ use crate::{
 /// [`ProcDscInfo`](crate::vb::procedure::ProcDscInfo), whose first dword
 /// points back at the object's `ObjectInfo`, in modules, classes, forms and
 /// UserControls alike. A standard module also counts each `Declare` as a
-/// method, ahead of its procedures, but stores no pointer for it: its first
-/// `Declare`-count slots read whatever bytes precede the procedure pointers
-/// (`vtable`: 13 `Declare`s, slots 0-12 hold values such as `0x00000409`
-/// and `0x62617456`, ASCII `"Vtab"`). Those slots are
+/// method, ahead of its procedures, and its table holds a slot for each, but
+/// the compiler writes nothing there: a `Declare` has no procedure, so its
+/// slot keeps whatever the compiler's output buffer held (`vtable`: 13
+/// `Declare`s, slots 0-12 hold values such as `0x00000409` and
+/// `0x62617456`, ASCII `"Vtab"`). Those slots are
 /// [`Declare`](Self::Declare).
 #[derive(Debug)]
 pub enum MethodEntry<'a> {

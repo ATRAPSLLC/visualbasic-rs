@@ -76,3 +76,23 @@ Public Function Extender() As Long
     Dial1.Tag = Dial1.Name
     Extender = Dial1.Width + Len(Dial1.Tag)
 End Function
+
+' The extender's methods, and its properties of each kind: a Single, a
+' Boolean, an Integer, a Long, a String, an enumeration and objects.
+Public Function ExtenderMembers() As Long
+    Dial1.SetFocus
+    Dial1.ZOrder 0
+    Dial1.Move 1, 2, 3, 4
+    Dial1.Drag 1
+    Dial1.ShowWhatsThis
+    Dial1.Top = Dial1.Height
+    Dial1.TabIndex = 2
+    Dial1.ToolTipText = "t"
+    Dial1.HelpContextID = 3
+    Dial1.WhatsThisHelpID = 4
+    Dial1.CausesValidation = False
+    Dial1.DragMode = 1
+    If Dial1.Parent Is Me Then ExtenderMembers = 1
+    If Dial1.Container Is Me Then ExtenderMembers = 2
+    If Dial1.Object Is Nothing Then ExtenderMembers = 3
+End Function

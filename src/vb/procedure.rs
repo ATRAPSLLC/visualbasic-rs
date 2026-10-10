@@ -590,6 +590,33 @@ impl<'a> ProcDscInfo<'a> {
         }
     }
 
+    /// Returns the bytes the descriptor occupies with the tables that follow
+    /// it: [`actual_size`](Self::actual_size), or the end of its line-number
+    /// table when it has one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a table's size or the line-number count cannot be
+    /// read.
+    pub fn extent_size(&self) -> Result<usize, Error> {
+        let base = self.actual_size()?;
+        let Some(start) = usize::try_from(self.line_table_offset()?)
+            .ok()
+            .filter(|&start| start != 0)
+        else {
+            return Ok(base);
+        };
+        let count = usize::from(read_u16_le(self.bytes, start)?);
+        let end = count
+            .checked_mul(4)
+            .and_then(|pairs| pairs.checked_add(2))
+            .and_then(|len| len.checked_add(start))
+            .ok_or(Error::ArithmeticOverflow {
+                context: "ProcDscInfo::extent_size line table",
+            })?;
+        Ok(base.max(end))
+    }
+
     /// Returns an iterator over primary cleanup table entries.
     ///
     /// Each entry describes a local variable that needs resource release
