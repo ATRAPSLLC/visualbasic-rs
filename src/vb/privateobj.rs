@@ -1,7 +1,8 @@
 //! PrivateObjectDescriptor structure parser.
 //!
 //! The PrivateObjectDescriptor contains per-object private data including
-//! function type descriptors, variable counts, and parameter name tables.
+//! function type descriptors, its public variables and implemented
+//! interfaces, its events' prototypes and the layouts of its `Type`s.
 //! It is referenced by [`ObjectInfo::private_object_va()`](super::object::ObjectInfo::private_object_va)
 //! at offset 0x0C.
 //!
@@ -15,13 +16,13 @@
 //! | 0x0C | 4 | Reserved (0 in every fixture) |
 //! | 0x10 | 2 | Module-level variables, plus 1 per `Implements` (see [`member_count`](PrivateObjectDescriptor::member_count)) |
 //! | 0x12 | 2 | `Event` declarations (see [`event_count`](PrivateObjectDescriptor::event_count)) |
-//! | 0x14 | 2 | Count of [`var_stubs_va`](PrivateObjectDescriptor::var_stubs_va) entries (0 in every fixture; see [`var_stub_count`](PrivateObjectDescriptor::var_stub_count)) |
+//! | 0x14 | 2 | `Type` declarations (see [`record_layout_count`](PrivateObjectDescriptor::record_layout_count)) |
 //! | 0x16 | 2 | Padding (0 in every fixture) |
 //! | 0x18 | 4 | `lpFuncTypDescs` - VA to array of FuncTypDesc pointers, one per method (null for the unnamed ones) |
 //! | 0x1C | 4 | `lpExtendedFuncData` - secondary per-method array (0 in every fixture) |
-//! | 0x20 | 4 | `lpMethodNameTable` - secondary method table |
-//! | 0x24 | 4 | `lpParamNames` - parameter name table |
-//! | 0x28 | 4 | `lpVarStubs` - variable stub table |
+//! | 0x20 | 4 | `lpMemberDescs` - VA to array of [`MemberDesc`](super::member::MemberDesc) pointers, one per +0x10 member (null for a `Private` variable) |
+//! | 0x24 | 4 | `lpEventDescs` - VA to array of FuncTypDesc pointers, one per +0x12 `Event` |
+//! | 0x28 | 4 | VA to array of [`RecordLayout`](super::controlprop::RecordLayout) pointers, one per +0x14 `Type` |
 //! | 0x2C | 12 | Reserved (0 in every fixture) |
 //! | 0x38 | 4 | Instance size (equal to the PublicBytes `+0x02`; see [`instance_size`](PrivateObjectDescriptor::instance_size)) |
 //! | 0x3C | 4 | `dwFlags` - 0x0104 for classes and UserControls, 0x0004 for forms |
@@ -43,7 +44,7 @@ use crate::{
 /// View over a PrivateObjectDescriptor structure (0x40 bytes).
 ///
 /// Contains per-object private data: function type descriptor pointers,
-/// variable counts, and parameter name tables.
+/// member and event descriptor pointers, and their counts.
 ///
 /// # Accessor fallibility
 ///
@@ -99,7 +100,8 @@ impl<'a> PrivateObjectDescriptor<'a> {
     /// `m_Owner`), Square 2 (`m_Side`, `Implements Shape`), Shape 0;
     /// `events` Listener 2 (`WithEvents m_Source`, `m_Log`); `data` Item 1
     /// (`Public Name`). It is not a method count: the FuncTypDesc array has
-    /// one entry per method of the object's method table.
+    /// one entry per method of the object's method table. It is the length
+    /// of the [`member_descs_va`](Self::member_descs_va) array.
     #[inline]
     pub fn member_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x10)
@@ -109,20 +111,22 @@ impl<'a> PrivateObjectDescriptor<'a> {
     ///
     /// `calls` Counter 1,
     /// `events` Source 3 (`Started`, `Ticked`, `Named`), `types` Kinds 1,
-    /// `forms` Gauge 1, 0 for every other fixture object.
+    /// `forms` Gauge 1, 0 for every other fixture object. It is the length
+    /// of the [`event_descs_va`](Self::event_descs_va) array.
     #[inline]
     pub fn event_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x12)
     }
 
-    /// The u16 count at offset 0x14, read as the length of the
-    /// [`var_stubs_va`](Self::var_stubs_va) array.
+    /// Number of `Type` declarations in the object, `Public` or `Private`,
+    /// the u16 at offset 0x14: the length of the
+    /// [`record_layouts_va`](Self::record_layouts_va) array.
     ///
-    /// Not the number of public variables: `tests/fixtures/data` `Item`
-    /// declares `Public Name As String` and has 0 here. 0 in every fixture,
-    /// so what it counts is unconfirmed.
+    /// `typerefs` `Shapes` 1 (`Point`), `records` `Item` 1 (`CT`), `udts`
+    /// `Shapes` 5; 0 for an object that declares none. A standard module's
+    /// `Type`s are in no such array: a module has no descriptor.
     #[inline]
-    pub fn var_stub_count(&self) -> Result<u16, Error> {
+    pub fn record_layout_count(&self) -> Result<u16, Error> {
         read_u16_le(self.bytes, 0x14)
     }
 
@@ -143,39 +147,46 @@ impl<'a> PrivateObjectDescriptor<'a> {
         read_u32_le(self.bytes, 0x18)
     }
 
-    /// VA of the secondary method table at offset 0x20.
+    /// VA of the [`MemberDesc`](super::member::MemberDesc) pointer array at
+    /// offset 0x20.
     ///
-    /// Its layout is unconfirmed. When the object has nothing to put in
-    /// it, it shares its VA with [`param_names_va`](Self::param_names_va)
-    /// and [`var_stubs_va`](Self::var_stubs_va) (`calls` Shape: all three
-    /// 0x00401C58).
+    /// One VA per [`member_count`](Self::member_count): a `MemberDesc` for a
+    /// `Public` variable (`WithEvents` or not) or an `Implements`, 0 for a
+    /// `Private` variable. `members` `Holder` points to its thirteen
+    /// `Public` variables `B` ... `Auto`, `calls` `Square` to 0 (`m_Side`)
+    /// and `Shape` (its `Implements`). See [`member`](super::member) for the
+    /// order. With no members it shares its VA with
+    /// [`event_descs_va`](Self::event_descs_va) and
+    /// [`record_layouts_va`](Self::record_layouts_va) (`calls` Shape: all
+    /// three 0x00401C58).
     #[inline]
-    pub fn method_name_table_va(&self) -> Result<u32, Error> {
+    pub fn member_descs_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x20)
     }
 
-    /// VA of the parameter name string table at offset 0x24.
+    /// VA of the event prototype array at offset 0x24.
     ///
-    /// Points to an array of VAs, among them VAs of null-terminated
-    /// parameter name strings shared across the object's functions
-    /// (`calls` Counter: `"Value"`, `"o"`, `"a"`, `"values"`, `"which"`,
-    /// `"factor"`), but also VAs of other structures (its first entry,
-    /// 0x00401E54, is not a string) and zeros. The exact layout is
-    /// unconfirmed.
+    /// One [`FuncTypDesc`](super::functype::FuncTypDesc) VA per
+    /// [`event_count`](Self::event_count), in `Event` declaration order;
+    /// each descriptor's parameter names are the event's (`calls` Counter:
+    /// `Changed(ByVal value)`; `events` Source: `Started`, `Ticked(n, ratio,
+    /// Cancel)`, `Named(s, v, o)`).
     #[inline]
-    pub fn param_names_va(&self) -> Result<u32, Error> {
+    pub fn event_descs_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x24)
     }
 
-    /// VA of variable implementation stub array at offset 0x28.
+    /// VA of the record layout array at offset 0x28.
     ///
-    /// Points to an array of [`var_stub_count`](Self::var_stub_count) VA pointers,
-    /// each to a [`VarStubDesc`](super::varstub::VarStubDesc) structure.
-    /// Use [`VarStubIter`](super::varstub::VarStubIter) to iterate. Every
-    /// fixture object has a `var_stub_count` of 0, so the format is unconfirmed
-    /// by `tests/fixtures`.
+    /// One [`RecordLayout`](super::controlprop::RecordLayout) VA per
+    /// [`record_layout_count`](Self::record_layout_count), in `Type`
+    /// declaration order (`udts` `Shapes`: `Point`, `Named`, `Third`,
+    /// `PrivT`, `Holder`). The compiler stores one layout per distinct shape
+    /// in the project, so two `Type`s with the same members share one
+    /// (`udts`: `Second.Pair` and `Shapes.PrivT`), as does an array
+    /// member's element (`Holder.Ns()` names `Named`'s).
     #[inline]
-    pub fn var_stubs_va(&self) -> Result<u32, Error> {
+    pub fn record_layouts_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x28)
     }
 
@@ -241,10 +252,10 @@ mod tests {
         let pod = PrivateObjectDescriptor::parse(&CLS_ZIP).unwrap();
         assert_eq!(pod.object_info_va().unwrap(), 0x0040281C);
         assert_eq!(pod.member_count().unwrap(), 14);
-        assert_eq!(pod.var_stub_count().unwrap(), 5);
+        assert_eq!(pod.record_layout_count().unwrap(), 5);
         assert_eq!(pod.func_type_descs_va().unwrap(), 0x00405CA8);
-        assert_eq!(pod.param_names_va().unwrap(), 0x00405544);
-        assert_eq!(pod.var_stubs_va().unwrap(), 0x00405644);
+        assert_eq!(pod.event_descs_va().unwrap(), 0x00405544);
+        assert_eq!(pod.record_layouts_va().unwrap(), 0x00405644);
         assert_eq!(pod.instance_size().unwrap(), 0x4C);
         assert_eq!(pod.flags().unwrap(), 0x0104);
         assert!(pod.is_class());
@@ -255,7 +266,7 @@ mod tests {
         let pod = PrivateObjectDescriptor::parse(&FORM1).unwrap();
         assert_eq!(pod.object_info_va().unwrap(), 0x0040243C);
         assert_eq!(pod.member_count().unwrap(), 0);
-        assert_eq!(pod.var_stub_count().unwrap(), 0);
+        assert_eq!(pod.record_layout_count().unwrap(), 0);
         assert_eq!(pod.func_type_descs_va().unwrap(), 0x0040558C);
         assert_eq!(pod.instance_size().unwrap(), 0x44);
         assert_eq!(pod.flags().unwrap(), 0x0004);
@@ -276,7 +287,7 @@ mod tests {
         let pod = PrivateObjectDescriptor::parse(&COOLBAR_OCX).unwrap();
         assert_eq!(pod.member_count().unwrap(), 30);
         assert_eq!(pod.event_count().unwrap(), 13);
-        assert_eq!(pod.var_stub_count().unwrap(), 0);
+        assert_eq!(pod.record_layout_count().unwrap(), 0);
         assert_eq!(pod.flags().unwrap(), 0x0104);
         assert!(pod.is_class());
     }

@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use crate::{addressmap::AddressMap, error::Error, util::read_u32_le};
+use crate::{addressmap::AddressMap, error::Error, util::read_u32_le, vb::control::ControlInfo};
 
 /// Parsed P-Code event handler thunk (20-byte dual-entry method stub).
 ///
@@ -117,10 +117,13 @@ impl fmt::Display for EventHandlerThunk {
     }
 }
 
-/// Parsed native event handler thunk (13-byte `this`-adjusting JMP stub).
+/// Parsed native adjustor thunk (13-byte `this`-adjusting JMP stub).
 ///
-/// The crate reads natively compiled event handlers as this pattern; no
-/// fixture has one, so it is unverified:
+/// A natively compiled object enters its procedures through these: an
+/// event sink's handler slot names a thunk's first entry, and a method link
+/// its bare jump at +8 ([`JUMP_OFFSET`](Self::JUMP_OFFSET)). The compiler
+/// also places thunks nothing names, whose adjustment is 0xFFFF
+/// (`events-native`).
 ///
 /// ```text
 /// +0x00  81 6C 24 04 XX XX XX XX   sub dword [esp+4], this_adjust
@@ -137,6 +140,9 @@ pub struct NativeEventThunk {
 impl NativeEventThunk {
     /// Total size of the native thunk in bytes.
     pub const SIZE: usize = 13;
+
+    /// Offset of the thunk's second entry, its `jmp rel32`.
+    pub const JUMP_OFFSET: u32 = 8;
 
     /// Parses a native event thunk from the given bytes.
     pub fn parse(data: &[u8], thunk_va: u32) -> Option<Self> {
@@ -212,17 +218,21 @@ impl fmt::Display for IUnknownThunk {
 /// for each event the object handles (`Private Sub Command1_Click()`); the
 /// other slots are 0.
 ///
-/// # Layout (variable-length: 0x18 + event_handler_slots * 4)
+/// # Layout (variable-length: 0x18 + 4 * [`ControlInfo::sink_slots`])
 ///
 /// | Offset | Field |
 /// |--------|-------|
 /// | 0x00 | Reserved (always 0) |
-/// | 0x04 | Back-pointer to this control's [`ControlInfo`](crate::vb::control::ControlInfo) entry |
+/// | 0x04 | Back-pointer to this control's [`ControlInfo`] entry |
 /// | 0x08 | Back-pointer to parent [`ObjectInfo`](crate::vb::object::ObjectInfo) |
 /// | 0x0C | `EVENT_SINK_QueryInterface` thunk VA - `jmp [IAT]` to MSVBVM60 |
 /// | 0x10 | `EVENT_SINK_AddRef` thunk VA - `jmp [IAT]` to MSVBVM60 |
 /// | 0x14 | `EVENT_SINK_Release` thunk VA - `jmp [IAT]` to MSVBVM60 |
-/// | 0x18+ | Event handler VAs (0 = not connected) |
+/// | 0x18 | `IDispatch` thunk VAs ([`dispatch_va`](Self::dispatch_va)), 4 for a `WithEvents` or `Implements` sink, none for a control |
+/// | then | Event handler VAs ([`handler_va`](Self::handler_va); 0 = not connected) |
+///
+/// [`ControlInfo::dispatch_slots`] says which sinks have the `IDispatch`
+/// slots (see [`ControlKind`](crate::vb::control::ControlKind)).
 ///
 /// The IUnknown thunks at +0x0C-0x14 are 6-byte `FF 25 imm32` indirect jumps
 /// through the Import Address Table to MSVBVM60.DLL. All controls in the same
@@ -234,6 +244,7 @@ impl fmt::Display for IUnknownThunk {
 #[derive(Clone, Copy, Debug)]
 pub struct EventSinkVtable<'a> {
     bytes: &'a [u8],
+    dispatch_slots: u16,
     handler_count: u16,
 }
 
@@ -241,12 +252,22 @@ impl<'a> EventSinkVtable<'a> {
     /// Header size before event handler entries.
     pub const HEADER_SIZE: usize = 0x18;
 
-    /// Parses an EventSinkVtable from a byte slice.
+    /// Parses the event sink vtable of the ControlInfo entry `info` from a
+    /// byte slice.
     ///
-    /// `handler_count` is [`ControlInfo::event_handler_slots`](crate::vb::control::ControlInfo::event_handler_slots).
-    pub fn parse(data: &'a [u8], handler_count: u16) -> Result<Self, Error> {
-        let entries_size = (handler_count as usize).saturating_mul(4);
-        let total = Self::HEADER_SIZE.saturating_add(entries_size);
+    /// The entry gives the slot count and whether `IDispatch` slots come
+    /// first ([`ControlInfo::dispatch_slots`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry's fields cannot be read, or
+    /// [`Error::TooShort`] if `data` is shorter than the header and its
+    /// slots.
+    pub fn parse(data: &'a [u8], info: &ControlInfo<'_>) -> Result<Self, Error> {
+        let dispatch_slots = info.dispatch_slots()?;
+        let handler_count = info.event_count()?;
+        let total =
+            Self::HEADER_SIZE.saturating_add(usize::from(info.sink_slots()?).saturating_mul(4));
         let bytes = data.get(..total).ok_or(Error::TooShort {
             expected: total,
             actual: data.len(),
@@ -254,8 +275,34 @@ impl<'a> EventSinkVtable<'a> {
         })?;
         Ok(Self {
             bytes,
+            dispatch_slots,
             handler_count,
         })
+    }
+
+    /// Returns the VA of `IDispatch` slot `index` (0 `GetTypeInfoCount`,
+    /// 1 `GetTypeInfo`, 2 `GetIDsOfNames`, 3 `Invoke`), or `None` for a
+    /// sink without them or an index past them.
+    pub fn dispatch_va(&self, index: u16) -> Option<u32> {
+        if index >= self.dispatch_slots {
+            return None;
+        }
+        let offset = Self::HEADER_SIZE.checked_add((index as usize).checked_mul(4)?)?;
+        read_u32_le(self.bytes, offset).ok()
+    }
+
+    /// Number of `IDispatch` slots before the handlers (4 or 0).
+    #[inline]
+    pub fn dispatch_slots(&self) -> u16 {
+        self.dispatch_slots
+    }
+
+    /// Returns the bytes the vtable occupies: its header and
+    /// [`ControlInfo::sink_slots`] slots, the `IDispatch` and handler slots
+    /// and, for an `Implements`, four zero slots after them.
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.bytes.len()
     }
 
     /// Back-pointer to this control's ControlInfo entry at +0x04.
@@ -288,13 +335,15 @@ impl<'a> EventSinkVtable<'a> {
         read_u32_le(self.bytes, 0x14)
     }
 
-    /// Number of event handler slots.
+    /// Number of handler slots after the `IDispatch` ones: the events, or
+    /// an `Implements`' interface members.
     #[inline]
     pub fn handler_count(&self) -> u16 {
         self.handler_count
     }
 
-    /// Returns the VA of the event handler at the given slot index.
+    /// Returns the VA of the event handler at the given slot index (the
+    /// event's index in its interface; for an `Implements`, the member's).
     ///
     /// Returns 0 if the object does not handle the event.
     /// Returns `None` if `slot >= handler_count`.
@@ -302,7 +351,8 @@ impl<'a> EventSinkVtable<'a> {
         if slot >= self.handler_count {
             return None;
         }
-        let offset = Self::HEADER_SIZE.checked_add((slot as usize).checked_mul(4)?)?;
+        let index = usize::from(self.dispatch_slots).checked_add(usize::from(slot))?;
+        let offset = Self::HEADER_SIZE.checked_add(index.checked_mul(4)?)?;
         read_u32_le(self.bytes, offset).ok()
     }
 

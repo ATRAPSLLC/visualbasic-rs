@@ -80,17 +80,17 @@ impl<'a> VbControl<'a> {
         self.info.control_type()
     }
 
-    /// Number of event handler slots on this control.
-    ///
-    /// This is the number of entries in the event sink vtable at +0x18,
-    /// NOT the dispatch_offset at +0x04 (which is a byte offset, not a count).
+    /// Number of event handler slots on this control:
+    /// [`ControlInfo::event_count`], the events (an `Implements`' interface
+    /// members), without a `WithEvents` or `Implements` sink's `IDispatch`
+    /// slots.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying ControlInfo field cannot be read.
+    /// Returns an error if the underlying ControlInfo fields cannot be read.
     #[inline]
     pub fn event_count(&self) -> Result<u16, Error> {
-        self.info.event_handler_slots()
+        self.info.event_count()
     }
 
     /// Control index within the form.
@@ -140,8 +140,9 @@ impl<'a> VbControl<'a> {
         self.guid.as_ref().and_then(|g| g.control_class_name())
     }
 
-    /// Returns the VA of the event handler at `event_index`: slot
-    /// `event_index` of the control's [`EventSinkVtable`].
+    /// Returns the VA of the event handler at `event_index`: handler slot
+    /// `event_index` of the control's [`EventSinkVtable`]
+    /// ([`EventSinkVtable::handler_va`]), after any `IDispatch` slots.
     ///
     /// A return value of `0` means the event is not handled. A non-zero VA
     /// is the handler's entry stub, filled in on disk
@@ -171,7 +172,7 @@ impl<'a> VbControl<'a> {
         let slots = self.info.event_handler_slots().ok()?;
         let size = EventSinkVtable::HEADER_SIZE.checked_add((slots as usize).checked_mul(4)?)?;
         let data = map.slice_from_va(va, size).ok()?;
-        EventSinkVtable::parse(data, slots).ok()
+        EventSinkVtable::parse(data, &self.info).ok()
     }
 
     /// Returns the number of events with handler VAs connected.
@@ -301,15 +302,18 @@ impl<'a, 'p> Iterator for ControlEntryIterator<'a, 'p> {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
-        let slots = match info.event_handler_slots() {
-            Ok(v) => v,
-            Err(e) => return Some(Err(e)),
+        let (count, dispatch_slots) = match (info.event_count(), info.dispatch_slots()) {
+            (Ok(count), Ok(dispatch_slots)) => (count, dispatch_slots),
+            (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
         };
-        // The handler slots follow the sink vtable's 0x18-byte header.
-        let event_handler_vas: &[u8] = if sink_va != 0 && slots > 0 {
-            let size = usize::from(slots).saturating_mul(4);
+        // The handler slots follow the sink vtable's 0x18-byte header and
+        // the IDispatch slots of a dual interface's vtable.
+        let event_handler_vas: &[u8] = if sink_va != 0 && count > 0 {
+            let size = usize::from(count).saturating_mul(4);
+            let skip = u32::from(dispatch_slots).saturating_mul(4);
             sink_va
                 .checked_add(EventSinkVtable::HEADER_SIZE as u32)
+                .and_then(|va| va.checked_add(skip))
                 .and_then(|va| self.map.slice_from_va(va, size).ok())
                 .and_then(|data| data.get(..size))
                 .unwrap_or(b"")

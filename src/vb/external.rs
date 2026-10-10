@@ -882,6 +882,13 @@ impl<'a> ExternalDeclareInfo<'a> {
     /// Size of the structure in bytes.
     pub const SIZE: usize = 0x10;
 
+    /// Bytes from the descriptor to the call stub the compiler places after
+    /// it: the descriptor, then 8 bytes nothing reads (0 in every fixture).
+    /// The stub (`mov eax, [cache + 8]; ...; push <descriptor>; call
+    /// <DllFunctionCall>`) starts at the descriptor + 0x18 (VBA6 6.0.9782
+    /// `0x0FB10155`), the address the module's constant pool names.
+    pub const BLOCK_SIZE: usize = 0x18;
+
     /// Parses an external declare info from the given byte slice.
     pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
         let bytes = data.get(..Self::SIZE).ok_or(Error::TooShort {

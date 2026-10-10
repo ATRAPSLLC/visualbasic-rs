@@ -38,7 +38,11 @@
 
 use std::fmt;
 
-use crate::{error::Error, util::read_u16_le};
+use crate::{
+    addressmap::AddressMap,
+    error::Error,
+    util::{read_u16_le, read_u32_le},
+};
 
 /// The resource-release action the runtime performs on a member at destruct.
 ///
@@ -237,6 +241,98 @@ impl<'a> ControlPropertyEntry<'a> {
         self.bytes.get(Self::HEADER_SIZE..).unwrap_or(&[])
     }
 
+    /// VA of the [`RecordLayout`] of a UDT member (nibble 9), the u32 at
+    /// entry+0x08; `None` for other types, and for a UDT none of whose
+    /// members needs init or cleanup, whose entry holds 0 (`records`'
+    /// local `p As Plain`).
+    ///
+    /// Every member of one UDT points to the same layout (`coverage`:
+    /// `Globals.Rec` members and locals at 0x004021C4).
+    pub fn record_layout_va(&self) -> Option<u32> {
+        (self.property_type() == ControlPropertyType::Udt)
+            .then(|| read_u32_le(self.bytes, 0x08).ok())
+            .flatten()
+            .filter(|&va| va != 0 && va != u32::MAX)
+    }
+
+    /// The raw type byte of an array's elements (nibble 5), at entry+0x08:
+    /// its low nibble is a [`ControlPropertyType`] (`data`: 0x69, a UDT,
+    /// for `Dim r(1) As Record`); `None` for other types.
+    pub fn element_type(&self) -> Option<u8> {
+        (self.property_type() == ControlPropertyType::Array)
+            .then(|| self.bytes.get(0x08).copied())
+            .flatten()
+    }
+
+    /// VA of the [`RecordLayout`] of an array's UDT elements, the u32 at
+    /// entry+0x0C; `None` unless the entry is an array of a UDT, and for a
+    /// UDT none of whose members needs init or cleanup, whose entry holds
+    /// 0xFFFFFFFF (`records`' `m_Plain(2) As Plain`).
+    pub fn element_layout_va(&self) -> Option<u32> {
+        let element = self.element_type()?;
+        (ControlPropertyType::from_raw(element) == ControlPropertyType::Udt)
+            .then(|| read_u32_le(self.bytes, 0x0C).ok())
+            .flatten()
+            .filter(|&va| va != 0 && va != u32::MAX)
+    }
+
+    /// Byte offset in the entry of a fixed-size array's inline `SAFEARRAY`
+    /// descriptor (`cDims`, `fFeatures`, `cbElements`, `cLocks`, `pvData`,
+    /// then a `{cElements, lLbound}` per dimension): 0x20 when the element
+    /// type byte has bits 0x60, else 0x10. `None` for a dynamic array
+    /// (flag bit 0) and for other types.
+    pub fn safearray_offset(&self) -> Option<usize> {
+        let element = self.element_type()?;
+        (self.flags() & 0x01 == 0).then_some(if element & 0x60 != 0 { 0x20 } else { 0x10 })
+    }
+
+    /// The `fFeatures` of a fixed-size array's `SAFEARRAY` descriptor
+    /// (`dispid` `Bag.m_Slots(7) As Object`: 0x0452, `FADF_DISPATCH`,
+    /// `FADF_HAVEIID`, `FADF_FIXEDSIZE`, `FADF_STATIC`).
+    pub fn safearray_features(&self) -> Option<u16> {
+        let offset = self.safearray_offset()?.checked_add(2)?;
+        read_u16_le(self.bytes, offset).ok()
+    }
+
+    /// The u32 that follows a fixed-size array's `SAFEARRAY` descriptor
+    /// when its `fFeatures` has `FADF_RECORD` (0x20), `FADF_HAVEIID` (0x40)
+    /// or `FADF_HAVEVARTYPE` (0x80): the entry's last 4 bytes.
+    fn safearray_extra(&self, feature: u16) -> Option<u32> {
+        let offset = self.safearray_offset()?;
+        if self.safearray_features()? & feature == 0 {
+            return None;
+        }
+        let dims = usize::from(read_u16_le(self.bytes, offset).ok()?);
+        let extra = offset
+            .checked_add(0x10)?
+            .checked_add(dims.checked_mul(8)?)?;
+        read_u32_le(self.bytes, extra).ok()
+    }
+
+    /// VA of the elements' IID of a fixed-size array whose `fFeatures` has
+    /// `FADF_HAVEIID` (`dispid` `Bag.m_Slots(7) As Object`:
+    /// `IID_IDispatch`).
+    pub fn safearray_iid_va(&self) -> Option<u32> {
+        self.safearray_extra(0x40)
+    }
+
+    /// The elements' `VARTYPE` of a fixed-size array whose `fFeatures` has
+    /// `FADF_HAVEVARTYPE`: the low word of the u32 after the descriptor
+    /// (`data` `m_Static(1 To 10) As Integer`: 2, `VT_I2`; the high word
+    /// holds no value).
+    pub fn safearray_vartype(&self) -> Option<u16> {
+        self.safearray_extra(0x80)
+            .and_then(|v| u16::try_from(v & 0xFFFF).ok())
+    }
+
+    /// Reads the [`RecordLayout`] a UDT member or an array of UDTs names.
+    pub fn record_layout<'m>(&self, map: &AddressMap<'m>) -> Option<RecordLayout<'m>> {
+        let va = self
+            .record_layout_va()
+            .or_else(|| self.element_layout_va())?;
+        RecordLayout::at(map, va).ok()
+    }
+
     /// Total size (byte stride to the next entry) of this entry.
     ///
     /// Faithful port of `CalcPropertyDataSize` (0x660169D3); the MLIL of
@@ -348,6 +444,98 @@ impl<'a> ControlPropertyEntry<'a> {
             .ok_or(Error::ArithmeticOverflow {
                 context: "calc_safearray_total_size base+dim_data+elem_extra",
             })
+    }
+}
+
+/// The layout of a user-defined type: the members that need init or
+/// cleanup, in [`ControlPropertyEntry`] form.
+///
+/// Named by a UDT member's entry ([`ControlPropertyEntry::record_layout_va`])
+/// and by an array of UDTs ([`ControlPropertyEntry::element_layout_va`]),
+/// in instance tables and procedure cleanup tables alike.
+///
+/// | Offset | Size | Field |
+/// |--------|------|-------|
+/// | 0x00 | 2 | Size of the layout in bytes, header included |
+/// | 0x02 | 2 | Size of the UDT |
+/// | 0x04 | 2 | Reserved (0 in every fixture) |
+/// | 0x06 | 2 | Number of entries |
+/// | 0x08 | 2 | Size of the UDT's ANSI form ([`ansi_size`](RecordLayout::ansi_size)) |
+/// | 0x0A | 2 | Unknown (0x3C04, 0x3404, 0x3404, 0x2C04) |
+/// | 0x0C | var | The entries |
+///
+/// `coverage` `Globals.bas`' `Rec` (0x50 bytes) lists `fStr As String`
+/// (0x24), `fV As Variant` (0x28), `fO As Object` (0x3C) and `fFx As String
+/// * 8` (0x40); its layout is 0x22 bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordLayout<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> RecordLayout<'a> {
+    /// Size of the header before the entries.
+    pub const HEADER_SIZE: usize = 0x0C;
+
+    /// Parses a record layout from the given byte slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TooShort`] if `data` is shorter than the header or
+    /// the size at 0x00.
+    pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
+        let size = usize::from(read_u16_le(data, 0x00)?).max(Self::HEADER_SIZE);
+        let bytes = data.get(..size).ok_or(Error::TooShort {
+            expected: size,
+            actual: data.len(),
+            context: "RecordLayout",
+        })?;
+        Ok(Self { bytes })
+    }
+
+    /// Reads the record layout at `va`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `va` is not mapped or the layout does not fit.
+    pub fn at(map: &AddressMap<'a>, va: u32) -> Result<Self, Error> {
+        Self::parse(map.slice_from_va(va, Self::HEADER_SIZE)?)
+    }
+
+    /// Size of the layout in bytes, header included, at offset 0x00.
+    #[inline]
+    pub fn size(&self) -> Result<u16, Error> {
+        read_u16_le(self.bytes, 0x00)
+    }
+
+    /// Size of the UDT at offset 0x02.
+    #[inline]
+    pub fn record_size(&self) -> Result<u16, Error> {
+        read_u16_le(self.bytes, 0x02)
+    }
+
+    /// Size of the UDT's ANSI form at offset 0x08: its size with each
+    /// `String * N` member taking N bytes instead of 2N, rounded up to 4
+    /// (`coverage` `Rec` 0x50 to 0x48, `FileRec` 0x24 to 0x1C). The
+    /// runtime's Unicode-to-ANSI record conversion copies this many bytes
+    /// (MSVBVM60 6.00.8176 `0x6605B12D`).
+    #[inline]
+    pub fn ansi_size(&self) -> Result<u16, Error> {
+        read_u16_le(self.bytes, 0x08)
+    }
+
+    /// Number of entries at offset 0x06.
+    #[inline]
+    pub fn entry_count(&self) -> Result<u16, Error> {
+        read_u16_le(self.bytes, 0x06)
+    }
+
+    /// The members that need init or cleanup: offset in the UDT, type and
+    /// type data.
+    pub fn entries(&self) -> ControlPropertyIter<'a> {
+        ControlPropertyIter::new(
+            self.bytes.get(Self::HEADER_SIZE..).unwrap_or(&[]),
+            self.entry_count().unwrap_or(0),
+        )
     }
 }
 

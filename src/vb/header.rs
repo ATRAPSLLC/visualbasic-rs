@@ -4,11 +4,12 @@
 //! located via the `push <imm32>` instruction at the PE entry point and
 //! always starts with the `"VB5!"` magic signature.
 //!
-//! Size: `0x68` bytes parsed (104 bytes). The compiler writes a `0x78`-byte
-//! fixed part: `0x68` to `0x77` are zero in every fixture, and the strings
-//! the `bSZ*` fields at `0x58` to `0x64` point to start at `0x78`, right
-//! after it. The `bSZ*` fields are byte offsets from the start of the
-//! VBHeader, not VAs. The runtime reads at least one of them: MSVBVM60
+//! Size: `0x78` bytes. The compiler writes the fixed part, then the four
+//! strings the `bSZ*` fields at `0x58` to `0x64` point to, each with its NUL
+//! and no padding, from `0x78` on. The `bSZ*` fields are byte offsets from
+//! the start of the VBHeader, not VAs. The last 16 bytes of the fixed part,
+//! `0x68` to `0x77`, are a GUID the compiler always writes as `GUID_NULL`
+//! ([`reserved_guid`](VbHeader::reserved_guid)). The runtime reads at least one of them: MSVBVM60
 //! 6.00.8176 at `0x660B1B11` adds `bSZProjectExeName` (+0x5C) to the
 //! VBHeader address and passes the string as the caption of an error
 //! `MessageBoxA`.
@@ -16,11 +17,12 @@
 use crate::{
     error::Error,
     util::{read_fixed_cstr, read_u16_le, read_u32_le},
+    vb::control::Guid,
 };
 
 /// View over a VBHeader (EXEPROJECTINFO) structure.
 ///
-/// The VBHeader is 0x68 bytes and begins with `"VB5!"`. It is the top-level
+/// The VBHeader is 0x78 bytes and begins with `"VB5!"`. It is the top-level
 /// structure that the VB6 runtime reads when initializing a VB6 executable.
 ///
 /// # Layout
@@ -50,6 +52,7 @@ use crate::{
 /// | 0x5C | 4 | `bSZProjectExeName` (offset from VBHeader start) |
 /// | 0x60 | 4 | `bSZProjectHelpFile` (offset from VBHeader start) |
 /// | 0x64 | 4 | `bSZProjectName` (offset from VBHeader start) |
+/// | 0x68 | 16 | A GUID, `GUID_NULL` in every binary (see [`reserved_guid`](Self::reserved_guid)) |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VbHeader<'a> {
     bytes: &'a [u8],
@@ -57,7 +60,7 @@ pub struct VbHeader<'a> {
 
 impl<'a> VbHeader<'a> {
     /// Total size of the VBHeader structure in bytes.
-    pub const SIZE: usize = 0x68;
+    pub const SIZE: usize = 0x78;
 
     /// Expected magic signature at offset 0x00.
     pub const MAGIC: &'static [u8; 4] = b"VB5!";
@@ -70,11 +73,11 @@ impl<'a> VbHeader<'a> {
     /// # Arguments
     ///
     /// * `data` - Byte slice containing the VBHeader. Only the first
-    ///   `0x68` bytes are used; additional bytes are ignored.
+    ///   `0x78` bytes are used; additional bytes are ignored.
     ///
     /// # Errors
     ///
-    /// - [`Error::TooShort`] if `data.len() < 0x68`.
+    /// - [`Error::TooShort`] if `data.len() < 0x78`.
     /// - [`Error::BadMagic`] if the first 4 bytes are not `"VB5!"`.
     pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
         let bytes = data.get(..Self::SIZE).ok_or(Error::TooShort {
@@ -295,6 +298,15 @@ impl<'a> VbHeader<'a> {
     #[inline]
     pub fn project_name_offset(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x64)
+    }
+
+    /// The GUID at offset 0x68: `GUID_NULL` in every binary.
+    ///
+    /// The compiler copies its `IID_NULL` here when it writes the header
+    /// (VB6.EXE 6.00.8176 `0x0045A2B0`); no runtime read of it was found.
+    /// `None` when the bytes do not read as a GUID.
+    pub fn reserved_guid(&self) -> Option<Guid> {
+        Guid::from_bytes(self.bytes.get(0x68..0x78)?)
     }
 }
 

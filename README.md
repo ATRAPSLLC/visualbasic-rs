@@ -47,17 +47,34 @@ for obj in project.objects()? {
 
 ## What it parses
 
-- **PE entry point** detection (EXE push-stub and DLL export patterns)
+- **PE entry point** detection (EXE push-stub and DLL export patterns) and
+  the COM export stubs of an ActiveX DLL or OCX
 - **VBHeader**, **ProjectData**, **ObjectTable** and the full structure chain
 - **PublicObjectDescriptor**, **ObjectInfo**, **OptionalObjectInfo**, **PrivateObjectDescriptor**
+- **Members and prototypes**: public variables and `Implements`, procedure
+  and event prototypes with their parameter names, and who owns each name
+- **Type references**: type libraries, interfaces and user-defined types a
+  member or parameter is typed by; UDT layouts and array element types
 - **P-Code bytecode**: opcode tables, operand decoding, streaming instruction
   iterator; each opcode's effect on the evaluation and x87 stacks and on Pr,
-  the object register, read from the runtime's handlers
-- **Controls**: ControlInfo, event sink vtables, event handler thunks
+  the object register, read from the runtime's handlers; what each constant
+  pool entry an instruction names holds
+- **Pool descriptors**: the record I/O descriptors of `Get #` and `Put #`,
+  the item lists of `Print`, `Write` and `Input`, the array headers of
+  fixed arrays in records, and the creation descriptors of `New`
+- **Structure extents**: where every structure the crate reads lies in the
+  image, for a disassembler that must not decode it
+- **Controls**: ControlInfo, event sink vtables (controls, `WithEvents`,
+  `Implements`), event handler thunks
+- **Native code**: every procedure that stores an unwind record, named by a
+  table or not, with its error handlers, `Resume` targets and `Erl` line
+  numbers; every address of native code the structures name; the region
+  between the code markers
 - **COM metadata**: GUIDs, TypeLib registration, external component tables
 - **Form binary data**: control trees, property streams, font/picture resources
 - **MSVBVM60.DLL exports**: every export by name and ordinal, with signatures
-  for most, so the runtime functions P-Code imports by ordinal are named
+  for most and whether it returns, so the runtime functions P-Code imports
+  by ordinal are named
 - **Imports**: the PE import table by import address table slot
 
 ## High-level walkers
@@ -76,6 +93,9 @@ each substructure by hand:
   `Mixed` binaries (combines the project flag with a per-object scan).
 - [`VbProject::diagnostics()`] - eager parse-health probe surfacing
   missing optional structures and known-anomaly patterns.
+- [`VbProject::structure_extents()`] - the extent of every structure the
+  crate reads (headers, tables, descriptors, procedure descriptors and
+  P-Code, constant pool data), each measured by the walk that reads it.
 
 ## Analysing P-Code
 

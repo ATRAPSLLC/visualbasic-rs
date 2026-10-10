@@ -595,6 +595,32 @@ impl<'a> FormControlRecord<'a> {
         self.ctype
     }
 
+    /// The ProgID of a hosted control's class as raw bytes: an ActiveX
+    /// control's (`MSWinsockLib.Winsock`) or a project's own UserControl's
+    /// (`DispId.Dial`).
+    ///
+    /// A hosted control's record has type 0xFF and begins its properties
+    /// with the ProgID, as a `u16` length, the bytes and a NUL
+    /// (`tests/fixtures/activex`, `dispid`, `ocx`), whether or not the
+    /// control has an event handler. It is the
+    /// [`ExternalComponentEntry::prog_id`](crate::vb::external::ExternalComponentEntry::prog_id)
+    /// of the control's class. `None` for any other record.
+    pub fn prog_id_bytes(&self) -> Option<&'a [u8]> {
+        if self.ctype != FormControlType::Unknown(0xFF) {
+            return None;
+        }
+        let length = usize::from(read_u16_le(self.properties, 0).ok()?);
+        let end = length.checked_add(2)?;
+        let bytes = self.properties.get(2..end)?;
+        (self.properties.get(end) == Some(&0)).then_some(bytes)
+    }
+
+    /// The ProgID of a hosted control's class
+    /// ([`prog_id_bytes`](Self::prog_id_bytes)) as a lossy UTF-8 string.
+    pub fn prog_id(&self) -> Option<Cow<'a, str>> {
+        self.prog_id_bytes().map(String::from_utf8_lossy)
+    }
+
     /// Raw property stream bytes (opcode+value pairs, excluding the 0xFF terminator).
     #[inline]
     pub fn raw_properties(&self) -> &'a [u8] {

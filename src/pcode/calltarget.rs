@@ -16,7 +16,7 @@
 //! | `ThisVCall*` | `Me`'s object (the calling object): the method at the vtable offset |
 //! | `VCall*` (`%2`) | the receiver's class is not in the instruction: [`Callee::Unknown`]; a caller that knows Pr's source asks [`CallResolver::resolve_with_pr`] (Pr loaded by `FLdPrThis` is `Me`), one that knows its class asks [`CallResolver::resolve_vtable`] |
 //! | `ImpAdCall*` (`%x`) | the pool entry: a procedure thunk (module procedure, `Friend` method), a `Declare` stub or an import thunk; the operand's byte count is exact either way |
-//! | `Late*` | the member name (pool, [`ConstantPool::name_at`]) or the DISPID, and the argument count operand |
+//! | `Late*` | the member name (pool, [`ConstantPool::name_at`]) or the DISPID, and the argument count operand; a `LateId*` on a receiver whose class the frame slots know reaches the member its DISPID names ([`LateTarget`], [`CallResolver::resolve_with_slots`]) |
 //!
 //! # The vtable of a project object
 //!
@@ -72,6 +72,20 @@
 //! return pointer; `LBound` 0x44, `UBound` 0x48 and `Count` 0x4C the return
 //! pointer).
 //!
+//! # Hosted controls
+//!
+//! A form's getter for a control the project hosts (an ActiveX control, or
+//! one of the project's own UserControls) returns the control's extender:
+//! the compiler calls it late, by DISPID. The control's form record names
+//! its class by ProgID, and [`VbProject::components`] gives the class's
+//! default interface, which the getter's result is typed with
+//! ([`CallResolver::returned_interface`]). A DISPID of the class names one
+//! of its members: a UserControl's procedure by its prototype's
+//! [`FuncTypDesc::dispid`], an ActiveX control's member through the
+//! caller's catalog ([`InterfaceCatalog::dispatched`]). The extender's own
+//! members are called 0x3000 below the DISPIDs `_VBControlExtender`
+//! declares ([`RuntimeInterfaces::extender_member`]).
+//!
 //! [`Instruction::stack_effect`]: super::decoder::Instruction::stack_effect
 
 use std::{
@@ -96,7 +110,7 @@ use crate::{
         constantpool::{ConstantPool, PoolEntry},
         control::Guid,
         exports::VbParamType,
-        functype::{ArgType, FuncTypDesc},
+        functype::{ArgType, FuncTypDesc, PropertyKind},
     },
 };
 
@@ -205,12 +219,45 @@ pub enum Callee {
         name: Option<String>,
         /// The member's DISPID (`LateId*`).
         dispid: Option<i32>,
+        /// The member the DISPID names, when the receiver's class is known
+        /// ([`CallResolver::resolve_with_slots`]). The call still goes
+        /// through `IDispatch::Invoke`, its arguments Variants by value.
+        target: Option<LateTarget>,
     },
     /// The instruction does not say (`VCall*` on Pr of unknown interface).
     Unknown {
         /// Byte offset of the member in the receiver's vtable, if the
         /// opcode carries one.
         vtable_offset: Option<u16>,
+    },
+}
+
+/// The member a late-bound call by DISPID reaches ([`Callee::Late`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LateTarget {
+    /// A procedure of the project: a public method or property procedure
+    /// of one of its classes or UserControls, whose
+    /// [`FuncTypDesc::dispid`] is the call's.
+    Procedure {
+        /// Index of the object.
+        object: u16,
+        /// Index of the method in the object's method table.
+        method: u16,
+        /// How the call invokes it.
+        invoke: InvokeKind,
+    },
+    /// Members of an external interface the [`InterfaceCatalog`] describes
+    /// ([`InterfaceCatalog::dispatched`]): a hosted control's own, or its
+    /// extender's (`_VBControlExtender`,
+    /// [`RuntimeInterfaces::extender_member`]). Each is invoked the way the
+    /// call invokes it.
+    Members {
+        /// The interface's IID.
+        iid: Guid,
+        /// The member's DISPID in that interface.
+        dispid: i32,
+        /// The member, under each name the catalog gives the DISPID.
+        members: Vec<InterfaceMember>,
     },
 }
 
@@ -269,8 +316,8 @@ struct ObjectFacts<'a> {
     methods: Vec<MethodFacts<'a>>,
     /// Method index by vtable offset, for the methods whose slot is known.
     by_vtable: HashMap<u16, u16>,
-    /// Control getters by vtable offset: the control's index and name.
-    controls: HashMap<u16, (u16, String)>,
+    /// Control getters by vtable offset.
+    controls: HashMap<u16, ControlGetter>,
     /// Member variable accessors by vtable offset: the variable's instance
     /// offset and the runtime function.
     variables: HashMap<u16, (u32, String)>,
@@ -279,6 +326,24 @@ struct ObjectFacts<'a> {
     builtin: Option<(Guid, u16)>,
     /// The VA of its ObjectInfo, which a prototype's class type names.
     info_va: u32,
+}
+
+/// The getter a form's or UserControl's vtable has for one of its controls.
+#[derive(Debug, Clone, Default)]
+struct ControlGetter {
+    /// The control's index.
+    index: u16,
+    /// Its name.
+    name: String,
+    /// The default interface of a hosted control's class, the class its
+    /// form record names ([`FormControlRecord::prog_id`]); `None` for an
+    /// intrinsic control and a control array.
+    ///
+    /// [`FormControlRecord::prog_id`]: crate::vb::formdata::FormControlRecord::prog_id
+    interface: Option<Guid>,
+    /// For a control array of a hosted class, that class's default
+    /// interface: the array's `Item` returns an element.
+    elements: Option<Guid>,
 }
 
 /// The interfaces a procedure's own code states for the objects in its frame
@@ -316,6 +381,10 @@ pub struct SlotInterfaces {
     /// Each store into a frame slot, by slot and P-Code offset, with the
     /// interface of what it stores when known.
     stores: BTreeMap<i16, BTreeMap<u16, Option<Guid>>>,
+    /// The interface of the elements of the control array a slot holds
+    /// ([`CallResolver::returned_elements`]); `None` for a slot two arrays
+    /// of different classes pass through.
+    elements: HashMap<i16, Option<Guid>>,
 }
 
 /// What one store into a frame slot stores.
@@ -404,9 +473,11 @@ impl SlotInterfaces {
                 last_load = Some(source);
             }
             let call = resolver.resolve_with_slots(object, insn, pr.as_ref(), known);
-            let returned = call
-                .as_ref()
-                .and_then(|call| resolver.returned_interface(call));
+            let returned = call.as_ref().and_then(|call| {
+                resolver
+                    .returned_interface(call)
+                    .or_else(|| known.element_at(call, pr.as_ref()))
+            });
             // A call that returns through its [retval] pointer fills the slot
             // whose address it consumes last (pushed first).
             if let (Some(iid), Some(call)) = (returned, call.as_ref())
@@ -433,6 +504,21 @@ impl SlotInterfaces {
             let Some(target) = frame_operand(next).filter(|_| is_store(next)) else {
                 continue;
             };
+            if insn.info.pushes != 0
+                && let Some(class) = call
+                    .as_ref()
+                    .and_then(|call| resolver.returned_elements(call))
+            {
+                found
+                    .elements
+                    .entry(target)
+                    .and_modify(|known| {
+                        if *known != Some(class) {
+                            *known = None;
+                        }
+                    })
+                    .or_insert(Some(class));
+            }
             let stored = match insn.info.mnemonic {
                 "CastAd" => match insn.operands.first() {
                     Some(Some(Operand::ConstPoolIndex(entry))) => pool
@@ -572,6 +658,25 @@ impl SlotInterfaces {
         found
     }
 
+    /// The element a control array's `Item` returns when `call` is that
+    /// `Item` ([`RuntimeInterfaces::CONTROL_ARRAY_ITEM`]) on an array held
+    /// in the frame slot Pr was loaded from.
+    fn element_at(&self, call: &CallSignature<'_>, pr: Option<&PrSource>) -> Option<Guid> {
+        let Callee::Interface {
+            iid, vtable_offset, ..
+        } = &call.callee
+        else {
+            return None;
+        };
+        let Some(PrSource::Frame { offset }) = pr else {
+            return None;
+        };
+        if iid.bytes != [0; 16] || *vtable_offset != RuntimeInterfaces::CONTROL_ARRAY_ITEM {
+            return None;
+        }
+        self.elements.get(offset).copied().flatten()
+    }
+
     /// Records `iid` for slot `offset`; a second, different one makes the
     /// slot conflicting.
     fn add(&mut self, offset: i16, iid: Guid) {
@@ -674,6 +779,10 @@ pub struct CallResolver<'a, 'p> {
     by_proc_dsc: HashMap<u32, (u16, u16)>,
     /// The descriptions of external interfaces, if supplied.
     interfaces: Option<Arc<dyn InterfaceCatalog + Send + Sync>>,
+    /// The default interfaces of the classes the project hosts as controls
+    /// ([`VbProject::components`]): an object of one, reached through its
+    /// control getter, is the control's extender.
+    hosted: Vec<Guid>,
 }
 
 /// How a member of an interface is invoked.
@@ -687,6 +796,44 @@ pub enum InvokeKind {
     Let,
     /// A property set (`Set` of an object property).
     Set,
+}
+
+impl InvokeKind {
+    /// How the late-bound call `mnemonic` invokes its member: a store
+    /// (`LateIdSt`, `LateIdCallSt`, `LateMemSt` ...) lets a property, a
+    /// store of an object (`*StAd`) sets one, every other form (`LateIdCall`,
+    /// `LateIdLdVar`, `LateIdCallLdVar` ...) calls a method or gets a
+    /// property, which [`admits`](Self::admits) both stand for.
+    pub fn of_late_call(mnemonic: &str) -> Self {
+        if mnemonic.ends_with("StAd") {
+            Self::Set
+        } else if mnemonic.ends_with("St") {
+            Self::Let
+        } else {
+            Self::Method
+        }
+    }
+
+    /// The prefix COM gives the function of a property accessor invoked
+    /// this way (`get_`, `put_`, `putref_`); none for a method.
+    pub fn accessor_prefix(self) -> &'static str {
+        match self {
+            Self::Method => "",
+            Self::Get => "get_",
+            Self::Let => "put_",
+            Self::Set => "putref_",
+        }
+    }
+
+    /// Returns whether a call invoking this way reaches a member invoked
+    /// as `member`: the same kind, or for a call, a method or a property
+    /// get ([`of_late_call`](Self::of_late_call)).
+    pub fn admits(self, member: Self) -> bool {
+        match self {
+            Self::Method => matches!(member, Self::Method | Self::Get),
+            _ => self == member,
+        }
+    }
 }
 
 /// A member of an external interface, as its type library describes it.
@@ -727,6 +874,14 @@ pub trait InterfaceCatalog {
     /// property's `Let` and `Set`, a `_Default` alias), all with the same
     /// arguments. Empty when the interface or the slot is unknown.
     fn members(&self, iid: &Guid, vtable_offset: u16) -> Vec<InterfaceMember>;
+
+    /// Returns the members of interface `iid` with DISPID `dispid`, which a
+    /// late-bound call names it by: a property's get and its let or set
+    /// share one. Empty when the interface or the DISPID is unknown, which
+    /// it is unless the catalog overrides this.
+    fn dispatched(&self, _iid: &Guid, _dispid: i32) -> Vec<InterfaceMember> {
+        Vec::new()
+    }
 }
 
 /// The runtime's interfaces that no type library describes, built into the
@@ -749,6 +904,9 @@ impl RuntimeInterfaces {
     /// The name given to the control-array object's interface.
     pub const CONTROL_ARRAY: &'static str = "ControlArray";
 
+    /// The vtable offset of the control-array object's `Item`.
+    pub const CONTROL_ARRAY_ITEM: u16 = 0x40;
+
     /// The VBA library's `_ErrObject` interface,
     /// `{A4C466B8-499F-101B-BB78-00AA00383CBB}` (`Err.Raise` at 0x44,
     /// `Err.Clear` at 0x48).
@@ -758,6 +916,48 @@ impl RuntimeInterfaces {
             0x3C, 0xBB,
         ],
     };
+
+    /// VB's `_VBControlExtender` interface,
+    /// `{164CBDD0-7321-11D1-A1E8-00A0C90F2731}` (`VB6.OLB`): the properties
+    /// and methods the extender of a hosted control adds to the control's
+    /// own (`Name`, `Left`, `Visible`, `Tag`, `SetFocus`, `Move`, ...).
+    pub const CONTROL_EXTENDER: Guid = Guid {
+        bytes: [
+            0xD0, 0xBD, 0x4C, 0x16, 0x21, 0x73, 0xD1, 0x11, 0xA1, 0xE8, 0x00, 0xA0, 0xC9, 0x0F,
+            0x27, 0x31,
+        ],
+    };
+
+    /// The first DISPID the compiler calls an extender member by.
+    const EXTENDER_FIRST: u32 = 0x8001_0000;
+
+    /// One past the last DISPID the compiler calls an extender member by.
+    const EXTENDER_END: u32 = 0x8001_2000;
+
+    /// How far above the DISPID a call names an extender member by
+    /// `_VBControlExtender` declares it.
+    const EXTENDER_SHIFT: u32 = 0x3000;
+
+    /// Returns the DISPID [`CONTROL_EXTENDER`](Self::CONTROL_EXTENDER)
+    /// declares for the extender member a late-bound call on a hosted
+    /// control names by `dispid`, or `None` for a DISPID outside the
+    /// extender's.
+    ///
+    /// The compiler calls the extender's members 0x3000 below the DISPIDs
+    /// the interface declares: its properties from 0x80010000 (`Name`,
+    /// declared 0x80013000), its methods from 0x80011000 (`SetFocus`,
+    /// declared 0x80014000). Measured on every extender member
+    /// `tests/fixtures/dispid` calls: the properties `Name`, `Left`, `Top`,
+    /// `Width`, `Height`, `Visible`, `Parent`, `DragMode`, `Tag`,
+    /// `TabIndex`, `object`, `HelpContextID`, `WhatsThisHelpID`,
+    /// `Container`, `CausesValidation` and `ToolTipText`, and the methods
+    /// `SetFocus`, `ZOrder`, `Move`, `Drag` and `ShowWhatsThis`.
+    pub fn extender_member(dispid: i32) -> Option<i32> {
+        let raw = dispid.cast_unsigned();
+        (Self::EXTENDER_FIRST..Self::EXTENDER_END)
+            .contains(&raw)
+            .then(|| raw.wrapping_add(Self::EXTENDER_SHIFT).cast_signed())
+    }
 
     /// Returns the interface of the object a runtime export returns, for
     /// the exports that return one fixed interface: `rtcErrObj` (`Err`)
@@ -774,7 +974,7 @@ impl InterfaceCatalog for RuntimeInterfaces {
             return Vec::new();
         }
         let (name, invoke, arg_widths) = match vtable_offset {
-            0x40 => ("Item", InvokeKind::Get, vec![1, 1]),
+            Self::CONTROL_ARRAY_ITEM => ("Item", InvokeKind::Get, vec![1, 1]),
             0x44 => ("LBound", InvokeKind::Get, vec![1]),
             0x48 => ("UBound", InvokeKind::Get, vec![1]),
             0x4C => ("Count", InvokeKind::Get, vec![1]),
@@ -804,12 +1004,23 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
     ///
     /// Returns an error if the project's object table cannot be read.
     pub fn new(project: &'p VbProject<'a>) -> Result<Self, Error> {
+        // The hosted classes' default interfaces, by ProgID.
+        let classes: HashMap<String, Guid> = project
+            .components()
+            .map(|components| {
+                components
+                    .filter_map(|component| {
+                        Some((component.prog_id().into_owned(), component.default_iid()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut objects = Vec::new();
         let mut by_proc_dsc = HashMap::new();
         for (object_index, object) in project.objects()?.enumerate() {
             let object_index = u16::try_from(object_index).unwrap_or(u16::MAX);
             objects.push(match object {
-                Ok(object) => Self::object_facts(&object, object_index, &mut by_proc_dsc),
+                Ok(object) => Self::object_facts(&object, object_index, &classes, &mut by_proc_dsc),
                 Err(_) => ObjectFacts::default(),
             });
         }
@@ -818,6 +1029,7 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
             objects,
             by_proc_dsc,
             interfaces: None,
+            hosted: classes.into_values().collect(),
         })
     }
 
@@ -862,9 +1074,12 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
     }
 
     /// Collects one object's facts, recording its methods' ProcDscInfo VAs.
+    /// `classes` gives the default interface of each class the project
+    /// hosts as a control, by ProgID.
     fn object_facts(
         object: &VbObject<'a, 'p>,
         object_index: u16,
+        classes: &HashMap<String, Guid>,
         by_proc_dsc: &mut HashMap<u32, (u16, u16)>,
     ) -> ObjectFacts<'a> {
         let mut iids: Vec<Guid> = object.default_iids().map(|(_, guid)| guid).collect();
@@ -930,18 +1145,48 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
                     .flatten()
             })
         });
+        // A hosted control's record names its class. A control array has a
+        // record per element, each with its array index, and its getter
+        // returns the array.
+        let mut hosted: HashMap<u16, (Option<Guid>, bool)> = HashMap::new();
         if let Some(form_data) = form_data {
             for record in form_data.controls() {
                 let index = u16::from(record.cid());
                 if !named.iter().any(|(known, _)| *known == index) {
                     named.push((index, record.name().into_owned()));
                 }
+                let class = record
+                    .prog_id()
+                    .and_then(|prog_id| classes.get(prog_id.as_ref()).copied());
+                let array = record.array_index().is_some();
+                hosted
+                    .entry(index)
+                    .and_modify(|(known, in_array)| {
+                        if *known != class {
+                            *known = None;
+                        }
+                        *in_array |= array;
+                    })
+                    .or_insert((class, array));
             }
         }
         if let Some((_, size)) = builtin {
             for (index, name) in named {
                 if let Some(offset) = index.checked_mul(4).and_then(|o| o.checked_add(size)) {
-                    controls.insert(offset, (index, name));
+                    let (interface, elements) = match hosted.get(&index) {
+                        Some(&(class, false)) => (class, None),
+                        Some(&(class, true)) => (None, class),
+                        None => (None, None),
+                    };
+                    controls.insert(
+                        offset,
+                        ControlGetter {
+                            index,
+                            name,
+                            interface,
+                            elements,
+                        },
+                    );
                 }
             }
         }
@@ -1072,7 +1317,9 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
             .map(|link| match link.map(|link| link.kind) {
                 Ok(MethodLinkKind::Empty) => Link::Empty,
                 Ok(MethodLinkKind::Procedure { proc_dsc_va }) => Link::Procedure(proc_dsc_va),
-                Ok(MethodLinkKind::Variable { offset, thunk_va }) => Link::Variable {
+                Ok(MethodLinkKind::Variable {
+                    offset, thunk_va, ..
+                }) => Link::Variable {
                     offset,
                     function: function(thunk_va),
                 },
@@ -1154,12 +1401,12 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
         if let Some(&method) = facts.by_vtable.get(&offset) {
             return self.procedure(object, method);
         }
-        if let Some((index, name)) = facts.controls.get(&offset) {
+        if let Some(getter) = facts.controls.get(&offset) {
             return CallSignature {
                 callee: Callee::Control {
                     object,
-                    index: *index,
-                    name: name.clone(),
+                    index: getter.index,
+                    name: getter.name.clone(),
                 },
                 arg_slots: Some(0),
                 arg_widths: Some(Vec::new()),
@@ -1265,16 +1512,27 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
     /// Returns the interface of the object a resolved call returns: a
     /// catalog member's [`InterfaceMember::returns_interface`], a project
     /// method whose prototype returns one of the project's classes (that
-    /// class's default interface), or a runtime export with a fixed object
-    /// return ([`RuntimeInterfaces::import_return`]).
+    /// class's default interface), a runtime export with a fixed object
+    /// return ([`RuntimeInterfaces::import_return`]), or the getter of a
+    /// hosted control (its class's default interface: the getter returns
+    /// the control's extender, whose members late-bound calls reach,
+    /// [`resolve_with_slots`](Self::resolve_with_slots)).
     pub fn returned_interface(&self, call: &CallSignature<'_>) -> Option<Guid> {
         match &call.callee {
             Callee::Interface { members, .. } => members.first()?.returns_interface,
             Callee::Import { function, .. } => RuntimeInterfaces::import_return(function),
+            Callee::Control { object, index, .. } => {
+                self.objects
+                    .get(usize::from(*object))?
+                    .controls
+                    .values()
+                    .find(|getter| getter.index == *index)?
+                    .interface
+            }
             Callee::Procedure { .. } => {
                 let returns = call.signature.as_ref()?.return_type()?;
                 let info_va = returns
-                    .object_va()
+                    .descriptor_va()
                     .filter(|_| returns.code() & 0x5F == 0x13)?;
                 self.objects
                     .iter()
@@ -1287,10 +1545,28 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
         }
     }
 
+    /// Returns the interface of the elements of the control array a
+    /// resolved call returns: the getter of a control array of a hosted
+    /// class gives that class's default interface, which the array's `Item`
+    /// returns ([`SlotInterfaces`] carries it from the slot holding the
+    /// array to the one `Item` writes).
+    pub fn returned_elements(&self, call: &CallSignature<'_>) -> Option<Guid> {
+        let Callee::Control { object, index, .. } = &call.callee else {
+            return None;
+        };
+        self.objects
+            .get(usize::from(*object))?
+            .controls
+            .values()
+            .find(|getter| getter.index == *index)?
+            .elements
+    }
+
     /// Resolves `instruction` like [`resolve_with_pr`](Self::resolve_with_pr),
-    /// and a `VCall*` that carries no IID (the typed forms, `VCallUI1`,
-    /// `VCallFPR8`, ...) through the interface `slots` know for the frame
-    /// slot Pr was loaded from.
+    /// and through the interface `slots` know for the frame slot Pr was
+    /// loaded from: a `VCall*` that carries no IID (the typed forms,
+    /// `VCallUI1`, `VCallFPR8`, ...) to the member at its vtable offset, a
+    /// `LateId*` to the member its DISPID names ([`LateTarget`]).
     pub fn resolve_with_slots(
         &self,
         object: u16,
@@ -1298,18 +1574,80 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
         pr: Option<&PrSource>,
         slots: &SlotInterfaces,
     ) -> Option<CallSignature<'a>> {
-        let resolved = self.resolve_with_pr(object, instruction, pr)?;
-        match resolved.callee {
+        let mut resolved = self.resolve_with_pr(object, instruction, pr)?;
+        if instruction.info.receiver != Receiver::Pr {
+            return Some(resolved);
+        }
+        let Some(iid) = slots.for_pr_at(pr, instruction.offset) else {
+            return Some(resolved);
+        };
+        match &mut resolved.callee {
             Callee::Unknown {
                 vtable_offset: Some(offset),
-            } if instruction.info.receiver == Receiver::Pr => {
-                match slots.for_pr_at(pr, instruction.offset) {
-                    Some(iid) => Some(self.interface_vtable(iid, offset)),
-                    None => Some(resolved),
-                }
+            } => Some(self.interface_vtable(iid, *offset)),
+            Callee::Late {
+                dispid: Some(dispid),
+                target,
+                ..
+            } => {
+                *target = self.late_target(iid, *dispid, instruction.info.mnemonic);
+                Some(resolved)
             }
             _ => Some(resolved),
         }
+    }
+
+    /// The member DISPID `dispid` names on an object of interface `iid`,
+    /// invoked the way the late-bound call `mnemonic` invokes it
+    /// ([`InvokeKind::of_late_call`]): a hosted control's extender member
+    /// ([`RuntimeInterfaces::extender_member`], whichever class the control
+    /// is), a project class's procedure whose prototype carries the DISPID,
+    /// or a member the catalog describes. `None` when none is invoked that
+    /// way.
+    fn late_target(&self, iid: Guid, dispid: i32, mnemonic: &str) -> Option<LateTarget> {
+        let invoke = InvokeKind::of_late_call(mnemonic);
+        let (iid, dispid) = match RuntimeInterfaces::extender_member(dispid) {
+            Some(declared) if self.hosted.contains(&iid) => {
+                (RuntimeInterfaces::CONTROL_EXTENDER, declared)
+            }
+            _ => (iid, dispid),
+        };
+        if let Some(object) = self
+            .objects
+            .iter()
+            .position(|facts| facts.iids.contains(&iid))
+        {
+            let methods = &self.objects.get(object)?.methods;
+            return methods.iter().enumerate().find_map(|(method, facts)| {
+                let ftd = facts.ftd?;
+                let kind = match ftd.property_kind() {
+                    PropertyKind::None => InvokeKind::Method,
+                    PropertyKind::Get => InvokeKind::Get,
+                    PropertyKind::Let => InvokeKind::Let,
+                    PropertyKind::Set => InvokeKind::Set,
+                    PropertyKind::Unknown(_) => return None,
+                };
+                (ftd.dispid().ok()? == dispid && invoke.admits(kind)).then(|| {
+                    LateTarget::Procedure {
+                        object: u16::try_from(object).unwrap_or(u16::MAX),
+                        method: u16::try_from(method).unwrap_or(u16::MAX),
+                        invoke: kind,
+                    }
+                })
+            });
+        }
+        let members: Vec<InterfaceMember> = self
+            .interfaces
+            .as_ref()?
+            .dispatched(&iid, dispid)
+            .into_iter()
+            .filter(|member| invoke.admits(member.invoke))
+            .collect();
+        (!members.is_empty()).then_some(LateTarget::Members {
+            iid,
+            dispid,
+            members,
+        })
     }
 
     /// Simulates a procedure's stacks ([`ProcedureStack::simulate`]) with
@@ -1585,7 +1923,11 @@ impl<'a, 'p: 'a> CallResolver<'a, 'p> {
             _ => Some(0),
         };
         CallSignature {
-            callee: Callee::Late { name, dispid },
+            callee: Callee::Late {
+                name,
+                dispid,
+                target: None,
+            },
             arg_slots: argc.map(|n| n.saturating_mul(4)),
             arg_widths: argc.map(|n| vec![4; usize::from(n)]),
             signature: None,
@@ -1618,6 +1960,17 @@ impl fmt::Display for Callee {
                 function,
             } => write!(f, "object{object}.var_{offset:X}:{function}"),
             Self::Event { id } => write!(f, "event#{id}"),
+            Self::Late {
+                target: Some(LateTarget::Procedure { object, method, .. }),
+                ..
+            } => write!(f, "late:object{object}.method{method}"),
+            Self::Late {
+                target: Some(LateTarget::Members { members, .. }),
+                ..
+            } => match members.first() {
+                Some(member) => write!(f, "late:{}.{}", member.interface, member.name),
+                None => f.write_str("late:<interface>"),
+            },
             Self::Late {
                 name: Some(name), ..
             } => write!(f, "late:{name}"),

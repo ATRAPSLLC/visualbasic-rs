@@ -17,9 +17,7 @@
 //! | 0x04 | 2 | `iObjectIndex` - signed; -1 (0xFFFF) = no COM object type reference |
 //! | 0x06 | 2 | Reserved (always 0) |
 //! | 0x08 | 4 | `lpOptionalDefaults` - VA to optional param default values header (see below) |
-//! | 0x0C | 2 | `wDispId` - the member's DISPID |
-//! | 0x0E | 1 | Always 3 in compiled projects (not the return type) |
-//! | 0x0F | 1 | `bFuncFlags` - 0x60 for regular Sub/Function, 0x68 for Property |
+//! | 0x0C | 4 | `memid` - the member's DISPID: a procedure's index with 0x60030000 (a Sub or Function) or 0x68030000 (a property) above it, an event's number from 1 |
 //! | 0x10 | 4 | `lpParamNames` - VA to parameter name string pointer array |
 //! | 0x20 | n | Type list: `this` (0x1E), each parameter, then the return value |
 //!
@@ -49,8 +47,11 @@ use std::fmt;
 use crate::{
     addressmap::AddressMap,
     error::Error,
-    util::{read_cstr, read_u16_le, read_u32_le},
-    vb::external::VarType,
+    util::{read_cstr, read_i32_le, read_u16_le, read_u32_le},
+    vb::{
+        external::VarType,
+        typeref::{InterfaceRef, RecordRef},
+    },
 };
 
 /// Property type encoded in the lowest 3 bits of `arg_size`.
@@ -248,14 +249,22 @@ impl<'a> FuncTypDesc<'a> {
         read_u32_le(self.bytes, 0x08)
     }
 
-    /// Method DISPID at offset 0x0C.
+    /// The member's DISPID, the four bytes at offset 0x0C.
     ///
-    /// Used by `ResolveDispatchToFuncTypDesc` (0x6600EFC3) in the runtime
-    /// for `IDispatch::GetIDsOfNames` resolution. Matches the DISPID that
-    /// COM clients use to invoke this method.
+    /// For a procedure, its index in the low word, 3 in the third byte and
+    /// [`func_flags`](Self::func_flags) in the top one: 0x60030000 plus the
+    /// index for a Sub or Function, 0x68030000 for each of a property's
+    /// procedures (`dispid` `Dial`: `Value` 0x68030003, `Spin` 0x60030004).
+    /// It is what a late-bound caller names the member by (the `LateId*`
+    /// operands calling `Dial` through its extender), and what
+    /// `ResolveDispatchToFuncTypDesc` (0x6600EFC3) in the runtime matches
+    /// for `IDispatch::Invoke`. For an event
+    /// ([`VbObject::event_type_descs`](crate::project::VbObject::event_type_descs)),
+    /// its number from 1 in declaration order, the DISPID of its events
+    /// interface (`ocx` `Knob`: `Turned` 1, `Reset` 2).
     #[inline]
-    pub fn dispid(&self) -> Result<u16, Error> {
-        read_u16_le(self.bytes, 0x0C)
+    pub fn dispid(&self) -> Result<i32, Error> {
+        read_i32_le(self.bytes, 0x0C)
     }
 
     /// Return type: the last type-list entry, when the procedure has one.
@@ -271,7 +280,8 @@ impl<'a> FuncTypDesc<'a> {
         self.type_list().last().copied()
     }
 
-    /// Secondary function flags at offset 0x0F.
+    /// Secondary function flags at offset 0x0F, the top byte of the
+    /// [`dispid`](Self::dispid).
     ///
     /// **Not read by the runtime.** Exhaustive search of MSVBVM60.DLL
     /// FuncTypDesc consumers (`ResolveDispatchToFuncTypDesc`, `IDispatchInvoke`,
@@ -305,8 +315,11 @@ impl<'a> FuncTypDesc<'a> {
 
     /// VA of the parameter name string pointer array at offset 0x10.
     ///
-    /// Points to an array of VAs, one per parameter. Each VA points to
-    /// a null-terminated ANSI parameter name string.
+    /// Points to an array of [`entry_count`](Self::entry_count) VAs, one per
+    /// parameter, then one for the return value, which is 0. Each other VA
+    /// points to a null-terminated ANSI parameter name string. The
+    /// runtime's `GetIDsOfNames` matches a named argument against every slot
+    /// (MSVBVM60 6.00.8176 `0x66016D57`).
     #[inline]
     pub fn param_names_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x10)
@@ -375,7 +388,7 @@ impl<'a> FuncTypDesc<'a> {
     /// (0x1E), then one per parameter, then the return value. Each entry is
     /// one [`ArgType`] byte; an array type is followed by padding to a 4-byte
     /// boundary, and a typed object, record or interface by padding and a
-    /// 4-byte descriptor VA (see [`ArgType::object_va`]).
+    /// 4-byte descriptor VA (see [`ArgType::descriptor_va`]).
     ///
     /// Empty when the slice the descriptor was parsed from ends before the
     /// type list.
@@ -416,9 +429,24 @@ impl<'a> FuncTypDesc<'a> {
             .collect()
     }
 
+    /// Returns the bytes the descriptor occupies: the header, `this` and the
+    /// type list, to the end of its last entry.
+    ///
+    /// `None` when the type list is not in the parsed slice.
+    pub fn size(&self) -> Option<usize> {
+        let (list, end) = self.type_list_and_end();
+        (list.len() == usize::from(self.entry_count())).then_some(end)
+    }
+
     /// Parses the type list's entries after `this`: the parameters, then the
     /// return value.
     fn type_list(&self) -> Vec<ArgType> {
+        self.type_list_and_end().0
+    }
+
+    /// Parses the type list's entries after `this`, with the offset past the
+    /// last one read.
+    fn type_list_and_end(&self) -> (Vec<ArgType>, usize) {
         let count = usize::from(self.entry_count());
         let mut types = Vec::with_capacity(count);
         // Entry 0 is `this`; positions are relative to the descriptor.
@@ -440,7 +468,7 @@ impl<'a> FuncTypDesc<'a> {
             };
             types.push(t);
         }
-        types
+        (types, pos)
     }
 
     /// Parses optional parameter default values from the defaults area.
@@ -641,12 +669,29 @@ impl ArgType {
         self.code
     }
 
-    /// Returns the VA of the class's ObjectInfo (typed object, 0x13), record
-    /// descriptor (0x11, 0x14) or interface (0x1C, 0x1D) that follows the
-    /// entry in the type list.
+    /// Returns the VA of the descriptor that follows the entry in the type
+    /// list: the class's `ObjectInfo` for a project class (0x13), an
+    /// [`InterfaceRef`] for an interface (0x1C, 0x1D), a [`RecordRef`] for a
+    /// record (0x14). Code 0x11 carries one too; no fixture has it.
     #[inline]
-    pub fn object_va(self) -> Option<u32> {
+    pub fn descriptor_va(self) -> Option<u32> {
         (self.descriptor != 0).then_some(self.descriptor)
+    }
+
+    /// Reads the [`InterfaceRef`] of an interface type (codes 0x1C, 0x1D):
+    /// the interface's library and IID.
+    pub fn interface<'a>(self, map: &AddressMap<'a>) -> Option<InterfaceRef<'a>> {
+        matches!(self.base_type(), Self::IUNKNOWN | Self::INTERFACE)
+            .then(|| InterfaceRef::at(map, self.descriptor_va()?).ok())
+            .flatten()
+    }
+
+    /// Reads the [`RecordRef`] of a record type (code 0x14): the record's
+    /// library and GUID.
+    pub fn record<'a>(self, map: &AddressMap<'a>) -> Option<RecordRef<'a>> {
+        (self.base_type() == Self::RECORD)
+            .then(|| RecordRef::at(map, self.descriptor_va()?).ok())
+            .flatten()
     }
 
     /// Returns the evaluation-stack slots (4 bytes each) a call passes for
@@ -677,12 +722,15 @@ impl ArgType {
     }
 
     /// Returns `true` if a descriptor VA follows the entry.
-    fn has_descriptor(self) -> bool {
-        matches!(self.base_type(), 0x11 | 0x13 | 0x14 | 0x1C | 0x1D)
+    pub(crate) fn has_descriptor(self) -> bool {
+        matches!(
+            self.base_type(),
+            Self::UDT | Self::OBJECT | Self::RECORD | Self::IUNKNOWN | Self::INTERFACE
+        )
     }
 
     /// Returns the type with the descriptor VA read from `bytes`.
-    fn with_descriptor(self, bytes: Option<&[u8]>) -> Self {
+    pub(crate) fn with_descriptor(self, bytes: Option<&[u8]>) -> Self {
         let descriptor = bytes.and_then(|b| read_u32_le(b, 0).ok()).unwrap_or(0);
         Self { descriptor, ..self }
     }
@@ -722,8 +770,16 @@ impl ArgType {
     /// A class of the project (0x13), followed by its ObjectInfo VA. Maps to
     /// VT_DISPATCH.
     pub const OBJECT: u8 = 0x13;
-    /// Record (0x14). Maps to VT_RECORD.
+    /// Record (0x14), a public user-defined type, followed by its
+    /// [`RecordRef`] VA. Maps to VT_RECORD.
     pub const RECORD: u8 = 0x14;
+    /// An interface of a type library that derives from `IUnknown` alone
+    /// (0x1C; `typerefs`: `IUnknown`), followed by its [`InterfaceRef`] VA.
+    pub const IUNKNOWN: u8 = 0x1C;
+    /// An interface of a type library that derives from `IDispatch` (0x1D;
+    /// `typerefs`: `Collection`, `StdFont`, `VB.TextBox`), followed by its
+    /// [`InterfaceRef`] VA.
+    pub const INTERFACE: u8 = 0x1D;
     /// Dispatch pointer (0x1E). Internal VB type for ByVal object/string refs.
     pub const DISPATCH_PTR: u8 = 0x1E;
 
@@ -779,10 +835,10 @@ impl ArgType {
             Self::STRING => "String",
             Self::UDT => "UDT",
             Self::OBJECT => "Class",
-            0x1B | 0x1D => "Object",
+            0x1B | Self::INTERFACE => "Object",
             Self::RECORD => "Record",
             0x16 => "IDispatch",
-            0x1C => "IUnknown",
+            Self::IUNKNOWN => "IUnknown",
             Self::DISPATCH_PTR => "DispPtr",
             _ => "Unknown",
         }
@@ -837,7 +893,7 @@ mod tests {
         assert_eq!(f.arg_slots(), Some(3));
         assert_eq!(f.param_offsets(), vec![0x0C, 0x10, 0x14]);
         assert_eq!(f.vtable_offset().unwrap(), 0x0028);
-        assert_eq!(f.dispid().unwrap(), 2);
+        assert_eq!(f.dispid().unwrap(), 0x6003_0002);
         assert_eq!(f.kind_keyword(), "Function");
     }
 
@@ -891,10 +947,10 @@ mod tests {
         let f = FuncTypDesc::parse(&data).unwrap();
         let args = f.arg_types();
         assert_eq!(args.len(), 1);
-        assert_eq!(args[0].object_va(), Some(0x004014F4));
+        assert_eq!(args[0].descriptor_va(), Some(0x004014F4));
         assert_eq!(args[0].type_name(), "Class");
         assert_eq!(
-            f.return_type().and_then(|t| t.object_va()),
+            f.return_type().and_then(|t| t.descriptor_va()),
             Some(0x004014F4)
         );
     }
