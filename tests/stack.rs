@@ -22,6 +22,7 @@ mod common;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write,
+    fs,
 };
 
 use visualbasic::{
@@ -29,6 +30,7 @@ use visualbasic::{
     pcode::{
         calltarget::{CallResolver, CallSignature, SlotInterfaces},
         decoder::Instruction,
+        operand::Operand,
         semantics::OpcodeSemantics,
         stackeffect::PrSource,
         stacksim::{Cut, InstructionStack, ProcedureStack},
@@ -122,9 +124,10 @@ impl Report {
             .iter()
             .filter(|i| {
                 matches!(i.info.semantics, OpcodeSemantics::GoSub)
-                    && i.operands.iter().flatten().any(|o| {
-                        matches!(o, visualbasic::pcode::operand::Operand::JumpTable { .. })
-                    })
+                    && i.operands
+                        .iter()
+                        .flatten()
+                        .any(|o| matches!(o, Operand::JumpTable { .. }))
             })
             .count();
         for conflict in &stack.merge_conflicts {
@@ -182,8 +185,7 @@ type Perturb =
 fn simulate_all(perturb: &Perturb) -> Report {
     let mut report = Report::default();
     for name in &projects() {
-        let bytes: &'static [u8] =
-            Box::leak(std::fs::read(fixture(name)).unwrap().into_boxed_slice());
+        let bytes: &'static [u8] = Box::leak(fs::read(fixture(name)).unwrap().into_boxed_slice());
         let project: &'static VbProject<'static> =
             Box::leak(Box::new(VbProject::from_bytes(bytes).unwrap()));
         let resolver = CallResolver::new(project).unwrap();
@@ -265,7 +267,7 @@ fn a_wrong_arity_breaks_the_balance() {
 fn coverage_census() {
     let mut counts: BTreeMap<(u8, u8), (usize, &'static str)> = BTreeMap::new();
     for name in &projects() {
-        let bytes = std::fs::read(fixture(name)).unwrap();
+        let bytes = fs::read(fixture(name)).unwrap();
         let project = VbProject::from_bytes(&bytes).unwrap();
         for object in project.objects().unwrap() {
             for entry in object.unwrap().methods().unwrap() {

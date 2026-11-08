@@ -181,6 +181,10 @@ pub enum PropType {
     ///
     /// The layout is MSSTDFMT.DLL 6.01.9839's save and load of the object.
     DataFormat,
+    /// A persisted object, [`ObjectBlob`]: a `u32` tag, a `u32` length and
+    /// that many bytes (`OleObjectBlob`, a hosted control's persisted
+    /// properties).
+    ObjectBlob,
     /// Flag-only: opcode is emitted with NO value data following.
     ///
     /// Used for font sub-properties (FontSize, FontBold, FontItalic,
@@ -206,6 +210,7 @@ impl PropType {
             Self::Size16 => Some(16),
             Self::Font => None,       // 11 base + variable nameLen callback
             Self::DataFormat => None, // StdDataFormat IPersistStream blob
+            Self::ObjectBlob => None, // 8 bytes and the length they state
             Self::Str | Self::TagStr | Self::Picture => None,
         }
     }
@@ -303,6 +308,52 @@ impl fmt::Display for ControlBounds {
             "{},{},{},{}",
             self.left, self.top, self.width, self.height
         )
+    }
+}
+
+/// A persisted object (`OleObjectBlob`): what a hosted control (an ActiveX
+/// control, a project's UserControl) saved of its own properties, between
+/// the extender's properties before and after it.
+///
+/// # Binary Layout
+///
+/// ```text
+/// +0x00  u32  tag     (0x0009424C in every fixture)
+/// +0x04  u32  length
+/// +0x08  [u8; length] the object's persisted data
+/// ```
+///
+/// `tests/fixtures/forms` Gauge1 (72 bytes) and `activex` CommonDialog1 (76),
+/// whose record goes on after it with its `Left` and `Top`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectBlob {
+    /// The tag before the length.
+    pub tag: u32,
+    /// The persisted bytes.
+    pub data: Vec<u8>,
+}
+
+impl ObjectBlob {
+    /// Parses a persisted object from raw bytes.
+    /// Returns the parsed value and bytes consumed, or `None` if too short.
+    pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
+        let tag = read_u32_le(data, 0).ok()?;
+        let length = usize::try_from(read_u32_le(data, 4).ok()?).ok()?;
+        let end = length.checked_add(8)?;
+        let bytes = data.get(8..end)?;
+        Some((
+            Self {
+                tag,
+                data: bytes.to_vec(),
+            },
+            end,
+        ))
+    }
+}
+
+impl fmt::Display for ObjectBlob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes", self.data.len())
     }
 }
 
@@ -793,6 +844,8 @@ pub enum PropertyValue {
     Picture(PictureData),
     /// StdDataFormat COM object (from MSSTDFMT.DLL).
     DataFormat(StdDataFormat),
+    /// A hosted control's persisted object.
+    ObjectBlob(ObjectBlob),
 }
 
 impl PropertyValue {
@@ -801,7 +854,7 @@ impl PropertyValue {
     /// These strings are part of the public API contract and are suitable
     /// for database storage: `"Flag"`, `"Byte"`, `"Int16"`, `"Long"`,
     /// `"Single"`, `"Color"`, `"Str"`, `"TagStr"`, `"Bounds"`,
-    /// `"ClientRect"`, `"Font"`, `"Picture"`, and `"DataFormat"`.
+    /// `"ClientRect"`, `"Font"`, `"Picture"`, `"DataFormat"` and `"ObjectBlob"`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Flag => "Flag",
@@ -818,6 +871,7 @@ impl PropertyValue {
             Self::Font(_) => "Font",
             Self::Picture(_) => "Picture",
             Self::DataFormat(_) => "DataFormat",
+            Self::ObjectBlob(_) => "ObjectBlob",
         }
     }
 
@@ -872,6 +926,7 @@ impl fmt::Display for PropertyValue {
             Self::Font(font) => write!(f, "{font}"),
             Self::Picture(pic) => write!(f, "{pic}"),
             Self::DataFormat(df) => write!(f, "{df}"),
+            Self::ObjectBlob(blob) => write!(f, "{blob}"),
         }
     }
 }
@@ -910,6 +965,13 @@ impl<'a> PropertyIter<'a> {
             pos: 0,
             ctype,
         }
+    }
+
+    /// Creates an iterator over `data` that starts decoding at `pos`, so the
+    /// properties' offsets stay those of the whole stream (a hosted
+    /// control's, whose ProgID comes first).
+    pub fn new_at(data: &'a [u8], ctype: FormControlType, pos: usize) -> Self {
+        Self { data, pos, ctype }
     }
 
     /// Returns the offset in the stream of the next byte to decode: once
@@ -1067,6 +1129,17 @@ impl<'a> Iterator for PropertyIter<'a> {
         if let Some(desc) = property_descriptor(self.ctype, opcode) {
             self.pos = self.pos.checked_add(1)?; // consume opcode byte
             let value_offset = self.pos;
+
+            if desc.prop_type == PropType::ObjectBlob {
+                let (blob, consumed) = ObjectBlob::parse(self.data.get(self.pos..)?)?;
+                self.pos = self.pos.checked_add(consumed)?;
+                return Some(Property {
+                    name: desc.name,
+                    index: opcode,
+                    value: PropertyValue::ObjectBlob(blob),
+                    offset: value_offset,
+                });
+            }
 
             if desc.prop_type == PropType::Flag {
                 return Some(Property {

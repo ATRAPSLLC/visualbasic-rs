@@ -17,6 +17,7 @@ use crate::{
     error::Error,
     imports::ImportTable,
     project::{CodeEntryKind, MethodLinkKind, PCodeMethod, VbObject},
+    trace::warn_drop,
     util::{read_cstr, read_u16_le, read_u32_le},
     vb::{
         comreg::ComRegData,
@@ -310,7 +311,7 @@ impl<'a> VbProject<'a> {
     ///
     /// Same as [`from_bytes`](Self::from_bytes), except PE parsing errors
     /// are not possible since the PE is already parsed.
-    pub fn from_goblin(file: &'a [u8], pe: &goblin::pe::PE<'_>) -> Result<Self, Error> {
+    pub fn from_goblin(file: &'a [u8], pe: &PE<'_>) -> Result<Self, Error> {
         let map = AddressMap::from_goblin(file, pe)?;
 
         // Extract VBHeader VA from the entry point
@@ -1117,7 +1118,7 @@ impl<'a> VbProject<'a> {
             let obj = match obj_result {
                 Ok(obj) => obj,
                 Err(e) => {
-                    crate::trace::warn_drop!("code_entrypoints.objects", error = ?e);
+                    warn_drop!("code_entrypoints.objects", error = ?e);
                     continue;
                 }
             };
@@ -1125,7 +1126,7 @@ impl<'a> VbProject<'a> {
             let entries = match obj.code_entries(None) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    crate::trace::warn_drop!("code_entrypoints.code_entries", error = ?e);
+                    warn_drop!("code_entrypoints.code_entries", error = ?e);
                     continue;
                 }
             };

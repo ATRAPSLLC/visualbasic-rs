@@ -26,6 +26,7 @@ use crate::{
         ControlEntryIterator, MethodEntry, MethodLinkIterator, MethodLinkKind, PCodeMethod,
         VbProject,
     },
+    trace::warn_drop,
     util::{read_u16_le, read_u32_le},
     vb::{
         constantpool::ConstantPool,
@@ -780,7 +781,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
             .filter_map(|link| match link {
                 Ok(link) => Some(link),
                 Err(e) => {
-                    crate::trace::warn_drop!("code_entries.method_links", error = ?e);
+                    warn_drop!("code_entries.method_links", error = ?e);
                     None
                 }
             })
@@ -800,7 +801,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
             let entry = match result {
                 Ok(entry) => entry,
                 Err(e) => {
-                    crate::trace::warn_drop!("code_entries.methods", error = ?e);
+                    warn_drop!("code_entries.methods", error = ?e);
                     continue;
                 }
             };
@@ -810,7 +811,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                     let pcode_size = match pm.proc_size() {
                         Ok(size) => size,
                         Err(e) => {
-                            crate::trace::warn_drop!("code_entries.proc_size", error = ?e);
+                            warn_drop!("code_entries.proc_size", error = ?e);
                             continue;
                         }
                     };
@@ -890,7 +891,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                 .filter_map(|r| match r {
                     Ok(c) => Some(c),
                     Err(e) => {
-                        crate::trace::warn_drop!("code_entries.controls_with_form_data", error = ?e);
+                        warn_drop!("code_entries.controls_with_form_data", error = ?e);
                         None
                     }
                 })
@@ -900,7 +901,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                 .filter_map(|r| match r {
                     Ok(c) => Some(c),
                     Err(e) => {
-                        crate::trace::warn_drop!("code_entries.controls", error = ?e);
+                        warn_drop!("code_entries.controls", error = ?e);
                         None
                     }
                 })
@@ -1078,7 +1079,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                 .filter_map(|r| match r {
                     Ok(c) => Some(c),
                     Err(e) => {
-                        crate::trace::warn_drop!("events.controls_with_form_data", error = ?e);
+                        warn_drop!("events.controls_with_form_data", error = ?e);
                         None
                     }
                 })
@@ -1088,7 +1089,7 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                 .filter_map(|r| match r {
                     Ok(c) => Some(c),
                     Err(e) => {
-                        crate::trace::warn_drop!("events.controls", error = ?e);
+                        warn_drop!("events.controls", error = ?e);
                         None
                     }
                 })
@@ -1120,10 +1121,69 @@ impl<'a, 'p: 'a> VbObject<'a, 'p> {
                     event_slot: slot,
                     event_name,
                     handler_va,
+                    method_index: self.handler_method(handler_va),
                 });
             }
         }
         Ok(bindings)
+    }
+
+    /// Returns the method-table index of the procedure the event sink stub at
+    /// `handler_va` calls, or `None` when the stub is of neither form below
+    /// or calls no procedure of this object.
+    ///
+    /// A connected sink slot holds a stub that names its handler:
+    ///
+    /// - P-Code: `mov eax, imm32; cmp ax, 0xC033; mov edx, <ProcDscInfo>;
+    ///   push <ProcCallEngine>; ret` (`events` `Listener`'s `m_Source`,
+    ///   `activex` `Client`'s controls), the `ProcDscInfo` being the one a
+    ///   P-Code method table slot points at;
+    /// - native code: `sub dword [esp+4], imm32; jmp <procedure>`
+    ///   (`events-native`), the procedure being the one a native slot points
+    ///   at. A natively compiled class has no method table
+    ///   ([`has_method_table`](Self::has_method_table) is `false` for
+    ///   `events-native`'s `Listener`), and nothing else ties its
+    ///   procedures to the method names: its handlers resolve to `None`.
+    ///
+    /// A handler's name is the binding Visual Basic makes at compile time
+    /// (`m_Source_Ticked`, `Winsock1_DataArrival`), so the procedure names
+    /// the event even where no event-name template does.
+    pub fn handler_method(&self, handler_va: u32) -> Option<u16> {
+        let map = self.project.address_map();
+        let stub = map.slice_from_va(handler_va, 13).ok()?;
+        let target = match *stub {
+            [
+                0xB8,
+                _,
+                _,
+                _,
+                _,
+                0x66,
+                0x3D,
+                0x33,
+                0xC0,
+                0xBA,
+                a,
+                b,
+                c,
+                d,
+                ..,
+            ] => u32::from_le_bytes([a, b, c, d]),
+            [0x81, 0x6C, 0x24, 0x04, _, _, _, _, 0xE9, a, b, c, d, ..] => handler_va
+                .checked_add(13)?
+                .checked_add_signed(i32::from_le_bytes([a, b, c, d]))?,
+            _ => return None,
+        };
+        self.methods().ok()?.enumerate().find_map(|(index, entry)| {
+            let resolved = match entry.ok()? {
+                MethodEntry::PCode(method) => method.proc_dsc_va(),
+                MethodEntry::Native { va } => va,
+                _ => return None,
+            };
+            (resolved == target)
+                .then(|| u16::try_from(index).ok())
+                .flatten()
+        })
     }
 
     /// Parses the form designer data for this object.
@@ -1562,6 +1622,9 @@ pub struct EventBinding<'a> {
     /// walker); may be zero when iterating all slots via
     /// [`VbObject::events_all_slots`].
     pub handler_va: u32,
+    /// Method-table index of the procedure the stub calls
+    /// ([`VbObject::handler_method`]), whose name is the handler's.
+    pub method_index: Option<u16>,
 }
 
 impl<'a> EventBinding<'a> {

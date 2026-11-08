@@ -3,8 +3,9 @@
 //! A single flat [`Error`] enum covers all failure modes across PE parsing,
 //! VB structure validation, address translation, and P-Code decoding.
 
-use std::error;
-use std::fmt;
+use std::{error, fmt};
+
+use goblin::error::Error as GoblinError;
 
 /// All errors that can occur during VB6 P-Code parsing.
 ///
@@ -258,9 +259,9 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
-impl From<goblin::error::Error> for Error {
+impl From<GoblinError> for Error {
     /// Converts a goblin parsing error into our [`Error::Goblin`] variant.
-    fn from(e: goblin::error::Error) -> Self {
+    fn from(e: GoblinError) -> Self {
         Error::Goblin(e.to_string())
     }
 }
@@ -503,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_error_trait_impl() {
-        let e: Box<dyn std::error::Error> = Box::new(Error::RvaNotMapped { rva: 0 });
+        let e: Box<dyn error::Error> = Box::new(Error::RvaNotMapped { rva: 0 });
         let _ = e.to_string();
     }
 

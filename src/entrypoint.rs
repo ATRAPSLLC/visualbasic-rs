@@ -49,6 +49,8 @@
 //! the first, then the second. Nothing scans the file for the magic.
 //! [`ExportStub`] decodes every export stub.
 
+use goblin::pe::export::Export;
+
 use crate::{addressmap::AddressMap, error::Error};
 
 /// Minimum number of bytes needed at the entry point to extract the VBHeader VA.
@@ -217,7 +219,7 @@ impl ExportStub {
 /// Returns `None` if no export matches.
 pub fn extract_vb_header_va_from_exports(
     map: &AddressMap<'_>,
-    exports: &[goblin::pe::export::Export<'_>],
+    exports: &[Export<'_>],
 ) -> Option<u32> {
     for export in exports {
         let rva = u32::try_from(export.rva).ok()?;

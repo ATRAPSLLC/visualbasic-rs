@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fs};
 
 use visualbasic::{VbProject, project::MethodEntry};
 
@@ -27,7 +27,7 @@ use crate::common::{fixture, projects};
 fn every_procedure_decodes_to_its_end() {
     let mut procedures = 0usize;
     for name in &projects() {
-        let bytes = std::fs::read(fixture(name)).expect("fixture readable");
+        let bytes = fs::read(fixture(name)).expect("fixture readable");
         let project = VbProject::from_bytes(&bytes).expect("a VB6 project");
         for object in project.objects().expect("objects") {
             let object = object.expect("object");

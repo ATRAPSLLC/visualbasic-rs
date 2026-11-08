@@ -9,7 +9,7 @@
 //! 3. **Variable-length opcodes** (size == -1): A `u16` byte count follows the
 //!    opcode, then that many bytes of payload data.
 
-use std::fmt;
+use std::{fmt, iter};
 
 use crate::{
     error::Error,
@@ -138,13 +138,13 @@ impl Instruction {
         self.operands.iter().flatten().flat_map(
             move |operand| -> Box<dyn Iterator<Item = u16> + 'a> {
                 match *operand {
-                    Operand::JumpTarget(t) if !sentinel(t) => Box::new(std::iter::once(t)),
+                    Operand::JumpTarget(t) if !sentinel(t) => Box::new(iter::once(t)),
                     Operand::JumpTable { at, count } => Box::new(
                         (0..usize::from(count))
                             .map(move |i| usize::from(at).saturating_add(i.saturating_mul(2)))
                             .filter_map(move |pos| read_u16_le(code, pos).ok()),
                     ),
-                    _ => Box::new(std::iter::empty()),
+                    _ => Box::new(iter::empty()),
                 }
             },
         )

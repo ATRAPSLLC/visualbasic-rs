@@ -401,15 +401,22 @@ impl<'a> FormDataHeader<'a> {
         Guid::from_bytes(self.bytes.get(0x25..0x35)?)
     }
 
-    /// Form width in twips at offset 0x59.
+    /// The byte length of the form's stream at offset 0x59: the bytes from
+    /// offset 0x5D to the form's end (the `0x04` after its last record).
+    ///
+    /// Not a size of the form: `tests/fixtures/forms` Board states 483 here
+    /// and its client size (`ClientSize`, 4680 x 3090 twips) in its
+    /// properties; its stream ends 483 bytes after 0x5D.
     #[inline]
-    pub fn width(&self) -> Result<u32, Error> {
+    pub fn stream_size(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x59)
     }
 
-    /// Form height in twips at offset 0x5D.
+    /// The byte length of the designer object's own record at offset 0x5D,
+    /// counted from 0x5D: its first child record starts that many bytes
+    /// after it (Board 87, Gauge 62 in `tests/fixtures/forms`).
     #[inline]
-    pub fn height(&self) -> Result<u32, Error> {
+    pub fn properties_size(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x5D)
     }
 }
@@ -667,8 +674,16 @@ impl<'a> FormControlRecord<'a> {
     }
 
     /// Decodes the property stream into an iterator of named property values.
+    ///
+    /// A hosted control's record (type 0xFF) states its extender's
+    /// properties after its ProgID ([`prog_id_bytes`](Self::prog_id_bytes)):
+    /// its place (`Bounds`, or `Left` and `Top` for one not drawn at run
+    /// time), index and tab index, around its persisted object.
     pub fn properties(&self) -> PropertyIter<'a> {
-        PropertyIter::new(self.properties, self.ctype)
+        let start = self
+            .prog_id_bytes()
+            .map_or(0, |bytes| bytes.len().saturating_add(3));
+        PropertyIter::new_at(self.properties, self.ctype, start)
     }
 }
 

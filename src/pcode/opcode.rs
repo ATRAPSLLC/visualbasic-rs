@@ -358,7 +358,7 @@ pub static UNKNOWN_OPCODE: OpcodeInfo = OpcodeInfo {
     pr_load: None,
     movement: "",
     category: "",
-    semantics: crate::pcode::semantics::OpcodeSemantics::Unclassified,
+    semantics: OpcodeSemantics::Unclassified,
     data_type: None,
     value_type: None,
     handler: 0,
@@ -407,7 +407,10 @@ pub fn table_by_index(table: DispatchTable) -> &'static [OpcodeInfo; 256] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::pcode::semantics::{ArithOp, OpcodeSemantics};
 
     #[test]
     fn test_all_tables_have_256_entries() {
@@ -417,6 +420,63 @@ mod tests {
         assert_eq!(LEAD2_TABLE.len(), 256);
         assert_eq!(LEAD3_TABLE.len(), 256);
         assert_eq!(LEAD4_TABLE.len(), 256);
+    }
+
+    /// Every arithmetic opcode names the operation it computes: none of the
+    /// tables' `arith` entries is [`ArithOp::Other`], and exponentiation is
+    /// the `Pwr` family (`PwrR8R8`, `PwrR8I2`, `PwrVar`).
+    #[test]
+    fn every_arithmetic_opcode_names_its_operation() {
+        let tables = [
+            &PRIMARY_TABLE,
+            &LEAD0_TABLE,
+            &LEAD1_TABLE,
+            &LEAD2_TABLE,
+            &LEAD3_TABLE,
+            &LEAD4_TABLE,
+        ];
+        let mut unnamed = Vec::new();
+        let mut powers = Vec::new();
+        for info in tables.iter().flat_map(|table| table.iter()) {
+            match info.semantics {
+                OpcodeSemantics::Arithmetic { op: ArithOp::Other } => unnamed.push(info.mnemonic),
+                OpcodeSemantics::Arithmetic { op: ArithOp::Pow } => powers.push(info.mnemonic),
+                _ => {}
+            }
+        }
+        assert!(unnamed.is_empty(), "unnamed arithmetic: {unnamed:?}");
+        powers.sort_unstable();
+        powers.dedup();
+        assert_eq!(powers, ["PwrR8I2", "PwrR8R8", "PwrVar"]);
+    }
+
+    /// Every unary opcode names the operation it computes: none of the
+    /// tables' `unary` entries is [`ArithOp::Other`], and the `Fn` functions
+    /// are their own (`FnFixR8` is `Fix`, `FnIntCy` `Int`, `FnSgnUI1` `Sgn`).
+    #[test]
+    fn every_unary_opcode_names_its_operation() {
+        let tables = [
+            &PRIMARY_TABLE,
+            &LEAD0_TABLE,
+            &LEAD1_TABLE,
+            &LEAD2_TABLE,
+            &LEAD3_TABLE,
+            &LEAD4_TABLE,
+        ];
+        let mut unnamed = Vec::new();
+        let mut named = BTreeMap::new();
+        for info in tables.iter().flat_map(|table| table.iter()) {
+            if let OpcodeSemantics::Unary { op } = info.semantics {
+                if op == ArithOp::Other {
+                    unnamed.push(info.mnemonic);
+                }
+                named.insert(info.mnemonic, op);
+            }
+        }
+        assert!(unnamed.is_empty(), "unnamed unary: {unnamed:?}");
+        assert_eq!(named.get("FnFixR8"), Some(&ArithOp::Fix));
+        assert_eq!(named.get("FnIntCy"), Some(&ArithOp::Int));
+        assert_eq!(named.get("FnSgnUI1"), Some(&ArithOp::Sgn));
     }
 
     #[test]
@@ -650,7 +710,6 @@ mod tests {
 
     #[test]
     fn test_value_type_only_where_fixed() {
-        use crate::pcode::semantics::PCodeDataType;
         // Moves name a width: no type.
         assert_eq!(PRIMARY_TABLE[0x71].mnemonic, "FStR4");
         assert_eq!(PRIMARY_TABLE[0x71].value_type, None);

@@ -354,6 +354,8 @@ impl<'a> Iterator for ConstPoolIter<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::array;
+
     use super::*;
     use crate::addressmap::SectionEntry;
 
@@ -458,7 +460,7 @@ mod tests {
     fn test_guid_at() {
         let mut file = vec![0u8; 0x3000];
         put(&mut file, 0x401000, &0x00401100u32.to_le_bytes());
-        let guid: [u8; 16] = core::array::from_fn(|i| i as u8 + 1);
+        let guid: [u8; 16] = array::from_fn(|i| i as u8 + 1);
         put(&mut file, 0x401100, &guid);
         let map = make_test_map(&file);
         let pool = ConstantPool::new(&map, 0x00401000);
