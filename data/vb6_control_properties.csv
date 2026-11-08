@@ -5,7 +5,11 @@
 # the composite labels Bounds (Left, Top, Width, Height), ClientSize (ClientLeft to
 # ClientHeight) and DataSource(obj). A property stream names a property by
 # its index in the table.
-# Status: active=serializable, fontsub=flag-only, skip=runtime-only, sep=separator, obj=COM object ref
+# Status: active=serializable, fontsub=flag-only, skip=runtime-only, sep=separator, obj=COM object ref,
+#   blob=a persisted object: a u32 tag, a u32 length and that many bytes. A hosted
+#   control's OleObjectBlob is one (`tests/fixtures/forms` Gauge1, `activex`
+#   CommonDialog1, whose record goes on after it); the OLE container's writes only
+#   its opcode (`props` POLE decodes to its terminator with it as a flag)
 #
 # Descriptor Table VAs:
 #   Timer:          0x66028A50 (9 entries)
@@ -34,6 +38,10 @@
 #   PropertyPage:   0x6602A3F0 (78 entries)
 #   UserControl:    0x66029530 (94 entries)
 #   UserDocument:   0x66029D10 (88 entries)
+#   Extender:       0x6602DE18 (75 entries) in MSVBVM60.DLL 6.00.8176
+#                   (`toolchain/vb6`), the properties a hosted control's record
+#                   (type 0xFF: an ActiveX control, a project's UserControl) states
+#                   after its ProgID; rows reuse the rows of the same descriptors
 #
 control_type,index,name,ser_type,callback_bytes,status,flags,descriptor_va
 CheckBox,0,Name,18,0,skip,0x8400D412,0x66001E50
@@ -1248,3 +1256,78 @@ VScrollBar,23,WhatsThisHelpID,3,0,active,0x80C12203,0x66001EF0
 VScrollBar,24,Container,32,0,skip,0x80004C20,0x66001FB0
 VScrollBar,25,RightToLeft,4,0,active,0x80C14404,0x66114000
 VScrollBar,26,CausesValidation,4,0,active,0x80C12204,0x66002010
+Extender,0,Name,18,0,skip,0x8400D412,0x6602DE18
+Extender,1,Index,17,0,active,0x84C1D411,0x6602DE18
+Extender,2,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,3,Bounds,8,4,active,0x90222408,0x6602DE18
+Extender,4,Top,10,0,flag,0x9020240A,0x6602DE18
+Extender,5,Width,9,0,flag,0x90202409,0x6602DE18
+Extender,6,Height,11,0,flag,0x9020240B,0x6602DE18
+Extender,7,Visible,4,0,active,0x80E14404,0x6602DE18
+Extender,8,Parent,32,0,skip,0x80005820,0x6602DE18
+Extender,9,DragMode,6,0,active,0x80C12606,0x6602DE18
+Extender,10,DragIcon,21,0,active,0x84C1A215,0x6602DE18
+Extender,11,Tag,13,0,active,0x80C1220D,0x6602DE18
+Extender,12,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,13,Enabled,4,0,flag,0x00C04404,0x6602DE18
+Extender,14,TabStop,4,0,active,0x80C14404,0x6602DE18
+Extender,15,TabIndex,2,0,active,0x84012402,0x6602DE18
+Extender,16,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,17,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,18,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,19,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,20,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,21,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,22,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,23,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,24,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,25,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,26,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,27,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,28,Object,32,0,skip,0x00005820,0x6602DE18
+Extender,29,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,30,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,31,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,32,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,33,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,34,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,35,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,36,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,37,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,38,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,39,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,40,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,41,DataFormat,22,0,active,0x84654416,0x6602DE18
+Extender,42,DataMember,33,0,active,0x80F12621,0x6602DE18
+Extender,43,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,44,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,45,OleObjectBlob,3,0,blob,0x02021803,0x6602DE18
+Extender,46,DataSource(obj),22,0,flag,0x84244C16,0x6602DE18
+Extender,47,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,48,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,49,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,50,HelpContextID,3,0,active,0x80C12203,0x6602DE18
+Extender,51,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,52,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,53,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,54,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,55,Default,4,0,active,0x84C14404,0x6602DE18
+Extender,56,Cancel,4,0,active,0x84C14404,0x6602DE18
+Extender,57,Left,8,0,active,0x82013408,0x6602DE18
+Extender,58,Top,10,0,active,0x8201340A,0x6602DE18
+Extender,59,Align,6,0,active,0x80C12406,0x6602DE18
+Extender,60,Negotiate,4,0,active,0x82C13404,0x6602DE18
+Extender,61,LinkTimeout,2,0,active,0x80C14402,0x6602DE18
+Extender,62,LinkTopic,1,0,active,0x80E1C401,0x6602DE18
+Extender,63,LinkItem,1,0,active,0x80E1C401,0x6602DE18
+Extender,64,LinkMode,6,0,active,0x80C1C406,0x6602DE18
+Extender,65,DataChanged,4,0,flag,0x80106E04,0x6602DE18
+Extender,66,DataField,1,0,active,0x80F12601,0x6602DE18
+Extender,67,DataSource,1,0,active,0x82F13201,0x6602DE18
+Extender,68,Bindings,1,0,active,0x02021801,0x6602DE18
+Extender,69,_,4,0,sep,0xE0000804,0x6602DE18
+Extender,70,WhatsThisHelpID,3,0,active,0x80C12203,0x6602DE18
+Extender,71,Container,32,0,skip,0x80004C20,0x6602DE18
+Extender,72,CausesValidation,4,0,active,0x80C12204,0x6602DE18
+Extender,73,DataBindings,22,0,flag,0x04005016,0x6602DE18
+Extender,74,ToolTipText,1,0,active,0x80D12401,0x6602DE18

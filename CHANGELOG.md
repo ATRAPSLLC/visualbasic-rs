@@ -6,6 +6,88 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-08
+
+A form's record stream had three misreads: a hosted control's record was
+property data nobody decoded, the form header's +0x59 and +0x5D were read as
+a width and a height they never held, and external table type 6 was read as
+a type library reference rather than the global object the runtime binds.
+
+### Added
+
+- **The procedure an event handler slot calls.** `VbObject::handler_method`
+  resolves a connected sink slot's stub to the method-table index of the
+  procedure it calls: a P-Code stub (`mov eax, imm32; cmp ax, 0xC033; mov
+  edx, <ProcDscInfo>; ...`) by the `ProcDscInfo` a method slot points at,
+  a native one (`sub dword [esp+4], imm32; jmp <procedure>`) by the
+  procedure a native method slot points at. `EventBinding::method_index`
+  carries it. A handler's name is the binding Visual Basic makes at compile
+  time, so the procedure names an event no template does: `events`
+  `Listener`'s `WithEvents m_Source` handlers resolve to `m_Source_Started`,
+  `m_Source_Ticked` and `m_Source_Named`, and `activex`'s hosted `Winsock1`
+  slots resolve although its sink leads with the extender's events. A
+  natively compiled class has no method table, so its handlers do not
+  resolve (`events-native`).
+
+- **A hosted control's extender properties.** A hosted control's record (an
+  ActiveX control, a project's UserControl) has type `0xFF` and states its
+  extender's properties - its place (`Bounds`, or `Left` and `Top` for one
+  not drawn at run time), `Index` and `TabIndex` - after its ProgID, around
+  the object it persisted. `FormControlRecord::properties` now starts
+  decoding past the ProgID (its `u16` length, bytes and NUL) rather than at
+  the stream's first byte, against the `Extender` descriptor table (75
+  entries, MSVBVM60.DLL 6.00.8176 `0x6602DE18`); any other record has no
+  ProgID and still decodes from the first byte.
+  `PropertyIter::new_at` decodes from a given offset so the properties'
+  offsets stay those of the whole stream.
+
+- **The persisted object a hosted control writes** (`ObjectBlob`): a `u32`
+  tag, a `u32` length and that many bytes (`OleObjectBlob`), carried by the
+  new `PropertyValue::ObjectBlob` and `PropType::ObjectBlob` (persisted as
+  `"ObjectBlob"`). `forms` Gauge1 is 72 bytes and `activex` CommonDialog1
+  76, each record going on after it with the extender's remaining
+  properties.
+
+- **`ExternalGlobalObject::data_slot_va`**: the `.data` slot the runtime
+  stores the bound object into.
+
+- **The arithmetic every opcode computes.** `ArithOp` gains `Fix`, `Int`
+  and `Sgn` for the `FnFix`, `FnInt` and `FnSgn` families, which were
+  `ArithOp::Other`. Two tests now assert that no `Arithmetic` or `Unary`
+  opcode in any of the six dispatch tables is left `ArithOp::Other`.
+
+### Changed
+
+- **`EventBinding` gains `method_index`** (breaking for struct literals).
+
+- **External table type 6 is a global object, not a type library**
+  (breaking). The runtime binds the object of the entry's class into the
+  entry's data slot when it loads the project, so the entry is
+  `{lpClsid, lpDataSlot}`: `ExternalKind::TypeLib` is now
+  `ExternalKind::GlobalObject` (persisted as `"GlobalObject"`),
+  `ExternalTypelibInfo` is now `ExternalGlobalObject` with `clsid_va`,
+  `clsid` and the new `data_slot_va`, and
+  `ExternalTableEntry::as_typelib` is now `as_global_object`.
+
+- **`PropType`, `PropertyValue` and `ArithOp` gain variants** (breaking for
+  exhaustive matches; none of the three is `non_exhaustive`).
+
+### Fixed
+
+- **The form header's +0x59 and +0x5D are sizes of the stream, not a form's
+  width and height** (breaking). `FormDataHeader::width` is now
+  `stream_size`, the byte length of the form's stream from offset 0x5D to
+  the `0x04` after its last record, and `height` is now `properties_size`,
+  the byte length of the designer object's own record counted from 0x5D.
+  `forms` Board states 483 and 87 there, and its size is in its properties
+  (`ClientSize`, 4680 x 3090 twips); the old names reported 483 x 87 twips
+  as a form's dimensions.
+
+- **Exponentiation is classified.** `ArithOp::Pow` was never produced: the
+  build script looked for a `Pow` mnemonic prefix, and the opcodes are the
+  `Pwr` family (`PwrR8R8`, `PwrR8I2`, `PwrVar`), which classified as
+  `ArithOp::Other`.
+
 ## [0.5.0] - 2026-10-09
 
 Every name of the ProjectInfo2 name area now has an owner: the private
@@ -687,7 +769,8 @@ Affects `vbobject.rs`, `pcodemethod.rs`, `methodlink.rs`,
 
 Initial public release.
 
-[Unreleased]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/ATRAPSLLC/visualbasic-rs/compare/v0.3.1...v0.3.2

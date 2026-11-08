@@ -8,6 +8,8 @@
 //! the data at those addresses from the file on disk, we must translate
 //! each VA through the PE section table.
 
+use goblin::pe::PE;
+
 use crate::error::Error;
 
 /// A single PE section's addressing information.
@@ -79,7 +81,7 @@ impl<'a> AddressMap<'a> {
     ///
     /// - [`Error::TooShort`] if the PE has no optional header.
     /// - [`Error::Not32Bit`] if the PE is not a 32-bit (PE32) executable.
-    pub fn from_goblin(file: &'a [u8], pe: &goblin::pe::PE<'_>) -> Result<Self, Error> {
+    pub fn from_goblin(file: &'a [u8], pe: &PE<'_>) -> Result<Self, Error> {
         // Verify this is PE32 (not PE32+)
         let oh = pe.header.optional_header.as_ref().ok_or(Error::TooShort {
             expected: 1,

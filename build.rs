@@ -11,11 +11,7 @@
 //! - `opcode_generated.rs` - 6 static `[OpcodeInfo; 256]` opcode arrays
 //! - `vb6_data_generated.rs` - control GUIDs, event templates, VB6 constants
 
-use std::collections::HashMap;
-use std::env;
-use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::{collections::HashMap, env, fs, io::Write, mem, path::Path};
 
 /// Splits one CSV line into its fields, honouring double-quoted fields (a
 /// quoted field may hold commas; `""` inside one is a quote).
@@ -31,7 +27,7 @@ fn split_csv_line(line: &str) -> Vec<String> {
                 chars.next();
             }
             '"' => quoted = !quoted,
-            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            ',' if !quoted => fields.push(mem::take(&mut field)),
             _ => field.push(c),
         }
     }
@@ -672,7 +668,7 @@ fn generate_control_properties(out_dir: &str) {
 
         // Only generate entries for active and flag properties
         // (flag = bits 16+17 clear in descriptor flags, opcode emitted with no value)
-        if status != "active" && status != "flag" {
+        if status != "active" && status != "flag" && status != "blob" {
             continue;
         }
 
@@ -680,6 +676,8 @@ fn generate_control_properties(out_dir: &str) {
         // Flag entries have no value data regardless of ser_type.
         let prop_type = if status == "flag" {
             "Flag"
+        } else if status == "blob" {
+            "ObjectBlob"
         } else {
             match (ser_type, callback_bytes) {
                 (0, _) => "Flag",
@@ -720,6 +718,9 @@ fn generate_control_properties(out_dir: &str) {
         props.sort_by_key(|e| e.index);
     }
 
+    writeln!(out, "use super::PropType;").unwrap();
+    writeln!(out).unwrap();
+
     // Write the PropertyDesc struct
     writeln!(
         out,
@@ -732,7 +733,7 @@ fn generate_control_properties(out_dir: &str) {
     writeln!(out, "    /// Property name.").unwrap();
     writeln!(out, "    pub name: &'static str,").unwrap();
     writeln!(out, "    /// Serialized value type.").unwrap();
-    writeln!(out, "    pub prop_type: super::PropType,").unwrap();
+    writeln!(out, "    pub prop_type: PropType,").unwrap();
     writeln!(
         out,
         "    /// Serialization type from descriptor flags & 0x3F."
@@ -767,7 +768,7 @@ fn generate_control_properties(out_dir: &str) {
         {
             writeln!(
                 out,
-                "    ({idx}, PropertyDesc {{ name: {name:?}, prop_type: super::PropType::{prop_type}, ser_type: {ser_type}, callback_bytes: {callback_bytes} }}),"
+                "    ({idx}, PropertyDesc {{ name: {name:?}, prop_type: PropType::{prop_type}, ser_type: {ser_type}, callback_bytes: {callback_bytes} }}),"
             )
             .unwrap();
         }
@@ -832,6 +833,9 @@ fn generate_control_properties(out_dir: &str) {
         ("UserControl", 40),
         ("PropertyPage", 41),
         ("UserDocument", 42),
+        // A hosted control's record (an ActiveX control, a project's
+        // UserControl) has type 0xFF and states its extender's properties.
+        ("Extender", 255),
     ];
 
     for (ctrl_name, ctype_id) in &ctype_map {
@@ -1105,7 +1109,7 @@ fn classify_arith_op(mnemonic: &str) -> &'static str {
     if mnemonic.starts_with("Mod") {
         return "Mod";
     }
-    if mnemonic.starts_with("Pow") {
+    if mnemonic.starts_with("Pwr") {
         return "Pow";
     }
     if mnemonic.starts_with("Concat") {
@@ -1138,6 +1142,15 @@ fn classify_unary_op(mnemonic: &str) -> &'static str {
     }
     if mnemonic.starts_with("FnAbs") {
         return "Abs";
+    }
+    if mnemonic.starts_with("FnFix") {
+        return "Fix";
+    }
+    if mnemonic.starts_with("FnInt") {
+        return "Int";
+    }
+    if mnemonic.starts_with("FnSgn") {
+        return "Sgn";
     }
     "Other"
 }

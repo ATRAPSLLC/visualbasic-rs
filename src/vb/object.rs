@@ -3,7 +3,7 @@
 //! These structures describe individual objects (forms, modules, classes)
 //! within a VB6 project.
 
-use std::fmt;
+use std::{fmt, vec};
 
 use crate::{
     addressmap::AddressMap,
@@ -886,7 +886,7 @@ impl fmt::Display for IidKind {
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct TypedIidIter {
     /// Pre-collected typed IID entries.
-    inner: std::vec::IntoIter<(IidKind, Guid)>,
+    inner: vec::IntoIter<(IidKind, Guid)>,
 }
 
 impl Iterator for TypedIidIter {

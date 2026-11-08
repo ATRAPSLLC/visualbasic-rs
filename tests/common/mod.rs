@@ -2,13 +2,16 @@
 
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// The fixture projects: every directory of `tests/fixtures` holding
 /// `<name>/<name>.exe` (or `.dll`, `.ocx`), sorted by name.
 pub fn projects() -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let mut names: Vec<String> = std::fs::read_dir(&root)
+    let mut names: Vec<String> = fs::read_dir(&root)
         .expect("fixtures directory")
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
         .filter(|name| fixture(name).is_file())

@@ -10,7 +10,7 @@
 //!         ├── type 7: ExternalDeclareInfo  (the DllFunctionCall descriptor)
 //!         │     ├── lpLibraryName  -> DLL name string
 //!         │     └── lpFunctionName -> API function name string
-//!         └── type 6: ExternalTypelibInfo  (lpGuid -> 16-byte GUID)
+//!         └── type 6: ExternalGlobalObject (lpClsid -> 16-byte CLSID, lpDataSlot)
 //!
 //! VbHeader +0x50 (table VA), +0x46 (count)
 //!   └── ExternalComponentEntry   (variable length, self-relative offsets)
@@ -700,14 +700,16 @@ impl fmt::Display for VarType {
 /// the entry represents and how `lpExternalObject` should be interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalKind {
-    /// GUID reference (`fExternalType == 0x06`).
+    /// A global object the runtime binds at load (`fExternalType == 0x06`).
     ///
-    /// The `lpExternalObject` VA points to an [`ExternalTypelibInfo`] whose
-    /// first dword is the VA of a 16-byte GUID. In the fixtures the two
-    /// projects with a UserControl (`forms`, `dispid`) each have one such
-    /// entry, with the GUID `{FCFB3D23-A0FA-1068-A738-08002B3371B5}`; no
-    /// fixture references an OCX.
-    TypeLib,
+    /// The `lpExternalObject` VA points to an [`ExternalGlobalObject`]: the
+    /// VA of a 16-byte CLSID and the VA of a slot in `.data`. When it loads
+    /// the project the runtime (MSVBVM60 6.00.8176 0x6602BEF1) walks the
+    /// external table and stores an AddRef'd reference to the object of that
+    /// class into the slot. In the fixtures the two projects with a
+    /// UserControl (`forms`, `dispid`) each have one such entry, for VB's
+    /// `Global` object, `{FCFB3D23-A0FA-1068-A738-08002B3371B5}`.
+    GlobalObject,
 
     /// Declare function import (`fExternalType == 0x07`).
     ///
@@ -727,7 +729,7 @@ impl ExternalKind {
     /// Classifies an external type value.
     pub fn from_raw(value: u32) -> Self {
         match value {
-            0x06 => Self::TypeLib,
+            0x06 => Self::GlobalObject,
             0x07 => Self::DeclareFunction,
             other => Self::Unknown(other),
         }
@@ -736,12 +738,12 @@ impl ExternalKind {
     /// Returns the stable persistence string for this external kind.
     ///
     /// These strings are part of the public API contract and are suitable
-    /// for database storage: `"DeclareFunction"`, `"TypeLib"`, and
+    /// for database storage: `"DeclareFunction"`, `"GlobalObject"`, and
     /// `"Unknown"`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::DeclareFunction => "DeclareFunction",
-            Self::TypeLib => "TypeLib",
+            Self::GlobalObject => "GlobalObject",
             Self::Unknown(_) => "Unknown",
         }
     }
@@ -757,7 +759,7 @@ impl fmt::Display for ExternalKind {
 ///
 /// The external table is referenced by `ProjectData.external_table_va()?`
 /// with `ProjectData.external_count()?` entries. Each entry is a DLL
-/// function a `Declare` imports or a GUID reference. `Declare`s of the same
+/// function a `Declare` imports or a global object the runtime binds. `Declare`s of the same
 /// entry point share one entry: `vtable` has 13 `Declare`s, 12 of them
 /// aliases of `GetTickCount`, and 2 entries.
 ///
@@ -804,7 +806,7 @@ impl<'a> ExternalTableEntry<'a> {
     ///
     /// Use this to determine how to interpret [`external_object_va`](Self::external_object_va):
     /// - [`ExternalKind::DeclareFunction`]: VA points to [`ExternalDeclareInfo`]
-    /// - [`ExternalKind::TypeLib`]: VA points to [`ExternalTypelibInfo`]
+    /// - [`ExternalKind::GlobalObject`]: VA points to [`ExternalGlobalObject`]
     ///
     /// # Errors
     ///
@@ -833,17 +835,18 @@ impl<'a> ExternalTableEntry<'a> {
         ExternalDeclareInfo::parse(data).ok()
     }
 
-    /// Parses this entry as a TypeLib reference.
+    /// Parses this entry as a global object reference.
     ///
-    /// Returns `None` if the type is not [`ExternalKind::TypeLib`] (`exprs`
-    /// entry 0, the `Declare` of `lstrlenA`) or the VA cannot be resolved.
-    pub fn as_typelib(&self, map: &AddressMap<'a>) -> Option<ExternalTypelibInfo<'a>> {
-        if !matches!(self.kind().ok()?, ExternalKind::TypeLib) {
+    /// Returns `None` if the type is not [`ExternalKind::GlobalObject`]
+    /// (`exprs` entry 0, the `Declare` of `lstrlenA`) or the VA cannot be
+    /// resolved.
+    pub fn as_global_object(&self, map: &AddressMap<'a>) -> Option<ExternalGlobalObject<'a>> {
+        if !matches!(self.kind().ok()?, ExternalKind::GlobalObject) {
             return None;
         }
         let va = self.external_object_va().ok()?;
-        let data = map.slice_from_va(va, ExternalTypelibInfo::SIZE).ok()?;
-        ExternalTypelibInfo::parse(data).ok()
+        let data = map.slice_from_va(va, ExternalGlobalObject::SIZE).ok()?;
+        ExternalGlobalObject::parse(data).ok()
     }
 }
 
@@ -972,51 +975,63 @@ impl<'a> ExternalDeclareInfo<'a> {
     }
 }
 
-/// External TypeLib reference descriptor.
+/// A global object the runtime binds at load.
 ///
-/// The target of an [`ExternalKind::TypeLib`] entry. The GUID is accessed
-/// indirectly through a VA pointer; in the fixtures it is
-/// `{FCFB3D23-A0FA-1068-A738-08002B3371B5}`, not an OCX's type library.
+/// The target of an [`ExternalKind::GlobalObject`] entry: the class to bind
+/// and where to put it. The runtime stores an AddRef'd reference to the
+/// object of that class into the data slot, which the project's code then
+/// reads as the object. In the fixtures the class is VB's `Global` object,
+/// `{FCFB3D23-A0FA-1068-A738-08002B3371B5}`.
 ///
 /// # Layout
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
-/// | 0x00 | 4 | `lpTypelibGuid` (VA to 16-byte GUID) |
-/// | 0x04 | 4 | `lpRuntimeData` (VA in the zero-filled `.data` section) |
+/// | 0x00 | 4 | `lpClsid` (VA to the 16-byte CLSID) |
+/// | 0x04 | 4 | `lpDataSlot` (VA of the slot in the zero-filled `.data` section) |
 #[derive(Clone, Copy, Debug)]
-pub struct ExternalTypelibInfo<'a> {
+pub struct ExternalGlobalObject<'a> {
     bytes: &'a [u8],
 }
 
-impl<'a> ExternalTypelibInfo<'a> {
-    /// Minimum size of the structure in bytes.
+impl<'a> ExternalGlobalObject<'a> {
+    /// Size of the structure in bytes.
     pub const SIZE: usize = 0x08;
 
-    /// Parses an external typelib info from the given byte slice.
+    /// Parses a global object reference from the given byte slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TooShort`] if `data.len() < 8`.
     pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
         let bytes = data.get(..Self::SIZE).ok_or(Error::TooShort {
             expected: Self::SIZE,
             actual: data.len(),
-            context: "ExternalTypelibInfo",
+            context: "ExternalGlobalObject",
         })?;
         Ok(Self { bytes })
     }
 
-    /// VA to the 16-byte typelib GUID at offset 0x00.
+    /// VA of the 16-byte CLSID at offset 0x00.
     #[inline]
-    pub fn typelib_guid_va(&self) -> Result<u32, Error> {
+    pub fn clsid_va(&self) -> Result<u32, Error> {
         read_u32_le(self.bytes, 0x00)
     }
 
-    /// Resolves the typelib GUID by following the VA pointer.
-    pub fn typelib_guid(&self, map: &AddressMap<'a>) -> Option<Guid> {
-        let va = self.typelib_guid_va().ok()?;
+    /// Resolves the CLSID by following [`clsid_va`](Self::clsid_va).
+    pub fn clsid(&self, map: &AddressMap<'a>) -> Option<Guid> {
+        let va = self.clsid_va().ok()?;
         if va == 0 {
             return None;
         }
         let data = map.slice_from_va(va, 16).ok()?;
         Guid::from_bytes(data)
+    }
+
+    /// VA of the slot the runtime stores the object into, at offset 0x04.
+    #[inline]
+    pub fn data_slot_va(&self) -> Result<u32, Error> {
+        read_u32_le(self.bytes, 0x04)
     }
 }
 

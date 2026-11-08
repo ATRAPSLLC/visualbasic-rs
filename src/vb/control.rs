@@ -577,6 +577,9 @@ impl<'a> Iterator for ControlIterator<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::array;
+
+    use super::*;
 
     #[test]
     fn test_guid_parses_its_display() {
@@ -592,7 +595,7 @@ mod tests {
         let lower: Guid = text.to_lowercase().parse().unwrap();
         assert_eq!(lower, guid);
         let all = Guid {
-            bytes: core::array::from_fn(|i| (i as u8).wrapping_mul(17)),
+            bytes: array::from_fn(|i| (i as u8).wrapping_mul(17)),
         };
         assert_eq!(all.to_string().parse::<Guid>().unwrap(), all);
         // Control: anything else is refused.
@@ -610,7 +613,6 @@ mod tests {
             );
         }
     }
-    use super::*;
 
     fn make_control_info() -> Vec<u8> {
         let mut buf = vec![0u8; ControlInfo::MIN_SIZE];

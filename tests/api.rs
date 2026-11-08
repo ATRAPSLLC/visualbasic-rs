@@ -12,26 +12,36 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs, sync::Arc};
 
 use visualbasic::{
     VbProject,
     imports::ImportSymbol,
     pcode::{
-        calltarget::{CallResolver, CallSignature, Callee},
-        decoder::Instruction,
+        calltarget::{
+            CallResolver, CallSignature, Callee, InterfaceCatalog, InterfaceMember, InvokeKind,
+            LateTarget, RuntimeInterfaces, SlotInterfaces,
+        },
+        decoder::{Instruction, ProcedureReturn},
         framevar::{FrameOwner, FrameResolver, FrameVar},
-        stackeffect::{Pop, Push},
+        movement::{Fill, Move, Place},
+        operand::Operand,
+        semantics::{ArgumentOrder, CallKind, OpcodeSemantics},
+        stackeffect::{Pop, PrSource, Push},
+        stacksim::{Cut, InstructionStack, ProcedureStack},
     },
     project::{MethodEntry, PCodeMethod},
-    vb::constantpool::PoolEntry,
+    vb::{
+        constantpool::PoolEntry, control::Guid, controlprop::ControlPropertyType,
+        designer::Designer,
+    },
 };
 
-use crate::common::fixture;
+use crate::common::{fixture, projects};
 
 /// Reads fixture `name`, leaked so its project outlives the test's borrows.
 fn project(name: &str) -> &'static VbProject<'static> {
-    let bytes: &'static [u8] = Box::leak(std::fs::read(fixture(name)).unwrap().into_boxed_slice());
+    let bytes: &'static [u8] = Box::leak(fs::read(fixture(name)).unwrap().into_boxed_slice());
     Box::leak(Box::new(VbProject::from_bytes(bytes).unwrap()))
 }
 
@@ -331,10 +341,8 @@ fn pool_entries_match_their_opcodes() {
                 };
                 for insn in method.instructions().unwrap().flatten() {
                     let index = match insn.operands[0] {
-                        Some(visualbasic::pcode::operand::Operand::ConstPoolIndex(i)) => i,
-                        Some(visualbasic::pcode::operand::Operand::ExternalCall {
-                            import, ..
-                        }) => import,
+                        Some(Operand::ConstPoolIndex(i)) => i,
+                        Some(Operand::ExternalCall { import, .. }) => import,
                         _ => continue,
                     };
                     let family = match insn.info.mnemonic {
@@ -450,9 +458,8 @@ fn names_runtime_imports() {
 /// Every instruction that loads Pr says where from, with its operands.
 #[test]
 fn every_pr_load_has_a_source() {
-    use visualbasic::pcode::stackeffect::PrSource;
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
-    for name in crate::common::projects() {
+    for name in projects() {
         let project = project(&name);
         for object in project.objects().unwrap() {
             for entry in object.unwrap().methods().unwrap() {
@@ -496,7 +503,6 @@ fn every_pr_load_has_a_source() {
 /// cleanup table's types for the locals the runtime releases.
 #[test]
 fn declares_frame_slots() {
-    use visualbasic::vb::controlprop::ControlPropertyType;
     let project = project("types");
     let main = method(project, 0, 3);
     let instructions: Vec<Instruction> = main.instructions().unwrap().flatten().collect();
@@ -600,7 +606,7 @@ fn summarizes_error_handling() {
 #[test]
 fn runtime_signatures_match_their_calls() {
     let mut checked = 0;
-    for name in crate::common::projects() {
+    for name in projects() {
         let project = project(&name);
         let resolver = CallResolver::new(project).unwrap();
         for (object_index, object) in project.objects().unwrap().enumerate() {
@@ -644,7 +650,6 @@ fn object_index(project: &'static VbProject<'static>, name: &str) -> u16 {
 /// 256 control getters, then the object's own slots in method-link order.
 #[test]
 fn resolves_form_vtables() {
-    use visualbasic::vb::designer::Designer;
     let forms = project("forms");
     let resolver = CallResolver::new(forms).unwrap();
     let board = object_index(forms, "Board");
@@ -723,9 +728,8 @@ fn resolves_form_vtables() {
 /// from the frame.
 #[test]
 fn describes_procedure_returns() {
-    use visualbasic::pcode::decoder::ProcedureReturn;
     let mut forms = BTreeMap::new();
-    for name in crate::common::projects() {
+    for name in projects() {
         let project = project(&name);
         for object in project.objects().unwrap() {
             for entry in object.unwrap().methods().unwrap() {
@@ -733,10 +737,7 @@ fn describes_procedure_returns() {
                     continue;
                 };
                 for insn in method.instructions().unwrap().flatten() {
-                    if !matches!(
-                        insn.info.semantics,
-                        visualbasic::pcode::semantics::OpcodeSemantics::Return
-                    ) {
+                    if !matches!(insn.info.semantics, OpcodeSemantics::Return) {
                         assert!(insn.procedure_return().is_none());
                         continue;
                     }
@@ -846,7 +847,6 @@ fn reads_line_numbers() {
 /// argument on top like a late-bound call.
 #[test]
 fn resolves_raised_events() {
-    use visualbasic::pcode::semantics::{ArgumentOrder, CallKind, OpcodeSemantics};
     let events = project("events");
     let resolver = CallResolver::new(events).unwrap();
     let source = object_index(events, "Source");
@@ -890,9 +890,8 @@ fn resolves_raised_events() {
 /// operands resolved.
 #[test]
 fn describes_movements() {
-    use visualbasic::pcode::movement::{Fill, Move, Place};
     let mut moved = 0;
-    for name in crate::common::projects() {
+    for name in projects() {
         let project = project(&name);
         for object in project.objects().unwrap() {
             for entry in object.unwrap().methods().unwrap() {
@@ -936,10 +935,6 @@ fn describes_movements() {
 /// simulate without a failure.
 #[test]
 fn resolves_the_control_array_object() {
-    use visualbasic::pcode::{
-        calltarget::RuntimeInterfaces,
-        stacksim::{Cut, InstructionStack, ProcedureStack},
-    };
     let forms = project("forms");
     let board = object_index(forms, "Board");
     let resolver = CallResolver::new(forms).unwrap();
@@ -972,11 +967,6 @@ fn resolves_the_control_array_object() {
 /// it describes; without it they stay [`Callee::External`].
 #[test]
 fn resolves_through_an_interface_catalog() {
-    use std::sync::Arc;
-    use visualbasic::{
-        pcode::calltarget::{InterfaceCatalog, InterfaceMember, InvokeKind},
-        vb::control::Guid,
-    };
     let forms = project("forms");
     let board = object_index(forms, "Board");
     let plain = CallResolver::new(forms).unwrap();
@@ -1043,7 +1033,6 @@ fn resolves_through_an_interface_catalog() {
 /// one slot. The procedure simulates without a failure.
 #[test]
 fn resolves_member_variable_accessors() {
-    use visualbasic::pcode::stacksim::{Cut, InstructionStack, ProcedureStack};
     let members = project("members");
     let program = object_index(members, "Program");
     let resolver = CallResolver::new(members).unwrap();
@@ -1129,7 +1118,6 @@ fn resolves_designer_vtables() {
 /// `rtcErrObj` returned, `_ErrObject`.
 #[test]
 fn resolves_calls_through_slot_interfaces() {
-    use visualbasic::pcode::calltarget::{RuntimeInterfaces, SlotInterfaces};
     let iraw = "{5D1E7A10-6C2B-4E1A-9B7F-3A2C1D0E0F02}";
     let externals = |name: &str| {
         let project = project(name);
@@ -1146,8 +1134,9 @@ fn resolves_calls_through_slot_interfaces() {
                 let mut last_load = None;
                 for (insn, record) in code.iter().zip(&stack.instructions) {
                     let pr = match record {
-                        visualbasic::pcode::stacksim::InstructionStack::Reached { pr, .. }
-                        | visualbasic::pcode::stacksim::InstructionStack::Cut { pr, .. } => *pr,
+                        InstructionStack::Reached { pr, .. } | InstructionStack::Cut { pr, .. } => {
+                            *pr
+                        }
                         _ => last_load,
                     };
                     if let Some(source) = insn.pr_source() {
@@ -1190,16 +1179,6 @@ fn resolves_calls_through_slot_interfaces() {
 /// stored last.
 #[test]
 fn slots_take_the_interface_a_call_returns() {
-    use std::sync::Arc;
-
-    use visualbasic::{
-        pcode::{
-            calltarget::{InterfaceCatalog, InterfaceMember, InvokeKind, SlotInterfaces},
-            stackeffect::PrSource,
-        },
-        vb::control::Guid,
-    };
-
     /// `IRaw`'s `GetSelf` (0x38), `GetDouble` (0x1C) and `GetUnknown`
     /// (0x34), `GetSelf` returning `IRaw` and `GetUnknown` `IUnknown` when
     /// `typed`. Both results pass through the same temporary (`var_E4`).
@@ -1249,21 +1228,21 @@ fn slots_take_the_interface_a_call_returns() {
             // Pr where the simulation reached, else the last Pr load before
             // the instruction (a call with no catalog entry cuts the path).
             let mut last_load = None;
-            let prs: Vec<_> = code
-                .iter()
-                .zip(&stack.instructions)
-                .map(|(insn, record)| {
-                    let pr = match record {
-                        visualbasic::pcode::stacksim::InstructionStack::Reached { pr, .. }
-                        | visualbasic::pcode::stacksim::InstructionStack::Cut { pr, .. } => *pr,
-                        _ => last_load,
-                    };
-                    if let Some(source) = insn.pr_source() {
-                        last_load = Some(source);
-                    }
-                    pr
-                })
-                .collect();
+            let prs: Vec<_> =
+                code.iter()
+                    .zip(&stack.instructions)
+                    .map(|(insn, record)| {
+                        let pr = match record {
+                            InstructionStack::Reached { pr, .. }
+                            | InstructionStack::Cut { pr, .. } => *pr,
+                            _ => last_load,
+                        };
+                        if let Some(source) = insn.pr_source() {
+                            last_load = Some(source);
+                        }
+                        pr
+                    })
+                    .collect();
             for (index, insn) in code.iter().enumerate() {
                 let pr = prs[index];
                 let Some(call) = resolver.resolve_with_slots(object, insn, pr.as_ref(), &slots)
@@ -1284,9 +1263,7 @@ fn slots_take_the_interface_a_call_returns() {
                     .iter()
                     .find(|i| i.info.mnemonic == "FStAdFunc")
                     .unwrap();
-                let Some(Some(visualbasic::pcode::operand::Operand::StackVar(target))) =
-                    store.operands.first()
-                else {
+                let Some(Some(Operand::StackVar(target))) = store.operands.first() else {
                     panic!("{store:?}");
                 };
                 let then_resolved = code.iter().enumerate().any(|(at, later)| {
@@ -1358,8 +1335,6 @@ fn slots_take_the_interface_a_call_returns() {
 /// `VCallHresult` names `IRaw` on its copy of the parameter.
 #[test]
 fn arguments_carry_interfaces_between_procedures() {
-    use visualbasic::pcode::calltarget::SlotInterfaces;
-
     let vtable = project("vtable");
     let program = object_index(vtable, "Program");
     let resolver = CallResolver::new(vtable).unwrap();
@@ -1410,9 +1385,7 @@ fn late_targets(
     resolver: &CallResolver<'static, 'static>,
     object: u16,
     index: u16,
-) -> Vec<(i32, Option<visualbasic::pcode::calltarget::LateTarget>)> {
-    use visualbasic::pcode::stacksim::InstructionStack;
-
+) -> Vec<(i32, Option<LateTarget>)> {
     let method = method(project, object, usize::from(index));
     let code: Vec<Instruction> = method.instructions().unwrap().flatten().collect();
     let (stack, slots) = resolver.simulate_procedure(object, &code, method.pcode_bytes());
@@ -1447,8 +1420,6 @@ fn late_targets(
 /// an object sets, a call calls).
 #[test]
 fn late_calls_reach_a_hosted_user_controls_procedures() {
-    use visualbasic::pcode::calltarget::{InvokeKind, LateTarget};
-
     let project = project_with_dispids();
     let resolver = CallResolver::new(project).unwrap();
     let host = object_index(project, "Host");
@@ -1515,15 +1486,6 @@ fn late_calls_reach_a_hosted_user_controls_procedures() {
 /// catalog they stay unresolved.
 #[test]
 fn late_calls_reach_a_hosted_controls_extender() {
-    use std::sync::Arc;
-
-    use visualbasic::{
-        pcode::calltarget::{
-            InterfaceCatalog, InterfaceMember, InvokeKind, LateTarget, RuntimeInterfaces,
-        },
-        vb::control::Guid,
-    };
-
     /// `_VBControlExtender`'s members at the DISPIDs `VB6.OLB` declares.
     struct Extender;
     impl InterfaceCatalog for Extender {
@@ -1676,13 +1638,6 @@ fn late_calls_reach_a_hosted_controls_extender() {
 /// interface.
 #[test]
 fn late_calls_reach_an_activex_controls_class() {
-    use std::sync::Arc;
-
-    use visualbasic::{
-        pcode::calltarget::{InterfaceCatalog, InterfaceMember, InvokeKind, LateTarget},
-        vb::control::Guid,
-    };
-
     /// Any member of any interface, named by its interface's IID.
     struct Any;
     impl InterfaceCatalog for Any {
@@ -1794,13 +1749,6 @@ fn late_calls_reach_an_activex_controls_class() {
 /// class is known, given a catalog that describes every external member.
 #[test]
 fn every_call_by_dispid_reaches_a_member() {
-    use std::sync::Arc;
-
-    use visualbasic::{
-        pcode::calltarget::{InterfaceCatalog, InterfaceMember, InvokeKind},
-        vb::control::Guid,
-    };
-
     /// Every member of every interface, each invoked every way.
     struct Every;
     impl InterfaceCatalog for Every {

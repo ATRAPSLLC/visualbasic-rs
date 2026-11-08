@@ -218,6 +218,12 @@ pub enum ArithOp {
     Imp,
     /// Absolute value.
     Abs,
+    /// `Fix`: the integral part, rounded toward zero.
+    Fix,
+    /// `Int`: the largest integral value not above the operand, rounded down.
+    Int,
+    /// `Sgn`: the sign, -1, 0 or 1, as an `Integer`.
+    Sgn,
     /// Unrecognized arithmetic.
     Other,
 }
@@ -270,7 +276,7 @@ impl CallKind {
 mod tests {
     use super::*;
     use crate::pcode::opcode::{
-        LEAD0_TABLE, LEAD1_TABLE, LEAD2_TABLE, LEAD3_TABLE, LEAD4_TABLE, PRIMARY_TABLE,
+        LEAD0_TABLE, LEAD1_TABLE, LEAD2_TABLE, LEAD3_TABLE, LEAD4_TABLE, OpcodeInfo, PRIMARY_TABLE,
     };
 
     #[test]
@@ -368,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_all_implemented_opcodes_have_semantics() {
-        let tables: [&[crate::pcode::opcode::OpcodeInfo; 256]; 6] = [
+        let tables: [&[OpcodeInfo; 256]; 6] = [
             &PRIMARY_TABLE,
             &LEAD0_TABLE,
             &LEAD1_TABLE,

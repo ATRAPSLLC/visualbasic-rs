@@ -20,7 +20,7 @@ use crate::{
         control::ControlInfo,
         controlprop::{ControlPropertyEntry, RecordLayout},
         events::{EventHandlerThunk, EventSinkVtable},
-        external::{ExternalComponentEntry, ExternalDeclareInfo},
+        external::{ExternalComponentEntry, ExternalDeclareInfo, ExternalGlobalObject},
         functype::{ArgType, FuncTypDesc},
         header::VbHeader,
         member::MemberDesc,
@@ -521,10 +521,14 @@ impl<'p> ExtentWalk<'p> {
                         self.length_prefix(va, name.len().saturating_add(1));
                     }
                 }
-            } else if let Some(typelib) = entry.as_typelib(map) {
-                self.push(object_va, 8, StructureKind::GlobalObjectReference);
-                if let Ok(guid) = typelib.typelib_guid_va() {
-                    self.guid(guid);
+            } else if let Some(global) = entry.as_global_object(map) {
+                self.push(
+                    object_va,
+                    ExternalGlobalObject::SIZE,
+                    StructureKind::GlobalObjectReference,
+                );
+                if let Ok(clsid) = global.clsid_va() {
+                    self.guid(clsid);
                 }
             }
         }

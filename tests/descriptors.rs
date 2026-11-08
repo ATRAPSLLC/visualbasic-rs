@@ -12,6 +12,8 @@
 
 mod common;
 
+use std::fs;
+
 use visualbasic::{
     VbObject, VbProject,
     pcode::decoder::PoolEntryRole,
@@ -32,7 +34,7 @@ use crate::common::{fixture, projects};
 
 /// Reads fixture `name`, leaked so its project outlives the test's borrows.
 fn project(name: &str) -> &'static VbProject<'static> {
-    let bytes: &'static [u8] = Box::leak(std::fs::read(fixture(name)).unwrap().into_boxed_slice());
+    let bytes: &'static [u8] = Box::leak(fs::read(fixture(name)).unwrap().into_boxed_slice());
     Box::leak(Box::new(VbProject::from_bytes(bytes).unwrap()))
 }
 
@@ -331,4 +333,50 @@ fn header_and_type_library_references_have_their_size() {
     }
     tails.dedup();
     assert_eq!(tails, [0x02085A90]);
+}
+
+/// Each connected sink slot of a P-Code object names the procedure it calls:
+/// `Listener`'s `m_Source` handlers in slot order (`events`), and the hosted
+/// `Winsock1` control's four, whose sink leads with its extender's events
+/// (`activex`). A natively compiled class has no method table to resolve
+/// them in (`events-native`).
+#[test]
+fn sink_slots_name_their_handler_procedures() {
+    let handlers = |name: &str, object_name: &str, control: &str| -> Vec<Option<String>> {
+        let project = project(name);
+        let object = object(project, object_name);
+        object
+            .events(None)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.control_name == control)
+            .map(|b| {
+                b.method_index.map(|index| {
+                    object
+                        .method_name(index)
+                        .ok()
+                        .and_then(|n| n.as_str())
+                        .map(|n| n.into_owned())
+                        .unwrap_or_default()
+                })
+            })
+            .collect()
+    };
+    assert_eq!(
+        handlers("events", "Listener", "m_Source"),
+        [
+            Some("m_Source_Started".to_string()),
+            Some("m_Source_Ticked".to_string()),
+            Some("m_Source_Named".to_string()),
+        ]
+    );
+    // `Client`'s handlers resolve, though its name table leaves them unnamed.
+    let winsock = handlers("activex", "Client", "Winsock1");
+    assert_eq!(winsock.len(), 4);
+    assert!(winsock.iter().all(Option::is_some), "{winsock:?}");
+    assert!(
+        handlers("events-native", "Listener", "m_Source")
+            .iter()
+            .all(Option::is_none)
+    );
 }

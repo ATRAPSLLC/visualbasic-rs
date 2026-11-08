@@ -3,25 +3,26 @@
 //! Usage:
 //!   cargo run --example dump -- <path-to-vb6-exe>
 
-use std::collections::HashMap;
-use std::error::Error as StdError;
-use std::str;
-use std::{env, fs, process};
+use std::{
+    borrow::Cow, collections::HashMap, env, error::Error as StdError, fs, iter, process, str,
+};
 
 use visualbasic::{
-    MethodEntry, VbControl, VbObject, VbProject,
+    Error, MethodEntry, VbControl, VbObject, VbProject,
+    addressmap::AddressMap,
     pcode::{calltarget::CallResolver, operand::Operand},
-    project::MethodLinkKind,
+    project::{MethodLinkKind, format_signature},
     vb::{
         comreg::{ComRegData, ComRegObject},
-        control::ControlKind,
+        control::{ControlKind, Guid},
+        controlprop::CleanupAction,
         eventname,
-        external::ExternalKind,
+        external::{ExternalKind, ExternalTableEntry},
         formdata::{FormControlType, FormDataParser},
         functype::FuncTypDesc,
         guitable::{GuiTableEntry, GuiTableIter},
         member::MemberKind,
-        projectinfo2::{ControlTypeIter, ProjectInfo2, read_name_strings},
+        projectinfo2::{ControlTypeEntry, ControlTypeIter, ProjectInfo2, read_name_strings},
         property::{Property, PropertyValue},
         publicbytes::ClassFormPublicBytes,
     },
@@ -137,7 +138,7 @@ fn print_assembly_header(project: &VbProject<'_>, path: &str) -> DynResult<()> {
     println!("    .compilation {}", mode.to_lowercase());
     println!("    .version {runtime_build}.{runtime_revision:02}");
     println!("    .lcid 0x{lcid:08X}");
-    if let Some(guid) = visualbasic::vb::control::Guid::from_bytes(ot.uuid()?) {
+    if let Some(guid) = Guid::from_bytes(ot.uuid()?) {
         println!("    .uuid {guid}");
     }
     println!(
@@ -386,10 +387,7 @@ fn format_obj_flags(obj: &ComRegObject<'_>) -> DynResult<String> {
 }
 
 /// Formats a ProjectInfo2 control type entry as `{GUID} (ClassName)`.
-fn format_guid_entry(
-    entry: &visualbasic::vb::projectinfo2::ControlTypeEntry,
-    map: &visualbasic::addressmap::AddressMap<'_>,
-) -> String {
+fn format_guid_entry(entry: &ControlTypeEntry, map: &AddressMap<'_>) -> String {
     entry
         .control_guid(map)
         .map(|g| {
@@ -404,10 +402,7 @@ fn format_guid_entry(
 }
 
 /// Resolves an external table entry to a human-readable description string.
-fn resolve_external(
-    project: &VbProject<'_>,
-    ext: &visualbasic::vb::external::ExternalTableEntry<'_>,
-) -> String {
+fn resolve_external(project: &VbProject<'_>, ext: &ExternalTableEntry<'_>) -> String {
     let map = project.address_map();
     let obj_va = ext.external_object_va().unwrap_or(0);
     if obj_va == 0 {
@@ -435,13 +430,16 @@ fn resolve_external(
                 format!("va=0x{obj_va:08X}")
             }
         }
-        ExternalKind::TypeLib => {
-            if let Some(tlib) = ext.as_typelib(map)
-                && let Some(guid) = tlib.typelib_guid(map)
+        ExternalKind::GlobalObject => {
+            if let Some(global) = ext.as_global_object(map)
+                && let Some(clsid) = global.clsid(map)
             {
-                format!("typelib {guid}")
+                format!(
+                    "global object {clsid} slot=0x{:08X}",
+                    global.data_slot_va().unwrap_or(0)
+                )
             } else {
-                format!("typelib va=0x{obj_va:08X}")
+                format!("global object va=0x{obj_va:08X}")
             }
         }
         ExternalKind::Unknown(t) => {
@@ -611,17 +609,17 @@ fn print_object(
         let ge_data_size = ge.form_data_size()?;
         println!();
         println!(
-            "    .formdata va=0x{:08X} size=0x{:X} width={} height={} {{",
+            "    .formdata va=0x{:08X} size=0x{:X} stream={} own={} {{",
             ge_data_va,
             ge_data_size,
-            h.width()?,
-            h.height()?
+            h.stream_size()?,
+            h.properties_size()?
         );
 
         // Decode form-level properties
         let form_props = fd.form_properties();
         if !form_props.is_empty() {
-            let decoded: Vec<String> = std::iter::once(format!("Name=\"{}\"", fd.form_name()))
+            let decoded: Vec<String> = iter::once(format!("Name=\"{}\"", fd.form_name()))
                 .chain(fd.form_properties_decoded().map(|p| property_text(&p)))
                 .collect();
             if !decoded.is_empty() {
@@ -797,9 +795,9 @@ fn print_object(
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_else(|| format!("method_{mi:02X}"));
 
-        let sig = func_descs.get(&mi).map(|ftd| {
-            visualbasic::project::format_signature(ftd, &mname, obj.project().address_map())
-        });
+        let sig = func_descs
+            .get(&mi)
+            .map(|ftd| format_signature(ftd, &mname, obj.project().address_map()));
         let link = links.get(&mi);
         let entry = method_entries.get(mi);
 
@@ -947,7 +945,7 @@ fn print_object(
 }
 
 /// Converts a Cow string result to an owned string, using `fallback` on error.
-fn str_or(result: Result<std::borrow::Cow<'_, str>, visualbasic::Error>, fallback: &str) -> String {
+fn str_or(result: Result<Cow<'_, str>, Error>, fallback: &str) -> String {
     result
         .map(|c| c.into_owned())
         .unwrap_or_else(|_| fallback.into())
@@ -959,7 +957,7 @@ fn print_variable_table(label: &str, table: &ClassFormPublicBytes<'_>) {
     println!("    // {label}: data size 0x{size:04X} ({size} bytes)");
     for entry in table.control_entries() {
         let cleanup = entry.cleanup_action();
-        let cleanup_note = if cleanup == visualbasic::vb::controlprop::CleanupAction::None {
+        let cleanup_note = if cleanup == CleanupAction::None {
             String::new()
         } else {
             format!(" cleanup={cleanup}")

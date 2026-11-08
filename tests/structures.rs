@@ -15,22 +15,29 @@ mod common;
 
 use std::{
     collections::{BTreeMap, HashSet},
+    fs,
+    path::Path,
     time::{Duration, Instant},
 };
 
 use visualbasic::{
-    CompilationMode, EntrypointKind, Error, MethodEntry, RecognitionFailure, VbObject, VbProject,
-    project::{CodeEntry, CodeEntryKind, MethodLinkKind, MethodNameResult, NameOwner},
+    CodeEntrypoint, CompilationMode, EntrypointKind, Error, MethodEntry, RecognitionFailure,
+    VbObject, VbProject,
+    project::{CodeEntry, CodeEntryKind, Instancing, MethodLinkKind, MethodNameResult, NameOwner},
     vb::{
         comreg::ComRegData,
         constantpool::PoolEntry,
         control::Guid,
         controlprop::{ControlPropertyEntry, ControlPropertyType, RecordLayout},
+        designer::Designer,
         external::{CallApiStub, ConversionKind, ExternalKind},
+        formdata::FormControlType,
         functype::ArgType,
         member::MemberKind,
         native::{ProcUnwindInfo, ProcedureUnwind},
         projectinfo2::{ControlTypeIter, ProjectInfo2, read_name_strings},
+        property::{ControlBounds, PropertyValue},
+        publicbytes::ClassFormPublicBytes,
     },
 };
 
@@ -38,7 +45,7 @@ use crate::common::{fixture, projects};
 
 /// Reads fixture `name`, leaked so its project outlives the test's borrows.
 fn project(name: &str) -> &'static VbProject<'static> {
-    let bytes: &'static [u8] = Box::leak(std::fs::read(fixture(name)).unwrap().into_boxed_slice());
+    let bytes: &'static [u8] = Box::leak(fs::read(fixture(name)).unwrap().into_boxed_slice());
     Box::leak(Box::new(VbProject::from_bytes(bytes).unwrap()))
 }
 
@@ -162,8 +169,8 @@ fn comreg_flags_name_the_user_controls() {
     }
 }
 
-/// `as_typelib` answers only for TypeLib entries, `as_declare` only for
-/// Declares.
+/// `as_global_object` answers only for global object entries, `as_declare`
+/// only for Declares.
 #[test]
 fn external_entries_check_their_kind() {
     let exprs = project("exprs");
@@ -172,27 +179,24 @@ fn external_entries_check_their_kind() {
     assert_eq!(entries.len(), 2);
     for entry in &entries {
         assert_eq!(entry.kind().unwrap(), ExternalKind::DeclareFunction);
-        assert!(entry.as_typelib(map).is_none());
+        assert!(entry.as_global_object(map).is_none());
         assert!(entry.as_declare(map).is_some());
     }
     let dispid = project("dispid");
     let map = dispid.address_map();
-    let typelib = dispid
+    let global = dispid
         .externals()
         .unwrap()
         .map(Result::unwrap)
-        .find(|e| e.kind().unwrap() == ExternalKind::TypeLib)
+        .find(|e| e.kind().unwrap() == ExternalKind::GlobalObject)
         .unwrap();
-    assert!(typelib.as_declare(map).is_none());
+    assert!(global.as_declare(map).is_none());
+    let object = global.as_global_object(map).unwrap();
     assert_eq!(
-        typelib
-            .as_typelib(map)
-            .unwrap()
-            .typelib_guid(map)
-            .unwrap()
-            .to_string(),
+        object.clsid(map).unwrap().to_string(),
         "{FCFB3D23-A0FA-1068-A738-08002B3371B5}"
     );
+    assert_ne!(object.data_slot_va().unwrap(), 0);
 }
 
 /// A Declare's external table entry is its DllFunctionCall descriptor: by
@@ -240,9 +244,7 @@ fn declare_entries_are_dllfunctioncall_descriptors() {
 }
 
 /// The entries `(offset, type)` of a variable descriptor table.
-fn entries(
-    table: &visualbasic::vb::publicbytes::ClassFormPublicBytes<'_>,
-) -> Vec<(u16, ControlPropertyType)> {
+fn entries(table: &ClassFormPublicBytes<'_>) -> Vec<(u16, ControlPropertyType)> {
     table
         .control_entries()
         .map(|e| (e.frame_offset().unwrap(), e.property_type()))
@@ -1501,7 +1503,7 @@ fn project_path_is_utf16() {
 /// starts `push imm32` without it is not a VB6 file.
 #[test]
 fn entry_point_push_needs_the_magic() {
-    let bytes = std::fs::read(fixture("hello")).unwrap();
+    let bytes = fs::read(fixture("hello")).unwrap();
     let pe = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap()) as usize;
     let entry_rva = u32::from_le_bytes(bytes[pe + 0x28..pe + 0x2C].try_into().unwrap());
     // .text is mapped at file offset == RVA in the fixtures.
@@ -1533,7 +1535,7 @@ fn entry_point_push_needs_the_magic() {
 #[test]
 fn corrupt_counts_end_quickly() {
     let path = fixture("calls");
-    let bytes = std::fs::read(&path).unwrap();
+    let bytes = fs::read(&path).unwrap();
     let clean = project("calls");
     let counter = object(clean, "Counter");
     let opt = counter.optional_info().unwrap();
@@ -1564,7 +1566,7 @@ fn corrupt_counts_end_quickly() {
     );
     assert!(controls <= mutant.len() / 0x28);
     // The other objects' entry points are those of the clean file.
-    let program = |entries: &[visualbasic::CodeEntrypoint<'_>]| -> Vec<u32> {
+    let program = |entries: &[CodeEntrypoint<'_>]| -> Vec<u32> {
         entries
             .iter()
             .filter(|e| e.object_index == Some(0))
@@ -1578,7 +1580,7 @@ fn corrupt_counts_end_quickly() {
     assert!(!program(&entries).is_empty());
 
     // exprs: a corrupt external count still yields the two Declares first.
-    let bytes = std::fs::read(fixture("exprs")).unwrap();
+    let bytes = fs::read(fixture("exprs")).unwrap();
     let clean = project("exprs");
     let pd = clean.vb_header().project_data_va().unwrap();
     let count_offset = clean.address_map().va_to_offset(pd + 0x238).unwrap();
@@ -1736,7 +1738,6 @@ fn hosted_controls_name_their_extender_events() {
 /// UserControl and a PropertyPage (`ocx`, an OCX).
 #[test]
 fn designers_of_every_kind() {
-    use visualbasic::vb::designer::Designer;
     for (fixture, name, designer) in [
         ("mdi", "Frame", Designer::MdiForm),
         ("mdi", "Child", Designer::Form),
@@ -1791,7 +1792,6 @@ fn method_links_in_vtable_order() {
 /// `PaletteMode = 0`, `ScaleMode = 1` with the default drawing flags).
 #[test]
 fn designer_records_decode_with_their_own_table() {
-    use visualbasic::vb::{formdata::FormControlType, property::PropertyValue};
     for (fixture, name, form_type, property, value) in [
         (
             "forms",
@@ -1869,7 +1869,6 @@ fn designer_records_decode_with_their_own_table() {
 /// stored as 2400).
 #[test]
 fn control_bounds_and_coordinates() {
-    use visualbasic::vb::property::{ControlBounds, PropertyValue};
     let project = project("geometry");
     let layout = object(project, "Layout");
     let form_data = project
@@ -1938,7 +1937,6 @@ fn extender_flags_follow_misc_status() {
 /// by-value Variant.
 #[test]
 fn event_conversions_by_parameter_type() {
-    use ConversionKind::*;
     let project = project("extender");
     let coords = project
         .components()
@@ -1954,24 +1952,27 @@ fn event_conversions_by_parameter_type() {
         kinds,
         [
             vec![
-                (0, false, XPosPixels),
-                (1, false, YPosPixels),
-                (2, false, XSizePixels),
-                (3, false, YSizePixels)
+                (0, false, ConversionKind::XPosPixels),
+                (1, false, ConversionKind::YPosPixels),
+                (2, false, ConversionKind::XSizePixels),
+                (3, false, ConversionKind::YSizePixels)
             ],
             vec![
-                (0, false, XPosHimetric),
-                (1, false, YPosHimetric),
-                (2, false, XSizeHimetric),
-                (3, false, YSizeHimetric)
+                (0, false, ConversionKind::XPosHimetric),
+                (1, false, ConversionKind::YPosHimetric),
+                (2, false, ConversionKind::XSizeHimetric),
+                (3, false, ConversionKind::YSizeHimetric)
             ],
             vec![],
             vec![],
-            vec![(0, false, Variant)],
+            vec![(0, false, ConversionKind::Variant)],
             vec![],
         ]
     );
-    assert_eq!(XSizeHimetric.stdole_type(), Some("OLE_XSIZE_HIMETRIC"));
+    assert_eq!(
+        ConversionKind::XSizeHimetric.stdole_type(),
+        Some("OLE_XSIZE_HIMETRIC")
+    );
     assert_eq!(coords.control_flags(), 0x2057);
 }
 
@@ -1984,12 +1985,10 @@ fn event_conversions_by_parameter_type() {
 /// `FontTransparent`; a menu's items follow it in the menu section.
 #[test]
 fn form_records_match_their_source() {
-    use visualbasic::vb::{formdata::FormControlType, property::PropertyValue};
-
     // `(control, property, value)` from the `.frm`: `Begin VB.<Class>
     // <Name>` blocks, `BeginProperty` blocks skipped, comments dropped.
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/props/Props.frm"),
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/props/Props.frm"),
     )
     .unwrap();
     let mut expected: Vec<(String, String, String)> = Vec::new();
@@ -2175,8 +2174,6 @@ fn form_records_match_their_source() {
 /// private, and a module or a designer object has none.
 #[test]
 fn classes_report_their_instancing() {
-    use visualbasic::project::Instancing;
-
     let server = project("server");
     for (class, instancing) in [
         ("Hidden", Instancing::Private),

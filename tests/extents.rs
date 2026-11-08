@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fs};
 
 use goblin::{
     options::ParseMode,
@@ -31,7 +31,7 @@ use crate::common::{fixture, projects};
 
 /// Reads fixture `name`, leaked so its project outlives the test's borrows.
 fn project(name: &str) -> (&'static [u8], &'static VbProject<'static>) {
-    let bytes: &'static [u8] = Box::leak(std::fs::read(fixture(name)).unwrap().into_boxed_slice());
+    let bytes: &'static [u8] = Box::leak(fs::read(fixture(name)).unwrap().into_boxed_slice());
     (
         bytes,
         Box::leak(Box::new(VbProject::from_bytes(bytes).unwrap())),
@@ -177,53 +177,65 @@ fn every_kind_is_found() {
             assert!(found.contains(kind), "{name}: no {kind:?}");
         }
     };
-    use StructureKind::*;
     expect(
         "forms",
         &[
-            VbHeader,
-            ProjectData,
-            ObjectTable,
-            ProjectInfo2,
-            EventSource,
-            ObjectDescriptor,
-            ObjectInfo,
-            OptionalObjectInfo,
-            PrivateObjectDescriptor,
-            MethodTable,
-            MethodLinkTable,
-            PointerTable,
-            Name,
-            Guid,
-            FunctionType,
-            ConstantPool,
-            StringConstant,
-            ProcedureDescriptor,
-            Pcode,
-            ControlInfo,
-            EventSinkVtable,
-            GuiTableEntry,
-            FormData,
-            TypeLibReference,
+            StructureKind::VbHeader,
+            StructureKind::ProjectData,
+            StructureKind::ObjectTable,
+            StructureKind::ProjectInfo2,
+            StructureKind::EventSource,
+            StructureKind::ObjectDescriptor,
+            StructureKind::ObjectInfo,
+            StructureKind::OptionalObjectInfo,
+            StructureKind::PrivateObjectDescriptor,
+            StructureKind::MethodTable,
+            StructureKind::MethodLinkTable,
+            StructureKind::PointerTable,
+            StructureKind::Name,
+            StructureKind::Guid,
+            StructureKind::FunctionType,
+            StructureKind::ConstantPool,
+            StructureKind::StringConstant,
+            StructureKind::ProcedureDescriptor,
+            StructureKind::Pcode,
+            StructureKind::ControlInfo,
+            StructureKind::EventSinkVtable,
+            StructureKind::GuiTableEntry,
+            StructureKind::FormData,
+            StructureKind::TypeLibReference,
         ],
     );
-    expect("ocx", &[Component, ComRegistration]);
-    expect("events", &[DispidMap]);
+    expect(
+        "ocx",
+        &[StructureKind::Component, StructureKind::ComRegistration],
+    );
+    expect("events", &[StructureKind::DispidMap]);
     expect(
         "types",
-        &[ExternalTable, DeclareDescriptor, OptionalDefaults],
+        &[
+            StructureKind::ExternalTable,
+            StructureKind::DeclareDescriptor,
+            StructureKind::OptionalDefaults,
+        ],
     );
-    expect("members", &[Member, InterfaceReference]);
-    expect("late", &[MemberName]);
-    expect("coverage", &[RecordLayout]);
-    expect("typerefs", &[RecordReference, RecordLayout]);
+    expect(
+        "members",
+        &[StructureKind::Member, StructureKind::InterfaceReference],
+    );
+    expect("late", &[StructureKind::MemberName]);
+    expect("coverage", &[StructureKind::RecordLayout]);
+    expect(
+        "typerefs",
+        &[StructureKind::RecordReference, StructureKind::RecordLayout],
+    );
     expect(
         "errors-native",
         &[
-            UnwindRecord,
-            ErrorHandlerTable,
-            ResumeTable,
-            LineNumberTable,
+            StructureKind::UnwindRecord,
+            StructureKind::ErrorHandlerTable,
+            StructureKind::ResumeTable,
+            StructureKind::LineNumberTable,
         ],
     );
 }
